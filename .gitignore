@@ -1,0 +1,33 @@
+# Local design references and test credentials (never publish)
+/design/
+
+# Dependencies, builds and local test results
+/node_modules/
+/dist/
+/dist-electron/
+/test-results/
+/playwright-report/
+
+# Local application data and credentials
+/state/
+/user-data/
+/userData/
+/electron-user-data/
+/sessions/
+/workflows/
+profiles.json
+profiles.json.*
+credentials.json
+secrets.json
+*.jsonl
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+.git-credentials
+.netrc
+.npmrc
+/.claude/settings.local.json
+/.codex/auth.json

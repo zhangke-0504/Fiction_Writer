@@ -1,0 +1,256 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createProvider, checkProvider } from '../electron/agent/provider.js';
+import type { ModelRequest } from '../electron/agent/model.js';
+import type { ModelProfile, Protocol } from '../shared/contracts.js';
+const key = 'synthetic-only-secret-fixture';
+async function fixture(
+  t: import('node:test').TestContext,
+  protocol: Protocol,
+  respond: (body: any, res: ServerResponse, req: IncomingMessage) => void,
+) {
+  const requests: { body: any; path?: string; headers: IncomingMessage['headers'] }[] = [];
+  const server = createServer(async (req, res) => {
+    let raw = '';
+    for await (const part of req) raw += part;
+    const body = JSON.parse(raw);
+    requests.push({ body, path: req.url, headers: req.headers });
+    respond(body, res, req);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const port = (server.address() as import('node:net').AddressInfo).port;
+  const profile: ModelProfile = {
+    id: 'a',
+    name: 'fixture',
+    model: protocol === 'chat' ? 'deepseek-v4-flash' : 'synthetic',
+    protocol,
+    baseUrl: `http://127.0.0.1:${port}/gate/v1`,
+  };
+  return { profile, requests };
+}
+function sse(res: ServerResponse, ...events: unknown[]) {
+  res.writeHead(200, { 'content-type': 'text/event-stream' });
+  const payload = Buffer.from(
+    events.map((event) => `data: ${JSON.stringify(event)}\r\n\r\n`).join('') + 'data: [DONE]\r\n\r\n',
+  );
+  res.write(payload.subarray(0, 21));
+  res.end(payload.subarray(21));
+}
+const chat = (delta: object, finish_reason: string | null = null) => ({
+  choices: [{ index: 0, delta, finish_reason }],
+});
+const ctx = (): ModelRequest => ({
+  system: 'System',
+  history: [{ role: 'user', text: 'Call read_file.' }],
+  tools: [{ name: 'read_file', description: 'Fixture', schema: { type: 'object' } }],
+  signal: AbortSignal.timeout(3000),
+  onText: () => {},
+});
+
+test('Chat Completions joins fragmented calls and returns tool ID plus DeepSeek reasoning in the same run', async (t) => {
+  const { profile, requests } = await fixture(t, 'chat', (body, res) => {
+    if (body.messages.at(-1).role === 'tool') {
+      sse(res, chat({ content: '测试通过' }), chat({}, 'stop'));
+      return;
+    }
+    sse(
+      res,
+      chat({ reasoning_content: 'fixture reasoning' }),
+      chat({
+        tool_calls: [
+          { index: 0, id: 'call_1', function: { name: 'read_file', arguments: '{"path":"' } },
+        ],
+      }),
+      chat({ tool_calls: [{ index: 0, function: { arguments: 'a.md"}' } }] }),
+      chat({}, 'tool_calls'),
+    );
+  });
+  const provider = createProvider(profile, key, 'high');
+  const request = ctx();
+  const first = await provider.turn(request);
+  assert.equal(first.calls[0].args, '{"path":"a.md"}');
+  assert.equal(provider.effort, 'high');
+  const chunks: string[] = [];
+  const follow = await provider.turn({
+    ...request,
+    history: [
+      ...request.history,
+      first,
+      { role: 'tool', id: 'call_1', result: { ok: true, value: 'data' } },
+    ],
+    onText: (t) => chunks.push(t),
+  });
+  assert.equal(follow.text, '测试通过');
+  assert.deepEqual(chunks, ['测试通过']);
+  assert.equal(requests[1].path, '/gate/v1/chat/completions');
+  assert.equal(requests[1].headers.authorization, `Bearer ${key}`);
+  assert.equal(requests[1].body.messages.at(-2).reasoning_content, 'fixture reasoning');
+  assert.equal(requests[1].body.messages.at(-1).tool_call_id, 'call_1');
+});
+
+test('Responses resubmits completed native output and function_call_output by call_id', async (t) => {
+  const native = {
+    type: 'function_call',
+    id: 'fc_1',
+    call_id: 'call_1',
+    name: 'read_file',
+    arguments: '{"path":"a.md"}',
+    status: 'completed',
+  };
+  const { profile, requests } = await fixture(t, 'responses', (body, res) => {
+    if (body.input.at(-1).type === 'function_call_output') {
+      sse(
+        res,
+        { type: 'response.output_text.delta', delta: '好' },
+        { type: 'response.completed', response: { output: [] } },
+      );
+      return;
+    }
+    sse(
+      res,
+      { type: 'response.output_item.added', output_index: 0, item: { ...native, arguments: '' } },
+      { type: 'response.function_call_arguments.delta', delta: '{"path":' },
+      { type: 'response.function_call_arguments.delta', delta: '"a.md"}' },
+      { type: 'response.output_item.done', output_index: 0, item: native },
+      { type: 'response.completed', response: { output: [native] } },
+    );
+  });
+  const provider = createProvider(profile, key);
+  const request = ctx();
+  const first = await provider.turn(request);
+  assert.deepEqual(first.calls, [{ id: 'call_1', name: 'read_file', args: native.arguments }]);
+  assert.equal(
+    (
+      await provider.turn({
+        ...request,
+        history: [...request.history, first, { role: 'tool', id: 'call_1', result: { ok: true } }],
+      })
+    ).text,
+    '好',
+  );
+  const { path, body } = requests[1];
+  assert.equal(path, '/gate/v1/responses');
+  assert.equal(body.store, false);
+  assert.deepEqual(body.input.at(-2), native);
+  assert.deepEqual(body.input.at(-1), {
+    type: 'function_call_output',
+    call_id: 'call_1',
+    output: '{"ok":true}',
+  });
+});
+
+test('Messages validates fragmented tool input, repeats the original tool_use block, and uses Anthropic auth', async (t) => {
+  const { profile, requests } = await fixture(t, 'messages', (body, res) => {
+    if (body.messages.at(-1).content[0].type === 'tool_result') {
+      sse(
+        res,
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '完成' } },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+        { type: 'message_stop' },
+      );
+      return;
+    }
+    sse(
+      res,
+      {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'toolu_1', name: 'read_file', input: {} },
+      },
+      {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"path":' },
+      },
+      {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '"a.md"}' },
+      },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+      { type: 'message_stop' },
+    );
+  });
+  const provider = createProvider(profile, key);
+  const request = ctx();
+  const first = await provider.turn(request);
+  assert.equal(provider.effort, 'default');
+  assert.equal(
+    (
+      await provider.turn({
+        ...request,
+        history: [
+          ...request.history,
+          first,
+          { role: 'tool', id: 'toolu_1', result: { ok: false, error: 'Missing' } },
+        ],
+      })
+    ).text,
+    '完成',
+  );
+  const { path, headers, body } = requests[1];
+  assert.equal(path, '/gate/v1/messages');
+  assert.equal(headers['x-api-key'], key);
+  assert.equal(headers['anthropic-version'], '2023-06-01');
+  assert.deepEqual(body.messages.at(-2).content[0].input, { path: 'a.md' });
+  assert.equal(body.messages.at(-1).content[0].tool_use_id, 'toolu_1');
+  assert.equal(body.messages.at(-1).content[0].is_error, true);
+});
+
+test('auth diagnostics never include provider response body and ordinary chat cannot pass the tool check', async (t) => {
+  const auth = await fixture(t, 'chat', (_body, res) => {
+    res.writeHead(401);
+    res.end(`bad ${key}`);
+  });
+  const result = await checkProvider(auth.profile, key, AbortSignal.timeout(3000));
+  assert.equal('kind' in result && result.kind, 'auth');
+  assert.ok(!JSON.stringify(result).includes(key));
+  const chatOnly = await fixture(t, 'chat', (_body, res) =>
+    sse(res, chat({ content: 'OK' }), chat({}, 'stop')),
+  );
+  assert.deepEqual(await checkProvider(chatOnly.profile, key, AbortSignal.timeout(3000)), {
+    connection: true,
+    tools: false,
+    issue: '模型未正确调用测试工具',
+  });
+});
+
+test('missing terminal event, error events and explicit cancellation do not return a committable turn', async (t) => {
+  for (const protocol of ['chat', 'responses', 'messages'] as const) {
+    const { profile } = await fixture(t, protocol, (_body, res) =>
+      sse(
+        res,
+        protocol === 'chat' ? chat({ content: 'partial' }) : { type: 'error', error: { message: key } },
+      ),
+    );
+    await assert.rejects(
+      createProvider(profile, key).turn(ctx()),
+      (error: Error) => !error.message.includes(key),
+    );
+  }
+  const { profile } = await fixture(t, 'chat', (_body, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify(chat({ content: 'partial' }))}\n\n`);
+  });
+  const abort = new AbortController();
+  const chunks: string[] = [];
+  await assert.rejects(
+    createProvider(profile, key).turn({
+      ...ctx(),
+      signal: abort.signal,
+      onText: (t) => {
+        chunks.push(t);
+        abort.abort();
+      },
+    }),
+    { name: 'AbortError' },
+  );
+  assert.deepEqual(chunks, ['partial']);
+});

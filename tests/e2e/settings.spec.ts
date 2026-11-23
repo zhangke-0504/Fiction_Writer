@@ -1,0 +1,142 @@
+import { test, expect, _electron as electron } from '@playwright/test';
+import { createServer } from 'node:http';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import type { ModelProfile, RuntimeView, Session } from '../../shared/contracts';
+
+test('encrypted profiles, routing selection, effort fallback and attachment snapshot', async ({}, testInfo) => {
+  const requests: { url?: string; body: any }[] = [];
+  let release!: () => void;
+  const wait = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const key = 'test-config-secret-not-real';
+  const server = createServer(async (req, res) => {
+    let source = '';
+    for await (const bytes of req) source += bytes;
+    const body = JSON.parse(source);
+    requests.push({ url: req.url, body });
+    if (req.headers.authorization !== `Bearer ${key}` && req.headers['x-api-key'] !== key) {
+      res.writeHead(401);
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    const send = (event: unknown) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+    if (req.url?.endsWith('chat/completions')) {
+      send({
+        choices: [
+          {
+            index: 0,
+            delta: { reasoning_content: 'native state not persisted', content: '第一段' },
+            finish_reason: null,
+          },
+        ],
+      });
+      await wait;
+      send({ choices: [{ index: 0, delta: { content: '已完成' }, finish_reason: 'stop' }] });
+    } else {
+      send({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+      send({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '第二模型' } });
+      send({ type: 'message_delta', delta: { stop_reason: 'end_turn' } });
+      send({ type: 'message_stop' });
+    }
+    res.end('data: [DONE]\n\n');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as import('node:net').AddressInfo).port;
+  const root = testInfo.outputPath('app'),
+    dir = testInfo.outputPath('code');
+  await mkdir(dir, { recursive: true });
+  const text = join(dir, 'info.md');
+  await writeFile(text, '最初版本', 'utf8');
+  const app = await electron.launch({
+    args: ['.'],
+    env: { ...process.env, FW_E2E: '1', FW_TEST_ROOT: root },
+  });
+  try {
+    const page = await app.firstWindow();
+    const request = <T>(method: string, args?: unknown) =>
+      page.evaluate(([m, a]) => window.fw.request<T>(m, a), [method, args] as const);
+    await page.getByRole('button', { name: '设置', exact: true }).click();
+    await page.getByLabel('名称').fill('测试供应商 A');
+    await page.getByLabel('模型 ID').fill('test-a');
+    await page.getByLabel('API Key').fill(key);
+    await page.getByLabel('API 请求地址').fill(`http://127.0.0.1:${port}/one/v1`);
+    await page.getByRole('button', { name: '保存配置' }).click();
+    await expect(page.getByText('配置已保存', { exact: true })).toBeVisible();
+    await expect(page.getByLabel('API Key')).toHaveValue('');
+    await page.getByRole('button', { name: '新建配置' }).click();
+    await page.getByLabel('名称').fill('测试供应商 B');
+    await page.getByLabel('模型 ID').fill('test-b');
+    await page.getByLabel('API Key').fill(key);
+    await page.getByLabel('API 请求地址').fill(`http://127.0.0.1:${port}/two/v1`);
+    await page.getByText('高级选项', { exact: true }).click();
+    await page.getByLabel('上游协议').selectOption('messages');
+    await page.getByRole('button', { name: '保存配置' }).click();
+    await expect(page.getByText('配置已保存', { exact: true })).toBeVisible();
+    let profiles = await request<ModelProfile[]>('profiles.list');
+    const a = profiles.find((p) => p.model === 'test-a')!,
+      b = profiles.find((p) => p.model === 'test-b')!;
+    expect(JSON.stringify(profiles)).not.toContain(key);
+    expect(await readFile(join(root, 'state', 'profiles.json'), 'utf8')).not.toContain(key);
+    await page.reload();
+    profiles = await request('profiles.list');
+    expect(profiles).toHaveLength(2);
+    await app.evaluate(({ dialog }, file) => {
+      dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [file] });
+    }, dir);
+    await page.getByRole('button', { name: 'Harness', exact: true }).click();
+    const panel = page.getByRole('complementary', { name: 'Harness 面板' });
+    await panel.getByRole('button', { name: '新建目录会话' }).click();
+    await expect(panel.getByLabel('模型')).toBeVisible();
+    const id = (await request<RuntimeView>('runtime.snapshot')).sessions.find(
+      (s) => s.session.cwd === dir,
+    )?.session.id;
+    expect(id).toBeDefined();
+    await expect(
+      request('session.start', {
+        id,
+        profileId: a.id,
+        prompt: 'fixture',
+        attachments: [join(dir, 'missing.md')],
+      }),
+    ).rejects.toThrow('无法附加文件');
+    expect(requests).toHaveLength(0);
+    await app.evaluate(({ dialog }, file) => {
+      dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [file] });
+    }, text);
+    await panel.getByRole('button', { name: '添加参考文件' }).click();
+    await expect(panel.getByText('info.md', { exact: true })).toBeVisible();
+    await panel.getByLabel('模型').selectOption(a.id);
+    await panel.getByLabel('思考等级').selectOption('high');
+    await panel.getByLabel('给 Agent 的消息').fill('使用我的参考文件');
+    await panel.getByRole('button', { name: '发送' }).click();
+    await expect(panel.getByText('第一段', { exact: true })).toBeVisible();
+    await panel.getByLabel('模型').selectOption(b.id);
+    await panel.getByLabel('思考等级').selectOption('low');
+    await writeFile(text, '已变更', 'utf8');
+    release();
+    await expect(panel.getByText('第一段已完成', { exact: true })).toBeVisible();
+    expect(requests[0].url).toBe('/one/v1/chat/completions');
+    expect(JSON.stringify(requests[0].body)).toContain('最初版本');
+    expect(requests[0].body.reasoning_effort).toBeUndefined();
+    await expect(panel.getByText(/使用模型默认思考设置/)).toBeVisible();
+    await panel.getByLabel('给 Agent 的消息').fill('下一轮');
+    await panel.getByRole('button', { name: '发送' }).click();
+    await expect(panel.getByText('第二模型', { exact: true })).toBeVisible();
+    expect(requests[1].url).toBe('/two/v1/messages');
+    const wire = JSON.stringify(requests[1].body);
+    expect(wire).toContain('第一段已完成');
+    expect(wire).not.toContain('native state');
+    expect(wire).not.toContain('info.md');
+    const disk = await readFile(join(root, 'state', 'sessions', `${id}.jsonl`), 'utf8');
+    expect(disk).not.toContain('native state');
+    expect(disk).not.toContain(key);
+  } finally {
+    release();
+    await app.close();
+    server.closeAllConnections();
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
