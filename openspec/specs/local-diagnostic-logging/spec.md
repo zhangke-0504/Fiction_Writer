@@ -70,20 +70,24 @@
 - **WHEN** 模型鉴权失败、响应中断、解析失败或用户停止流
 - **THEN** 日志标明同一请求的已到达阶段与明确结果，保存可用的协议、状态和耗时，不能漏记成只有开始，也不写原始响应/鉴权信息
 
-### Requirement: Skill application and novel workflow stages are traceable
-诊断 SHALL 区分 Skill 读取/验证与某条写作路径实际采用该 Skill，记录静态标识、版本或资源指纹、使用阶段和原因，不伪称已证明模型遵循。单章直写、长篇回读与整书生成即使绕过通用 loop，也 SHALL 留下实际发生的模型请求、取材决定、预览生命周期、阶段结果、跳过、检查点保存和恢复记录。
+### Requirement: Skill dispatch and novel writing results are traceable
+默认诊断 SHALL 能按同一 Run 和工具调用区分内置 Skill 检索、资源读取或加载、所选指令进入实际模型请求、小说工具执行以及磁盘结果。日志 SHALL 仅记录已注册能力标识、资源指纹、候选数、安全状态和关联标识；请求发出不表示模型遵循 Skill。单章工具内部的只读取材与正文流 SHALL 保留各自的请求、预览和提交诊断。续写 SHALL 记录目标章和跳过已有内容的原因，不依赖固定阶段或检查点事件。
 
-#### Scenario: Distinguish loaded resources from the skill applied to the run
-- **WHEN** 小说会话载入多份 Skill 资源但只启动「单章续写」或「故事一致性」其中一种路径
-- **THEN** 日志分别记录已加载的资源和实际使用的 Skill，不把未选择的资源记成已执行，不记录 Skill 注入后的提示词
+#### Scenario: Trace discovery and use without confusing loaded resources with execution
+- **WHEN** Agent 检索写作 Skill，候选不止一个，选择 `generate-novel` 后调用作品工具
+- **THEN** 日志可串起候选与选中的标识、选中资源指纹、其实际发往模型的请求、后续工具执行与文件提交；不把其他候选记为已激活，不保存搜索词、生成指令或工具内容
 
-#### Scenario: Readback and chapter generation without a generic loop
-- **WHEN** 写章路径先只读取材再流式生成正文，部分补读命中或没有匹配，随后提交或者取消
+#### Scenario: Trace rejected references and distinct chapter stream failures
+- **WHEN** 合成场景触发不存在的伏笔目标、前两章落盘后第三章提前结束，或者第三章返回终止事件但达到输出上限
+- **THEN** 日志能区分写入前的无效引用拒绝、未完成流和达到输出上限，关联发生失败的工具、请求或安全章节引用；不保存用户文档的原始 ID、异常正文、流事件或稿件片段
+
+#### Scenario: Readback and drafting inside the chapter tool have separate evidence
+- **WHEN** 写章工具先只读取材再流式生成正文，部分补读命中或没有匹配，随后提交或者取消
 - **THEN** 日志能区分两类请求、补读命中/缺失、预览开始/结束及最终提交结果，不写查询关键词、引用片段或生成正文
 
-#### Scenario: Whole-book resume reports why existing chapters were skipped
-- **WHEN** 整书在某章失败后重启并继续，前面已有提交或手写章节
-- **THEN** 可查阶段或检查点验证与恢复、跳过原因、目标章引用和最终结果，并能区分「沿用已完成」和「重新生成」
+#### Scenario: Whole-book continuation reports why existing chapters were skipped
+- **WHEN** 第三章未成功保存而整书中断，用户重启后通过同一输入框明确继续
+- **THEN** 日志可查核对现稿后的目标章、已保存章被跳过和目标章重新生成的结果，不把可继续状态当作已有提交
 
 ### Requirement: File commits and visible workspace revision can be compared
 诊断 SHALL 记录受管理写入的类型、前提校验、成功/失败/部分提交、受影响文档的安全引用及可比对的修订标识，关联已发出的文件变更通知。前端 SHALL 记录受影响的通知序号、断档、重读结果、实际显示的修订或保留作者草稿的决定；不把通知发出当作界面已应用，也不将外部 watcher 推断为应用写入。

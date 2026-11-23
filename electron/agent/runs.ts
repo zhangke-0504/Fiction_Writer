@@ -16,7 +16,14 @@ import { Journal } from '../journal.js';
 import { diagnosticScope, noDiagnostic, type ReportDiagnostic } from '../../shared/diagnostics.js';
 import { classified, DiagnosticFailure, elapsed, safeReporter } from '../diagnostics/trace.js';
 
-type StateEntry = { session: Session; line?: ChatLine; run?: RunInfo };
+import { readNovelTask, type NovelContinuation, type NovelTaskState } from './novel-goal.js';
+
+type StateEntry = {
+  session: Session;
+  line?: ChatLine;
+  run?: RunInfo;
+  novelTask?: NovelTaskState | null;
+};
 export interface RunContext {
   id: string;
   diagnostic?: ReportDiagnostic;
@@ -27,6 +34,9 @@ export interface RunContext {
   uncertainStop?: (reason: string) => void;
   preview: (value?: ChapterPreview) => void;
   progress: (value: WorkProgress) => void;
+  authorLine?: number;
+  continuation?: NovelContinuation;
+  saveNovelTask: (value: NovelTaskState | null) => Promise<void>;
 }
 interface Active {
   controller: AbortController;
@@ -39,6 +49,7 @@ export const directoryKey = (path: string) => {
 };
 export class RunManager {
   private readonly states = new Map<string, SessionView>();
+  private readonly novelTasks = new Map<string, NovelTaskState>();
   private readonly active = new Map<string, Active>();
   private readonly reserved = new Set<string>();
   private readonly deleting = new Set<string>();
@@ -50,7 +61,6 @@ export class RunManager {
   constructor(
     root: string,
     private readonly journal: Journal,
-    private readonly workflowFor: (bookId?: string) => WorkProgress | undefined = () => undefined,
     private readonly diagnostic: ReportDiagnostic = noDiagnostic,
   ) {
     this.directory = join(root, 'sessions');
@@ -71,13 +81,23 @@ export class RunManager {
           state.session = entry.session;
           if (entry.line) state.messages.push(entry.line);
           if (entry.run) state.run = entry.run;
+          if (entry.novelTask === null) this.novelTasks.delete(id);
+          else if (entry.novelTask && entry.session.bookId) {
+            const task = readNovelTask(entry.novelTask, state.messages);
+            if (task) this.novelTasks.set(id, task);
+          }
         } catch {
           /* A crash can leave the last log record incomplete. */
         }
       }
       if (state) {
         if (state.run?.status === 'running') {
-          state.run = { id: state.run.id, status: 'interrupted', error: '应用已退出或后台曾中断' };
+          state.run = {
+            ...state.run,
+            preview: undefined,
+            status: 'interrupted',
+            error: '应用已退出或后台曾中断',
+          };
           this.sessionTrace(state.session)('run.recovered', {
             runId: state.run.id,
             outcome: 'interrupted',
@@ -149,12 +169,7 @@ export class RunManager {
   snapshot(): RuntimeView {
     return {
       cursor: this.journal.cursor,
-      sessions: structuredClone(
-        [...this.states.values()].map((view) => ({
-          ...view,
-          workflow: this.workflowFor(view.session.bookId),
-        })),
-      ),
+      sessions: structuredClone([...this.states.values()]),
     };
   }
   get(id: string): SessionView {
@@ -168,7 +183,6 @@ export class RunManager {
     operation: (ctx: RunContext) => Promise<void>,
     effort?: RunInfo['effort'],
     report = this.diagnostic,
-    action?: string,
   ) {
     const view = this.states.get(id);
     if (!view || this.deleting.has(id)) throw new DiagnosticFailure('missing', '会话不存在或正在删除');
@@ -177,6 +191,13 @@ export class RunManager {
       throw new DiagnosticFailure('unavailable', '工作区不可用');
     if (this.uncertain.has(id)) throw new Error(this.uncertain.get(id));
     if (this.reserved.has(key)) throw new DiagnosticFailure('busy', '该工作区已有任务在运行');
+    const saved = this.novelTasks.get(id);
+    const continuation: NovelContinuation | undefined = saved && {
+      task: structuredClone(saved),
+      originalDirection: view.messages[saved.originalLine].text,
+      amendedDirection:
+        saved.amendmentLine === undefined ? undefined : view.messages[saved.amendmentLine].text,
+    };
     const run: RunInfo = { id: randomUUID(), status: 'running', effort };
     const trace = diagnosticScope(this.sessionTrace(view.session, report), { runId: run.id });
     const started = performance.now();
@@ -194,7 +215,7 @@ export class RunManager {
     this.reserved.add(key);
     const active: Active = { controller: cancel, settled: Promise.resolve() };
     this.active.set(id, active);
-    trace('run.started', { action, effort });
+    trace('run.started', { effort });
     active.settled = (async () => {
       try {
         await this.append(view, { run: { ...run } });
@@ -205,6 +226,17 @@ export class RunManager {
           diagnostic: trace,
           signal: cancel.signal,
           session: structuredClone(view.session),
+          authorLine: prompt ? view.messages.length - 1 : undefined,
+          continuation,
+          saveNovelTask: async (value) => {
+            cancel.signal.throwIfAborted();
+            const saved = value && readNovelTask(value, view.messages);
+            if (!view.session.bookId || (value && !saved))
+              throw new DiagnosticFailure('novel_goal_conflict', '无法保存当前小说的续接信息');
+            await this.append(view, { novelTask: saved || null, run: { ...run, preview: undefined } });
+            if (saved) this.novelTasks.set(id, saved);
+            else this.novelTasks.delete(id);
+          },
           line: pushLine,
           uncertainStop: (reason) => {
             this.uncertain.set(id, reason);
@@ -302,6 +334,7 @@ export class RunManager {
           if (error.code !== 'ENOENT') throw error;
         });
         this.states.delete(id);
+        this.novelTasks.delete(id);
         this.sessionTrace(state.session, report)('session.deleted');
         this.uncertain.delete(id);
         this.changed(id);

@@ -10,7 +10,8 @@ export class ProviderError extends Error {
   constructor(
     message: string,
     readonly kind: 'auth' | 'network' | 'protocol' | 'timeout' = 'protocol',
-    readonly detail?: 'http_error' | 'malformed_stream' | 'incomplete_stream' | 'provider_error',
+    readonly detail?:
+      'http_error' | 'malformed_stream' | 'incomplete_stream' | 'output_limit' | 'provider_error',
   ) {
     super(message);
   }
@@ -351,8 +352,10 @@ async function parseMessages(
         break;
       }
     }
+    if (closed && finish === 'max_tokens')
+      throw error('Messages 输出达到模型长度上限，未取得完整结果', 'output_limit');
     if (!closed || !['end_turn', 'tool_use', 'stop_sequence'].includes(finish))
-      throw error('Messages 输出中断或未完成', 'incomplete_stream');
+      throw error('Messages 输出中断或缺少有效的结束状态', 'incomplete_stream');
   } catch (cause) {
     const completedCalls = [...completedToolBlocks]
       .map((index) => blocks.get(index))
@@ -397,8 +400,17 @@ export function createProvider(
   timeoutMs = 120_000,
 ): ModelProvider {
   const configuration = settings(profile, effort);
+  // The official DeepSeek Messages endpoint documents a larger budget (including thinking tokens).
+  // Do not assume the same limit for models behind other gateways.
+  const extendedOutputTokens =
+    profile.protocol === 'messages' &&
+    /^https:\/\/api\.deepseek\.com\/anthropic(?:\/v1)?$/i.test(profile.baseUrl) &&
+    /^deepseek-(?:flash|v4-(?:flash|pro))$/i.test(profile.model)
+      ? 16_384
+      : undefined;
   return {
     effort: configuration.used,
+    extendedOutputTokens,
     async turn(request) {
       const spanId = request.spanId ?? randomUUID();
       const report = diagnosticScope(safeReporter(request.diagnostic ?? noDiagnostic), {
@@ -414,7 +426,13 @@ export function createProvider(
       });
       let httpStatus: number | undefined;
       try {
-        const signal = AbortSignal.any([request.signal, AbortSignal.timeout(timeoutMs)]);
+        const turnTimeout =
+          extendedOutputTokens !== undefined &&
+          request.maxTokens === extendedOutputTokens &&
+          timeoutMs === 120_000
+            ? 180_000
+            : timeoutMs;
+        const signal = AbortSignal.any([request.signal, AbortSignal.timeout(turnTimeout)]);
         const url = profile.baseUrl + operation[profile.protocol];
         const hdr: Record<string, string> = {
           'content-type': 'application/json',
@@ -435,6 +453,11 @@ export function createProvider(
           model: profile.model,
           stream: true,
           ...configuration.fields,
+          ...(extendedOutputTokens &&
+            request.directProse &&
+            !request.tools.length && {
+              thinking: { type: 'disabled' },
+            }),
           ...(request.tools.length ? { tools: toolDefinitions(request.tools, profile.protocol) } : {}),
         });
         let response: Response;

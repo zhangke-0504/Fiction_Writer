@@ -119,6 +119,13 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
     release();
     await expect(panel.getByText('第一段已完成', { exact: true })).toBeVisible();
     expect(requests[0].url).toBe('/one/v1/chat/completions');
+    expect(
+      requests[0].body.tools.map((tool: { function: { name: string } }) => tool.function.name),
+    ).toContain('read_file');
+    expect(JSON.stringify(requests[0].body.tools)).not.toMatch(
+      /skill_search|skill_load|book_get_context/,
+    );
+    await expect(panel.getByLabel('写作动作')).toHaveCount(0);
     expect(JSON.stringify(requests[0].body)).toContain('最初版本');
     expect(requests[0].body.reasoning_effort).toBeUndefined();
     await expect(panel.getByText(/使用模型默认思考设置/)).toBeVisible();

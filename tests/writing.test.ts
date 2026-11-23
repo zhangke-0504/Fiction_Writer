@@ -9,8 +9,9 @@ import { RunManager } from '../electron/agent/runs.js';
 import { Journal } from '../electron/journal.js';
 import { NovelTools } from '../electron/agent/novel-tools.js';
 import { runAgent } from '../electron/agent/loop.js';
+import { ProviderError } from '../electron/agent/provider.js';
 import { ScriptedProvider } from '../electron/agent/scripted.js';
-import { loadSkills } from '../electron/agent/skills.js';
+import { SkillCatalog } from '../electron/agent/skills.js';
 import { fileURLToPath } from 'node:url';
 import { chapterContext } from '../electron/agent/chapter-context.js';
 import { draftChapter } from '../electron/agent/draft.js';
@@ -30,7 +31,12 @@ async function fixture(t: import('node:test').TestContext) {
     runs = new RunManager(join(root, 'state'), journal);
   await runs.init();
   const session = await runs.create({ cwd: workspace.bookRoot(id), bookId: id }, '测试');
-  const skills = await loadSkills(fileURLToPath(new URL('../skills', import.meta.url)));
+  const skillsPath = fileURLToPath(new URL('../skills', import.meta.url));
+  const catalog = new SkillCatalog(skillsPath);
+  const skills = {
+    chapter: await catalog.load('write-chapter'),
+    consistency: await catalog.load('story-consistency'),
+  };
   const outline = await workspace.readDocument(id, { type: 'outline', id: 'outline' });
   const report = await workspace.writeChanges(id, [
     { ...outline, expect: outline.revision, body: '父亲留下 [钥匙](subjects/key.md)。' },
@@ -76,11 +82,181 @@ async function fixture(t: import('node:test').TestContext) {
     },
   ]);
   assert.equal(report.error, undefined);
-  return { workspace, root, id, runs, session, skills };
+  return { workspace, root, id, runs, session, skills, catalog };
 }
 
+test('reference index uses canonical IDs, paginates and does not authorize a write', async (t) => {
+  const { workspace, id, runs, session, skills, catalog } = await fixture(t);
+  const outline = await workspace.readDocument(id, { type: 'outline', id: 'outline' });
+  const indexed = Array.from({ length: 61 }, (_, i) => `<!-- beat:story-${i} -->`).join('\n\n');
+  assert.equal(
+    (
+      await workspace.writeDocument(id, {
+        ...outline,
+        body: `${outline.body}\n\n${indexed}\n\n\`\`\`md\n<!-- beat:not-a-real-id -->\n\`\`\``,
+      })
+    ).error,
+    undefined,
+  );
+  const provider = new ScriptedProvider([
+    () => call('beats', 'book_get_context', { index: 'beats' }),
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"nextOffset":60/);
+      assert.match(JSON.stringify(history.at(-1)), /story-59/);
+      assert.doesNotMatch(JSON.stringify(history.at(-1)), /story-60|not-a-real-id/);
+      return call('beats-next', 'book_get_context', { index: 'beats', offset: 60 });
+    },
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"rows":\[\{"id":"story-60"\}\],"nextOffset":null/);
+      return call('ids', 'book_get_context', { index: 'subjects' });
+    },
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"id":"key"/);
+      assert.doesNotMatch(JSON.stringify(history.at(-1)), /父亲留下/);
+      return call('chapters', 'book_get_context', { index: 'chapters' });
+    },
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"id":"one","title":"潮起","order":1,"hasBody":true/);
+      return call('no-write', 'book_apply_changes', {
+        operations: [{ type: 'subject', id: 'key', action: 'update', body: '不应修改' }],
+      });
+    },
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /先用 book_get_context/);
+      return text('需要读原文');
+    },
+  ]);
+  runs.start(session.id, '读取索引', async (ctx) => {
+    await runAgent(
+      ctx,
+      provider,
+      '',
+      [],
+      '读取索引',
+      new NovelTools(workspace, id, provider, catalog).tools(),
+    );
+  });
+  await runs.wait(session.id);
+  assert.equal(runs.get(session.id).run?.status, 'completed', runs.get(session.id).run?.error);
+  assert.equal((await workspace.readDocument(id, { type: 'subject', id: 'key' })).body, '父亲留下。');
+});
+
+test('an invalid foreshadowing reference returns concrete repairs without writing the batch', async (t) => {
+  const { workspace, id, runs, session, skills, catalog } = await fixture(t);
+  const trace = collectDiagnostics();
+  const outline = await workspace.readDocument(id, { type: 'outline', id: 'outline' });
+  assert.equal(
+    (
+      await workspace.writeDocument(id, {
+        ...outline,
+        body: `${outline.body}\n\n<!-- beat:real-departure -->`,
+      })
+    ).error,
+    undefined,
+  );
+  assert.equal(
+    (
+      await workspace.writeChanges(id, [
+        {
+          type: 'clue',
+          id: 'legacy',
+          expect: null,
+          fields: { title: '旧伏笔', setupBeatId: 'real-departure' },
+          body: '原稿',
+        },
+      ])
+    ).error,
+    undefined,
+  );
+  const invalid = {
+    type: 'clue',
+    id: 'hint-troy-embers',
+    action: 'create',
+    body: '灰烬下埋着归乡的线索。',
+    fields: {
+      title: '特洛伊余烬',
+      subjectIds: ['key'],
+      setupBeatId: 'beat-departure',
+      payoffChapterId: 'two',
+    },
+  };
+  const provider = new ScriptedProvider([
+    () => call('read', 'book_get_context', {}),
+    () => call('invalid', 'book_apply_changes', { operations: [invalid] }),
+    async ({ history }) => {
+      const last = history.at(-1)!;
+      assert.equal(last.role, 'tool');
+      assert.equal(last.result.reason, 'invalid_references');
+      assert.equal(last.result.ok, false);
+      assert.deepEqual(last.result.value, {
+        committed: [],
+        pending: [{ type: 'clue', id: invalid.id }],
+        invalidReferences: [
+          {
+            document: { type: 'clue', id: invalid.id },
+            field: 'setupBeatId',
+            target: { type: 'beat', id: 'beat-departure' },
+          },
+        ],
+        reason: 'invalid_references',
+        error: 'clue/hint-troy-embers：无效引用 beat/beat-departure',
+      });
+      await assert.rejects(workspace.readDocument(id, { type: 'clue', id: invalid.id }));
+      return call('index', 'book_get_context', { index: 'chapters' });
+    },
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"id":"one"/);
+      return call('repair', 'book_apply_changes', {
+        operations: [
+          {
+            ...invalid,
+            fields: { ...invalid.fields, setupBeatId: null, setupChapterId: 'one' },
+          },
+        ],
+      });
+    },
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"ok":true/);
+      return text('已修正');
+    },
+  ]);
+  runs.start(
+    session.id,
+    '修正伏笔',
+    async (ctx) => {
+      await runAgent(
+        ctx,
+        provider,
+        '',
+        [],
+        '修正伏笔',
+        new NovelTools(workspace, id, provider, catalog).tools(),
+      );
+    },
+    'high',
+    trace.report,
+  );
+  await runs.wait(session.id);
+  assert.equal(runs.get(session.id).run?.status, 'completed', runs.get(session.id).run?.error);
+  assert.equal(
+    (await workspace.readDocument(id, { type: 'clue', id: invalid.id })).fields.setupChapterId,
+    'one',
+  );
+  assert.equal(
+    (await workspace.readDocument(id, { type: 'clue', id: 'legacy' })).fields.setupBeatId,
+    'real-departure',
+  );
+  assert.equal(
+    trace.rows.find((row) => row.event === 'tool.finished' && row.fields.tool === 'book_apply_changes')
+      ?.fields.reason,
+    'invalid_references',
+  );
+  assert.deepEqual(trace.rejected, []);
+  assert.doesNotMatch(JSON.stringify(trace.rows), /hint-troy-embers|beat-departure/);
+});
+
 test('story consistency requires the current read set and applies only affected documents', async (t) => {
-  const { workspace, id, runs, session, skills } = await fixture(t);
+  const { workspace, id, runs, session, skills, catalog } = await fixture(t);
   const town = await workspace.readDocument(id, { type: 'subject', id: 'town' });
   const provider = new ScriptedProvider([
     () =>
@@ -121,7 +297,7 @@ test('story consistency requires the current read set and applies only affected 
       skills.consistency,
       [],
       '调整钥匙来历',
-      new NovelTools(workspace, id, provider, skills).tools(),
+      new NovelTools(workspace, id, provider, catalog).tools(),
     ).then(() => {}),
   );
   await runs.wait(session.id);
@@ -159,7 +335,7 @@ test('story consistency requires the current read set and applies only affected 
       skills.consistency,
       [],
       '改大纲',
-      new NovelTools(workspace, id, reverse, skills).tools(),
+      new NovelTools(workspace, id, reverse, catalog).tools(),
     ).then(() => {}),
   );
   await runs.wait(session.id);
@@ -171,8 +347,62 @@ test('story consistency requires the current read set and applies only affected 
   assert.match((await workspace.readDocument(id, { type: 'subject', id: 'key' })).body, /母亲/);
 });
 
+test('an exact in-run commit can be reused, but a subsequent external edit still needs a fresh read', async (t) => {
+  const { workspace, id, runs, session, catalog } = await fixture(t);
+  const ref = { type: 'subject' as const, id: 'new-cast-id' };
+  const mutation = (id: string, action: 'create' | 'update', body: string) =>
+    call(id, 'book_apply_changes', {
+      operations: [
+        {
+          ...ref,
+          action,
+          body,
+          ...(action === 'create' && { fields: { name: '归人', kind: 'character' } }),
+        },
+      ],
+    });
+  const provider = new ScriptedProvider([
+    () => call('read', 'book_get_context', {}),
+    () => mutation('create', 'create', '初稿'),
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"ok":true/);
+      return mutation('update', 'update', 'Agent 已知修改');
+    },
+    async ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"ok":true/);
+      const doc = await workspace.readDocument(id, ref);
+      assert.equal(doc.body, 'Agent 已知修改');
+      assert.equal(
+        (await workspace.writeDocument(id, { ...doc, body: '作者外部修订' })).error,
+        undefined,
+      );
+      return mutation('stale', 'update', '不能覆盖');
+    },
+    ({ history }) => {
+      const last = history.at(-1)!;
+      assert.equal(last.role, 'tool');
+      assert.equal(last.result.reason, 'context_required');
+      assert.deepEqual(last.result.value, { unread: [ref], remaining: 0 });
+      return text('保留作者修订');
+    },
+  ]);
+  runs.start(session.id, '修改资料', async (ctx) => {
+    await runAgent(
+      ctx,
+      provider,
+      '',
+      [],
+      '修改资料',
+      new NovelTools(workspace, id, provider, catalog).tools(),
+    );
+  });
+  await runs.wait(session.id);
+  assert.equal(runs.get(session.id).run?.status, 'completed', runs.get(session.id).run?.error);
+  assert.equal((await workspace.readDocument(id, ref)).body, '作者外部修订');
+});
+
 test('chapter drafting uses prior prose, relevant clues, subject facts, and keeps continuation as an append', async (t) => {
-  const { workspace, id, runs, session, skills } = await fixture(t);
+  const { workspace, id, runs, session, skills, catalog } = await fixture(t);
   const provider = new ScriptedProvider([
     ({ history, system, onText }) => {
       const input = JSON.stringify(history);
@@ -198,6 +428,125 @@ test('chapter drafting uses prior prose, relevant clues, subject facts, and keep
   );
 });
 
+test('only a direct current request can overwrite its explicit chapter target', async (t) => {
+  const { workspace, id, runs, session, skills, catalog } = await fixture(t);
+  const one = await workspace.readDocument(id, { type: 'chapter', id: 'one' });
+  const two = await workspace.readDocument(id, { type: 'chapter', id: 'two' });
+  for (const [prompt, target] of [
+    ['不要重写第二章', 'two'],
+    ['请从头重写第二章', 'one'],
+    ['请看看第二章', 'two'],
+    ['重写第二章？', 'two'],
+    ['请从头重写第二章', 'two'],
+  ]) {
+    const allowed = prompt === '请从头重写第二章' && target === 'two';
+    const provider = new ScriptedProvider([
+      () =>
+        call('replace', 'book_generate_chapter', {
+          chapterId: target,
+          mode: 'replace',
+          direction: '请重写第二章',
+        }),
+      ...(allowed ? [() => text('现在门后透出灯光。')] : []),
+      ({ history }) => {
+        assert.match(JSON.stringify(history.at(-1)), allowed ? /"ok":true/ : /rewrite_not_authorized/);
+        return text('完成测试');
+      },
+    ]);
+    runs.start(session.id, prompt, async (ctx) => {
+      await runAgent(
+        ctx,
+        provider,
+        '',
+        [],
+        prompt,
+        new NovelTools(workspace, id, provider, catalog, { authorPrompt: prompt }).tools(),
+      );
+    });
+    await runs.wait(session.id);
+    assert.equal(runs.get(session.id).run?.status, 'completed', runs.get(session.id).run?.error);
+    assert.equal((await workspace.readDocument(id, one)).revision, one.revision);
+    assert.equal(
+      (await workspace.readDocument(id, two)).body,
+      allowed ? '现在门后透出灯光。' : two.body,
+    );
+  }
+});
+
+for (const reason of ['incomplete_stream', 'output_limit'] as const) {
+  test(`chapter tool treats ${reason} as non-committable and bounds retries`, async (t) => {
+    const { workspace, id, runs, session, skills, catalog } = await fixture(t);
+    const trace = collectDiagnostics();
+    const doc = await workspace.readDocument(id, { type: 'chapter', id: 'two' });
+    let attempts = 0;
+    const fail = ({ onText }: import('../electron/agent/model.js').ModelRequest) => {
+      assert.equal(runs.get(session.id).run?.preview, undefined);
+      onText(`未完成预览 ${++attempts}`);
+      throw new ProviderError('不应提交', 'protocol', reason);
+    };
+    const toolCall = (callId: string) =>
+      call(callId, 'book_generate_chapter', { chapterId: 'two', mode: 'append' });
+    const provider = new ScriptedProvider([
+      () => toolCall('first'),
+      fail,
+      ...(reason === 'incomplete_stream' ? [fail] : []),
+      ({ history }) => {
+        assert.match(JSON.stringify(history.at(-1)), new RegExp(reason));
+        return toolCall('replay');
+      },
+      ({ history }) => {
+        assert.match(JSON.stringify(history.at(-1)), new RegExp(reason));
+        return text('未保存');
+      },
+    ]);
+    runs.start(
+      session.id,
+      '继续当前章',
+      async (ctx) => {
+        await runAgent(
+          ctx,
+          provider,
+          '',
+          [],
+          '继续当前章',
+          new NovelTools(workspace, id, provider, catalog).tools(),
+        );
+      },
+      'high',
+      trace.report,
+    );
+    await runs.wait(session.id);
+    assert.equal(runs.get(session.id).run?.status, 'completed', runs.get(session.id).run?.error);
+    assert.equal(runs.get(session.id).run?.preview, undefined);
+    assert.equal((await workspace.readDocument(id, doc)).revision, doc.revision);
+    assert.equal(attempts, reason === 'incomplete_stream' ? 2 : 1);
+    assert.equal(trace.rows.filter((row) => row.event === 'chapter.retry').length, attempts - 1);
+    assert.deepEqual(trace.rejected, []);
+  });
+}
+
+test('chapter retry will not generate again if the draft base changed after interruption', async (t) => {
+  const { workspace, id, runs, session } = await fixture(t);
+  const doc = await workspace.readDocument(id, { type: 'chapter', id: 'two' });
+  const model = new ScriptedProvider([
+    async ({ onText }) => {
+      onText('未完成预览');
+      assert.equal(
+        (await workspace.writeDocument(id, { ...doc, body: '作者刚刚改写的文字' })).error,
+        undefined,
+      );
+      throw new ProviderError('模拟断流', 'protocol', 'incomplete_stream');
+    },
+  ]);
+  runs.start(session.id, '续写', async (ctx) => {
+    await draftChapter(workspace, ctx, model, 'two', 'append', '', { retryIncomplete: true });
+  });
+  await runs.wait(session.id);
+  assert.match(runs.get(session.id).run?.error ?? '', /已变化/);
+  assert.equal(runs.get(session.id).run?.preview, undefined);
+  assert.equal((await workspace.readDocument(id, doc)).body, '作者刚刚改写的文字');
+});
+
 test('long chapter context uses real excerpts with source IDs and prioritizes recent prose', () => {
   const make = (id: string, order: number, body: string): Manuscript => ({
     type: 'chapter',
@@ -218,7 +567,7 @@ test('long chapter context uses real excerpts with source IDs and prioritizes re
 });
 
 test('long chapter generation can retrieve a missed passage before showing prose', async (t) => {
-  const { workspace, id, runs, session, skills } = await fixture(t);
+  const { workspace, id, runs, session, skills, catalog } = await fixture(t);
   const earlier = await workspace.readDocument(id, { type: 'chapter', id: 'one' });
   const fact = '潮汐誓言从不允许携火过桥。';
   const body = `开篇。\n\n${'甲'.repeat(32_000)}\n\n${fact}\n\n${'乙'.repeat(32_000)}\n\n结尾。`;
@@ -257,7 +606,7 @@ test('long chapter generation can retrieve a missed passage before showing prose
 });
 
 test('writing based on a reread passage rejects a later change to that source', async (t) => {
-  const { workspace, id, runs, session, skills } = await fixture(t);
+  const { workspace, id, runs, session, skills, catalog } = await fixture(t);
   const original = await workspace.readDocument(id, { type: 'chapter', id: 'one' });
   assert.equal(
     (await workspace.writeDocument(id, { ...original, body: `${'甲'.repeat(60_000)}取材出处` })).error,
@@ -308,7 +657,7 @@ test('writing based on a reread passage rejects a later change to that source', 
 });
 
 test('stopping a direct chapter draft clears its preview and records no commit', async (t) => {
-  const { workspace, id, runs, session, skills } = await fixture(t);
+  const { workspace, id, runs, session, skills, catalog } = await fixture(t);
   const before = await workspace.readDocument(id, { type: 'chapter', id: 'two' });
   const trace = collectDiagnostics();
   let entered!: () => void;

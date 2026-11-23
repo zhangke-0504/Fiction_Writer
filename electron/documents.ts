@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { parser } from '@lezer/markdown';
 import { parse as yaml, stringify } from 'yaml';
-import type { DocRef, DocType, Fields, Manuscript } from '../shared/contracts.js';
+import type { DocRef, DocType, Fields, InvalidReference, Manuscript } from '../shared/contracts.js';
 
 export const itemFolders = { subject: 'subjects', clue: 'foreshadowing', chapter: 'chapters' } as const;
 export const kinds = ['character', 'item', 'scene'];
@@ -129,24 +129,38 @@ export function storyBeats(body: string) {
   });
   return ids;
 }
-function itemRefs(doc: Pick<Manuscript, 'type' | 'fields' | 'body'>) {
-  const refs = storyLinks(doc.body).map((link) => docKey(link.ref));
+type Reference = Omit<InvalidReference, 'document'>;
+export const referenceKey = ({ type, id }: Reference['target']) => `${type}/${id}`;
+export function referenceIssues(
+  doc: Pick<Manuscript, 'type' | 'fields' | 'body'>,
+  targetKeys: ReadonlySet<string>,
+  beats: ReadonlySet<string>,
+) {
+  const issues = new Map<string, Reference>();
+  const check = (field: Reference['field'], type: Reference['target']['type'], id?: string) => {
+    if (!id || (type === 'beat' ? beats.has(id) : targetKeys.has(docKey({ type, id })))) return;
+    const key = `${field}:${type}/${id}`;
+    if (!issues.has(key)) issues.set(key, { field, target: { type, id } });
+  };
+  for (const link of storyLinks(doc.body)) check('body', link.ref.type, link.ref.id);
   if (doc.type === 'clue') {
-    for (const id of doc.fields.subjectIds ?? []) refs.push(`subject/${id}`);
-    for (const id of [doc.fields.setupChapterId, doc.fields.payoffChapterId])
-      if (id) refs.push(`chapter/${id}`);
-    for (const id of [doc.fields.setupBeatId, doc.fields.payoffBeatId]) if (id) refs.push(`beat/${id}`);
+    for (const id of doc.fields.subjectIds ?? []) check('subjectIds', 'subject', id);
+    for (const field of ['setupChapterId', 'payoffChapterId'] as const)
+      check(field, 'chapter', doc.fields[field]);
+    for (const field of ['setupBeatId', 'payoffBeatId'] as const)
+      check(field, 'beat', doc.fields[field]);
   }
-  if (doc.type === 'chapter') for (const id of doc.fields.beatIds ?? []) refs.push(`beat/${id}`);
-  return refs;
+  if (doc.type === 'chapter') for (const id of doc.fields.beatIds ?? []) check('beatIds', 'beat', id);
+  return issues;
 }
 export function referenceErrors(
   doc: Pick<Manuscript, 'type' | 'fields' | 'body'>,
   targetKeys: ReadonlySet<string>,
-  beats: string[],
+  beats: ReadonlySet<string>,
 ) {
-  const allowed = new Set([...targetKeys, ...beats.map((id) => `beat/${id}`)]);
-  return [...new Set(itemRefs(doc).filter((key) => !allowed.has(key)))];
+  return [
+    ...new Set([...referenceIssues(doc, targetKeys, beats).values()].map((r) => referenceKey(r.target))),
+  ];
 }
 export function unlinkRemoved(
   doc: Manuscript,

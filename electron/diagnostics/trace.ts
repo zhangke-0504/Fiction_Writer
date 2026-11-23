@@ -16,12 +16,8 @@ export function errorReason(error: unknown, signal?: AbortSignal) {
   if (e.kind === 'network') return 'network';
   if (e.kind === 'protocol') return e.detail ?? 'protocol';
   if (e.code === 'ENOENT') return 'missing';
-  if (
-    e.code === 'validation' ||
-    e.code === 'invalid_frontmatter' ||
-    e.code === 'invalid_references' ||
-    e.code === 'workspace_error'
-  )
+  if (e.code === 'invalid_references' || e.code === 'unbound_foreshadowing') return e.code;
+  if (e.code === 'validation' || e.code === 'invalid_frontmatter' || e.code === 'workspace_error')
     return 'input_validation';
   if (e.code === 'conflict') return 'conflict';
   if (typeof e.code === 'string' && /^(EACCES|EPERM|EBUSY|ENOSPC|EROFS|EIO)$/.test(e.code))

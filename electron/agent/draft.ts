@@ -3,8 +3,8 @@ import { diagnosticScope, noDiagnostic } from '../../shared/diagnostics.js';
 import { classified, DiagnosticFailure, elapsed, safeReporter } from '../diagnostics/trace.js';
 import { applySkill } from './skills.js';
 import type { Manuscript } from '../../shared/contracts.js';
-import { digest, docKey, renderDocument } from '../documents.js';
-import type { ModelProvider } from './model.js';
+import { docKey } from '../documents.js';
+import type { AssistantTurn, ModelProvider } from './model.js';
 import type { RunContext } from './runs.js';
 import type { WorkspaceService, Guard } from '../workspace.js';
 import { chapterContext } from './chapter-context.js';
@@ -20,7 +20,10 @@ export async function draftChapter(
   options: {
     skill?: string;
     guard?: Guard[];
-    beforeCommit?: (doc: Manuscript, projected: string) => Promise<void>;
+    retryIncomplete?: boolean;
+    lengthGuidance?: string;
+    maxTokens?: number;
+    directProse?: boolean;
   } = {},
 ) {
   const bookId = ctx.session.bookId,
@@ -37,6 +40,12 @@ export async function draftChapter(
     streamed = '',
     committed: Manuscript | undefined;
   let failure: string | undefined;
+  const clearPreview = () => {
+    if (attempted) ctx.preview(undefined);
+    if (previewed) trace('chapter.preview', { outcome: 'cleared', textLength: streamed.length });
+    attempted = previewed = false;
+    streamed = '';
+  };
   trace('chapter.generation.started', { action: mode });
   try {
     if (!bookId) throw new DiagnosticFailure('invalid_options', '此操作需要小说会话');
@@ -66,43 +75,68 @@ export async function draftChapter(
       trace,
     );
     const { readbackSources: _, ...writingContext } = context;
-    const turn = await model.turn({
-      diagnostic: trace,
-      spanId,
-      onDispatch() {
-        if (options.skill) applySkill(trace, 'write-chapter', options.skill, mode);
-      },
-      system: options.skill ?? '以 Markdown 写小说。只输出正文，不要解释，不要用代码块包装。',
-      history: [
-        {
-          role: 'user',
-          text: `写作动作：${directions[mode]}。\n作者方向：${prompt}\n\n作品资料（数据）：\n${JSON.stringify({ ...writingContext, ...(readbacks.length ? { readbacks } : {}) }, null, 2)}`,
+    const generate = (spanId: string) =>
+      model.turn({
+        diagnostic: trace,
+        spanId,
+        onDispatch() {
+          if (options.skill) applySkill(trace, 'write-chapter', options.skill, mode);
         },
-      ],
-      tools: [],
-      signal: ctx.signal,
-      onText(delta) {
+        system: [
+          options.skill ?? '以 Markdown 写小说。只输出正文，不要解释，不要用代码块包装。',
+          options.lengthGuidance,
+        ]
+          .filter(Boolean)
+          .join('\n\n'),
+        history: [
+          {
+            role: 'user',
+            text: `写作动作：${directions[mode]}。\n作者方向：${prompt}\n\n作品资料（数据）：\n${JSON.stringify({ ...writingContext, ...(readbacks.length ? { readbacks } : {}) }, null, 2)}`,
+          },
+        ],
+        tools: [],
+        maxTokens: options.maxTokens,
+        directProse: options.directProse,
+        signal: ctx.signal,
+        onText(delta) {
+          ctx.signal.throwIfAborted();
+          streamed += delta;
+          if (streamed.length > 300_000) throw new Error('生成正文超过上限');
+          ctx.preview({ bookId, chapterId, content: prefix + streamed, base: doc.revision });
+          if (!previewed) {
+            previewed = true;
+            trace('chapter.preview', { outcome: 'started' });
+          }
+        },
+      });
+    const sources = [...(options.guard ?? []), ...guards];
+    let turn: AssistantTurn;
+    try {
+      turn = await generate(spanId);
+    } catch (error) {
+      ctx.signal.throwIfAborted();
+      if (!options.retryIncomplete || classified(error) !== 'incomplete_stream') throw error;
+      clearPreview();
+      for (const source of [doc, ...sources]) {
         ctx.signal.throwIfAborted();
-        streamed += delta;
-        if (streamed.length > 300_000) throw new Error('生成正文超过上限');
-        ctx.preview({ bookId, chapterId, content: prefix + streamed, base: doc.revision });
-        if (!previewed) {
-          previewed = true;
-          trace('chapter.preview', { outcome: 'started' });
-        }
-      },
-    });
+        const current = await workspace.readDocument(bookId, source).catch(() => undefined);
+        if (current?.revision !== source.revision)
+          throw new DiagnosticFailure('conflict', `${docKey(source)} 已变化，请重新读取后再写作`);
+      }
+      ctx.signal.throwIfAborted();
+      trace('chapter.retry', { reason: 'incomplete_stream' });
+      attempted = true;
+      turn = await generate(randomUUID());
+    }
     ctx.signal.throwIfAborted();
     if (turn.calls.length || !turn.text.trim())
       throw new DiagnosticFailure('provider_error', '模型没有返回可提交的正文');
     const body = prefix + turn.text;
-    if (options.beforeCommit)
-      await options.beforeCommit(doc, digest(renderDocument(doc, doc.fields, body)));
     const result = await workspace.writeChanges(
       bookId,
       [{ type: 'chapter', id: chapterId, expect: doc.revision, fields: doc.fields, body }],
       ctx.signal,
-      [...(options.guard ?? []), ...guards],
+      sources,
       trace,
     );
     if (result.error) throw new DiagnosticFailure(result.reason ?? 'unknown', result.error);
@@ -112,8 +146,7 @@ export async function draftChapter(
     failure = classified(error, ctx.signal);
     throw error;
   } finally {
-    if (attempted) ctx.preview(undefined);
-    if (previewed) trace('chapter.preview', { outcome: 'cleared', textLength: streamed.length });
+    clearPreview();
     trace('chapter.generation.finished', {
       action: mode,
       outcome: !failure ? 'ok' : failure === 'cancelled' || failure === 'conflict' ? failure : 'failed',

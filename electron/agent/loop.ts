@@ -14,6 +14,17 @@ import type { RunContext } from './runs.js';
 import type { ToolResult } from '../../shared/contracts.js';
 export interface LocalTool extends ToolSpec {
   execute: (args: Record<string, any>, ctx: RunContext) => Promise<unknown>;
+  onResultSent?: (result: ToolResult, report: ReportDiagnostic) => void;
+}
+/** A domain failure can carry a bounded tool result, without forwarding it to diagnostics. */
+export class ToolFailure extends DiagnosticFailure {
+  constructor(
+    reason: string,
+    message: string,
+    readonly value?: unknown,
+  ) {
+    super(reason, message);
+  }
 }
 export const object = (properties: Record<string, unknown>, required = Object.keys(properties)) => ({
   type: 'object',
@@ -87,6 +98,12 @@ function commandOutcome(value: unknown) {
   };
 }
 
+export const defaultRoundLimit = 24;
+interface AgentBudget {
+  roundLimit: () => number;
+  outputTokens: () => number | undefined;
+}
+
 export async function runAgent(
   ctx: RunContext,
   provider: ModelProvider,
@@ -94,14 +111,14 @@ export async function runAgent(
   previous: Turn[],
   prompt: string,
   tools: LocalTool[],
-  limit = 24,
-  onFirstDispatch?: (report: ReportDiagnostic) => void,
+  budget: number | AgentBudget = defaultRoundLimit,
 ) {
   const history: Turn[] = [...previous, { role: 'user', text: prompt }];
   const trace = diagnosticScope(safeReporter(ctx.diagnostic ?? noDiagnostic), { lane: 'agent' });
   const registered = new Map(tools.map((tool) => [tool.name, tool]));
-  const outbound: Candidate[] = [];
+  const outbound: { candidate: Candidate; result: ToolResult; tool?: LocalTool }[] = [];
   let rounds = 0;
+  const roundLimit = () => (typeof budget === 'number' ? budget : budget.roundLimit());
   let active: Round | undefined;
   let failure: string | undefined;
   const finish = (outcome: string, reason: string, toolCount = 0) => {
@@ -165,12 +182,14 @@ export async function runAgent(
           transportOk: false,
           termination: reason === 'termination_uncertain' ? 'uncertain' : undefined,
         });
+        const result: ToolResult = { ok: false, error: safeText(e), reason };
+        const payload = JSON.stringify({
+          ...result,
+          ...(e instanceof ToolFailure && { value: e.value }),
+        });
         return {
           content: [
-            {
-              type: 'text',
-              text: JSON.stringify({ ok: false, error: safeText(e) } satisfies ToolResult),
-            },
+            { type: 'text', text: payload.length <= 120_000 ? payload : JSON.stringify(result) },
           ],
           details: undefined,
           isError: true,
@@ -202,14 +221,19 @@ export async function runAgent(
           system,
           history,
           tools,
+          maxTokens: typeof budget === 'number' ? undefined : budget.outputTokens(),
           signal: ctx.signal,
           onText: ctx.text,
           diagnostic: report,
           spanId,
           onDispatch(nextSpanId) {
-            if (number === 1) onFirstDispatch?.(report);
-            for (const candidate of outbound.splice(0))
+            for (const { candidate, result, tool } of outbound.splice(0)) {
               candidate.report('tool.result_sent', { spanId: nextSpanId, nextTurn: number });
+              tool?.onResultSent?.(
+                result,
+                diagnosticScope(candidate.context, { spanId: nextSpanId, turn: number }),
+              );
+            }
           },
         });
         ctx.signal.throwIfAborted();
@@ -298,7 +322,7 @@ export async function runAgent(
               if (!candidate.executed)
                 reject(candidate, ctx.signal.aborted ? 'cancelled' : 'invalid_arguments');
               candidate.report('tool.result_ready', { outcome: detail.ok ? 'ok' : 'failed' });
-              outbound.push(candidate);
+              outbound.push({ candidate, result: detail, tool: registered.get(tool.toolName) });
             }
           }
           if (ctx.signal.aborted || message.stopReason === 'aborted') {
@@ -307,7 +331,7 @@ export async function runAgent(
           } else if (message.stopReason === 'error') {
             failure = active?.failure ?? 'provider_error';
             finish('failed', failure);
-          } else if (rounds >= limit && toolResults.length) {
+          } else if (rounds >= roundLimit() && toolResults.length) {
             finish('failed', 'iteration_limit', toolResults.length);
             return { action: 'end' };
           } else {
@@ -348,7 +372,7 @@ export async function runAgent(
   const last = [...result].reverse().find((message) => message.role === 'assistant');
   if (last?.stopReason === 'error')
     throw new DiagnosticFailure(failure ?? 'provider_error', last.errorMessage ?? '模型请求失败');
-  if (last?.stopReason === 'toolUse' && rounds >= limit)
+  if (last?.stopReason === 'toolUse' && rounds >= roundLimit())
     throw new DiagnosticFailure('iteration_limit', '已达到模型往返上限；已提交的文件仍保留');
   return history;
 }

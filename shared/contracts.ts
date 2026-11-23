@@ -47,9 +47,23 @@ export interface LibraryView {
 export type Change =
   | (DocRef & { expect: string | null; fields: Fields; body: string })
   | (DocRef & { expect: string; delete: true });
+export type ReferenceField =
+  | 'body'
+  | 'subjectIds'
+  | 'beatIds'
+  | 'setupChapterId'
+  | 'payoffChapterId'
+  | 'setupBeatId'
+  | 'payoffBeatId';
+export interface InvalidReference {
+  document: DocRef;
+  field: ReferenceField;
+  target: { type: DocType | 'beat'; id: string };
+}
 export interface WriteReport {
   committed: DocRef[];
   pending: DocRef[];
+  invalidReferences?: InvalidReference[];
   reason?: string;
   error?: string;
 }
@@ -88,7 +102,6 @@ export interface WorkProgress {
   done: number;
   total: number;
   complete?: boolean;
-  blocked?: boolean;
   message?: string;
 }
 export interface RunInfo {
@@ -104,7 +117,6 @@ export interface SessionView {
   messages: ChatLine[];
   streaming: string;
   run?: RunInfo;
-  workflow?: WorkProgress;
 }
 export interface RuntimeView {
   workerId?: string;
@@ -117,12 +129,11 @@ export interface StartRun {
   effort?: Effort;
   prompt: string;
   attachments?: string[];
-  action?: 'chat' | 'draft' | 'append' | 'replace' | 'novel';
   chapterId?: string;
-  restartWorkflow?: boolean;
 }
 export interface ToolResult {
   ok: boolean;
   value?: unknown;
   error?: string;
+  reason?: string;
 }

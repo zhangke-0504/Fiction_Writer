@@ -26,7 +26,7 @@
 - **THEN** 测试结果分别给出连接成功、工具验证未通过的状态，而不自动改用其他协议或向其他地址发送密钥
 
 ### Requirement: Global panel, directory-bound sessions and run options
-应用 SHALL 在聚焦时支持 `Ctrl+Alt+I` 和可见入口切换 Harness 面板；只在面板内查询、新建、切换和删除 Session。Session SHALL 绑定创建时的小说或用户选择的普通目录，不随页面变化。发送前 SHALL 支持选择已配置模型、`low`／`medium`／`high` 思考等级及参考文件，默认 `high`；不能映射等级时 SHALL 明确显示采用模型默认值。本轮发送后模型、思考等级、目录及附件不因修改界面选项而改变。
+应用 SHALL 在聚焦时支持 `Ctrl+Alt+I` 和可见入口切换 Harness 面板；只在面板内查询、新建、切换和删除 Session。Session SHALL 绑定创建时的小说或用户选择的普通目录，不随页面变化。发送前 SHALL 支持选择已配置模型、`low`／`medium`／`high` 思考等级及参考文件，默认 `high`；不能映射等级时 SHALL 明确显示采用模型默认值。本轮发送后模型、思考等级、目录及附件不因修改界面选项而改变。Harness SHALL 以同一个自然语言发送入口处理讨论和任务；界面及发送请求 MUST NOT 要求对话、单章、整书或继续工作流的模式参数。选中章节如传入，只作为该绑定作品的当前上下文。
 
 #### Scenario: Start a session from the editor or the library
 - **WHEN** 用户在小说页用快捷键打开面板创建会话，再从书库为一个普通目录创建会话
@@ -35,6 +35,10 @@
 #### Scenario: Select a provider, effort and referenced file
 - **WHEN** 用户在面板中用某条模型配置开始一轮，附加一份有效的本地文件，再在运行中切换页面和配置选择
 - **THEN** 本轮只按发起时所选配置和工作目录运行，使用所附文件；后一轮才应用新选择，附件若缺失或超限应在发送前报告
+
+#### Scenario: Discuss a book without writing any files
+- **WHEN** 用户在绑定小说的面板发送「先聊聊怎么把《奥德赛》改编成十章小说，别写文件」
+- **THEN** 不需要选择对话模式；Agent 提供建议，不执行写入，不启动整书生成
 
 ### Requirement: General multi-step agent loop with local tools
 后台 SHALL 支持不依赖小说结构的多步 Agent 循环，包含文件列表、文本搜索、文件读取、创建或覆盖、局部编辑、删除和命令执行。工具 SHALL 能在所选普通目录执行实际的文件和代码任务，而非只生成建议，不要求逐次审批或使用工具沙箱。命令须有工作目录、退出结果、超时、输出边界和取消；工具和模型错误 SHALL 产生可见结果而非无期限挂起。
@@ -47,8 +51,19 @@
 - **WHEN** 命令超时或工具输入无效
 - **THEN** 运行器生成可诊断的结果供模型或用户处理，不挂住界面和另一个工作区；达到运行边界时明确结束该轮
 
+### Requirement: Discover and activate built-in writing skills on demand
+对小说会话，后台 SHALL 向通用 Agent 提供内置 Skill 检索和按注册标识加载指令的工具。检索 SHALL 返回与当前任务相关的候选及简要用途；加载 SHALL 只提供被选中的已注册 Skill 指令。模型 SHALL 能在同一 Run 中理解当前请求、实际检索并选择对应的 Skill，再用现有工具执行。检索排名、Skill 内容或附件 MUST NOT 自行授予写入权限或启动任务。整书请求 MUST NOT 通过专用任务模式、固定整书阶段机、特定提示词匹配或包装该阶段机的工具执行。
+
+#### Scenario: A task discovers and uses a built-in skill in the same run
+- **WHEN** 用户在小说会话要求生成一整本小说，模型检索相应写作能力并选中候选 `generate-novel`
+- **THEN** 同一 Agent Run 实际返回检索结果、加载该 Skill、把指令交给后续模型请求，再由模型调用小说工具；用户不需要选模式、手工指定 Skill 或审批每一步
+
+#### Scenario: Unsupported skill names and ordinary directories do not trigger writing skills
+- **WHEN** 模型申请加载未知 Skill 或提供任意文件路径，或者请求来自普通目录会话
+- **THEN** 未注册 Skill 不会被读取或执行；普通目录仍可用通用工具处理本地任务，不注入小说 Skill 或工具
+
 ### Requirement: Background ownership and recoverable sessions
-后台 SHALL 独立持有活跃运行与 Session，支持消息和运行状态流、历史持久化、在仍运行的应用内接回任务，以及重启后阅读历史。关闭面板、切换页面、切换 Session 或重载渲染界面 SHALL 不取消运行。每个绑定工作区最多一个活跃 Agent Run 或整书任务；应用完全退出或后台终止导致的未完成运行 SHALL 标为中断，不自动执行未确认完成的命令或文件写入。
+后台 SHALL 独立持有活跃运行与 Session，支持消息和运行状态流、历史持久化、在仍运行的应用内接回任务，以及重启后阅读历史。关闭面板、切换页面、切换 Session 或重载渲染界面 SHALL 不取消运行。每个绑定工作区最多一个活跃 Agent Run，整书任务使用同一运行和停止机制；应用完全退出或后台终止导致的未完成运行 SHALL 标为中断，不自动执行未确认完成的命令或文件写入。
 
 #### Scenario: Navigate away while a novel task is running
 - **WHEN** Agent 在小说 A 新增主体并开始续写一章，用户关闭 Harness、回书库新建小说 B，再返回小说 A

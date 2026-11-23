@@ -452,6 +452,92 @@ test('Messages records other candidates as not executed when one block invalidat
   assert.doesNotMatch(JSON.stringify(trace.rows), /private-call-|private-malformed/);
 });
 
+test('a larger tool output budget is only advertised for supported official DeepSeek profiles', () => {
+  const profile: ModelProfile = {
+    id: 'fixture',
+    name: 'fixture',
+    model: 'deepseek-flash',
+    protocol: 'messages',
+    baseUrl: 'https://api.deepseek.com/anthropic',
+  };
+  assert.equal(createProvider(profile, key).extendedOutputTokens, 16_384);
+  assert.equal(
+    createProvider({ ...profile, baseUrl: 'https://example.invalid/anthropic' }, key)
+      .extendedOutputTokens,
+    undefined,
+  );
+  assert.equal(
+    createProvider({ ...profile, model: 'other-model' }, key).extendedOutputTokens,
+    undefined,
+  );
+  assert.equal(createProvider({ ...profile, protocol: 'chat' }, key).extendedOutputTokens, undefined);
+});
+
+test('official DeepSeek direct prose changes only prose-only requests, not tool reasoning', async (t) => {
+  const requests: { thinking?: { type: string } }[] = [];
+  t.mock.method(globalThis, 'fetch', async (_input: unknown, init: RequestInit) => {
+    assert.equal(new URL(String(_input)).origin, 'https://api.deepseek.com');
+    requests.push(JSON.parse(init.body as string));
+    const events = [
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '完整文本。' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      { type: 'message_stop' },
+    ];
+    return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''), {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  });
+  const provider = createProvider(
+    {
+      id: 'fixture',
+      name: 'fixture',
+      model: 'deepseek-flash',
+      protocol: 'messages',
+      baseUrl: 'https://api.deepseek.com/anthropic',
+    },
+    key,
+  );
+  await provider.turn(ctx());
+  await provider.turn({ ...ctx(), directProse: true });
+  await provider.turn({ ...ctx(), directProse: true, tools: [] });
+  assert.deepEqual(
+    requests.map((request) => request.thinking),
+    [undefined, undefined, { type: 'disabled' }],
+  );
+});
+
+test('Messages distinguishes an open stream from a closed max_tokens result', async (t) => {
+  const trace = collectDiagnostics();
+  let closed = false;
+  const { profile } = await fixture(t, 'messages', (_body, res) =>
+    sse(
+      res,
+      {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: 'private-partial-prose' },
+      },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'max_tokens' } },
+      ...(closed ? [{ type: 'message_stop' }] : []),
+    ),
+  );
+  const provider = createProvider(profile, key);
+  for (const reason of ['incomplete_stream', 'output_limit']) {
+    await assert.rejects(provider.turn({ ...ctx(), tools: [], diagnostic: trace.report }), {
+      detail: reason,
+    });
+    closed = true;
+  }
+  assert.deepEqual(
+    trace.rows.filter((row) => row.event === 'model.finished').map((row) => row.fields.reason),
+    ['incomplete_stream', 'output_limit'],
+  );
+  assert.deepEqual(trace.rejected, []);
+  assert.doesNotMatch(JSON.stringify(trace.rows), /private-partial-prose/);
+});
+
 test('Messages distinguishes closed tool blocks from unfinished blocks on early EOF', async (t) => {
   const trace = collectDiagnostics();
   const { profile } = await fixture(t, 'messages', (_body, res) =>

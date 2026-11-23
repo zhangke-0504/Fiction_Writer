@@ -63,7 +63,6 @@ export function Harness({
     [error, setError] = useState(''),
     [failureId, setFailureId] = useState<string>(),
     [busy, setBusy] = useState(false);
-  const [action, setAction] = useState<StartRun['action']>('chat');
   const feed = useRef<HTMLDivElement>(null),
     sticky = useRef(true);
   const current = view.sessions.find((s) => s.session.id === selectedId);
@@ -97,7 +96,6 @@ export function Harness({
     setList(false);
     setError('');
     setFailureId(undefined);
-    setAction('chat');
     setAttachments([]);
     sticky.current = true;
   }
@@ -110,17 +108,9 @@ export function Harness({
       selectSession(created.id);
     });
   }
-  async function send(e: FormEvent | undefined, restartWorkflow = false) {
-    e?.preventDefault();
-    if (!current || !profile || busy || running) return;
-    const actual = restartWorkflow
-      ? 'novel'
-      : action === 'novel' && hasBook
-        ? 'novel'
-        : hasChapter
-          ? action
-          : 'chat';
-    if ((!actual || actual === 'chat') && !prompt.trim()) return;
+  async function send(e: FormEvent) {
+    e.preventDefault();
+    if (!current || !profile || busy || running || !prompt.trim()) return;
     await perform(async () => {
       const args: StartRun = {
         id: current.session.id,
@@ -129,8 +119,6 @@ export function Harness({
         effort,
         attachments: [...attachments],
         chapterId: hasChapter ? chapter.chapterId : undefined,
-        action: actual,
-        restartWorkflow,
       };
       await api.request('session.start', args);
       setPrompt('');
@@ -148,9 +136,7 @@ export function Harness({
       }
     });
   const showList = list || !current;
-  const progress = running
-    ? (current?.run?.progress ?? current?.workflow)
-    : (current?.workflow ?? current?.run?.progress);
+  const progress = current?.run?.progress;
   return (
     <aside className="harness" aria-label="Harness 面板" hidden={!open}>
       <header className="harness-header">
@@ -283,13 +269,13 @@ export function Harness({
                 <h3>{hasBook ? '和作品一起思考' : '在本地目录开始工作'}</h3>
                 <p>
                   {hasBook
-                    ? '可以讨论故事、维护资料，或者选中一章后续写。'
+                    ? '直接说你想做什么：讨论故事、维护资料、写一章或写整本。'
                     : 'Agent 可以读取或编辑工作目录中的文件，并运行本地开发命令。'}
                 </p>
               </div>
             )}
             {progress && (
-              <div className="workflow-status">
+              <div className="writing-progress">
                 <strong>{progress.step}</strong>
                 <span>
                   {progress.done} / {progress.total}
@@ -324,13 +310,6 @@ export function Harness({
               </p>
             )}
             {current.session.missing && <p className="notice">工作区已删除或不可用，历史仍可查看。</p>}
-            {progress?.blocked && hasBook && !running && profile && !current.session.missing && (
-              <p className="composer-note">
-                <button type="button" onClick={() => void send(undefined, true)} disabled={busy}>
-                  按现稿另开计划
-                </button>
-              </p>
-            )}
             {!!attachments.length && (
               <div className="attachment-list">
                 {attachments.map((path) => (
@@ -390,23 +369,6 @@ export function Harness({
                 <option value="medium">Medium</option>
                 <option value="high">High</option>
               </select>
-              {hasBook && (
-                <select
-                  aria-label="写作动作"
-                  value={(hasChapter || action === 'novel' ? action : 'chat') ?? 'chat'}
-                  onChange={(e) => setAction(e.target.value as StartRun['action'])}
-                >
-                  <option value="chat">对话</option>
-                  {hasChapter && (
-                    <>
-                      <option value="draft">生成本章</option>
-                      <option value="append">续写本章</option>
-                      <option value="replace">重写本章</option>
-                    </>
-                  )}
-                  <option value="novel">生成全书</option>
-                </select>
-              )}
               {running ? (
                 <button
                   type="button"
@@ -422,23 +384,12 @@ export function Harness({
               ) : (
                 <button
                   className="primary send"
-                  aria-label={
-                    action === 'novel'
-                      ? progress && !progress.complete
-                        ? '继续生成全书'
-                        : '开始生成全书'
-                      : '发送'
-                  }
-                  disabled={
-                    !profile ||
-                    busy ||
-                    !!current.session.missing ||
-                    ((!action || action === 'chat' || (!hasChapter && action !== 'novel')) &&
-                      !prompt.trim())
-                  }
+                  type="submit"
+                  aria-label="发送"
+                  disabled={!profile || busy || !!current.session.missing || !prompt.trim()}
                 >
                   <Icon name="send" size={16} />
-                  {action === 'novel' ? (progress && !progress.complete ? '继续' : '开始') : '发送'}
+                  发送
                 </button>
               )}
             </div>

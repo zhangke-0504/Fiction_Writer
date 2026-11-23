@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { AssistantTurn, ModelProvider, ModelRequest } from './model.js';
 export type Script = (request: ModelRequest) => AssistantTurn | Promise<AssistantTurn>;
 export class ScriptedProvider implements ModelProvider {
@@ -7,6 +8,7 @@ export class ScriptedProvider implements ModelProvider {
     request.signal.throwIfAborted();
     const step = this.script.shift();
     if (!step) throw new Error('Fixture exhausted');
+    request.onDispatch?.(request.spanId ?? randomUUID());
     const response = await step(request);
     request.signal.throwIfAborted();
     return response;

@@ -11,6 +11,7 @@ import type {
   DocRef,
   DocSummary,
   DocType,
+  InvalidReference,
   LibraryView,
   Manuscript,
   WriteReport,
@@ -23,6 +24,8 @@ import {
   maxDocBytes,
   parseDocument,
   referenceErrors,
+  referenceIssues,
+  referenceKey,
   renderDocument,
   storyBeats,
   unlinkRemoved,
@@ -170,9 +173,10 @@ export class WorkspaceService {
     const { documents, diagnostics } = await this.load(await this.checkedRoot(bookId), bookId);
     const keys = new Set(documents.map(docKey)),
       beats = storyBeats(documents.find((d) => d.type === 'outline')?.body ?? '');
-    if (new Set(beats).size !== beats.length) diagnostics.push('outline/outline: 大纲情节点 ID 重复');
+    const beatIds = new Set(beats);
+    if (beatIds.size !== beats.length) diagnostics.push('outline/outline: 大纲情节点 ID 重复');
     for (const doc of documents) {
-      const broken = referenceErrors(doc, keys, beats);
+      const broken = referenceErrors(doc, keys, beatIds);
       if (broken.length) diagnostics.push(`${docKey(doc)}: 断开的引用 ${broken.join('、')}`);
     }
     return { documents, diagnostics };
@@ -307,8 +311,11 @@ export class WorkspaceService {
     signal?: AbortSignal,
     guards: Guard[] = [],
     diagnostic = noDiagnostic,
+    bindNewClues = false,
   ): Promise<WriteReport> {
-    return this.enqueue(bookId, () => this.commit(bookId, changes, signal, guards, diagnostic));
+    return this.enqueue(bookId, () =>
+      this.commit(bookId, changes, signal, guards, diagnostic, bindNewClues),
+    );
   }
   private async commit(
     bookId: string,
@@ -316,8 +323,10 @@ export class WorkspaceService {
     signal: AbortSignal | undefined,
     guards: Guard[],
     diagnostic: ReportDiagnostic,
+    bindNewClues: boolean,
   ): Promise<WriteReport> {
     let pending = changes.map(refOf);
+    let invalidReferences: InvalidReference[] | undefined;
     const committed: DocRef[] = [];
     if (!changes.length) return { committed, pending };
     const operation = beginCommit(
@@ -403,22 +412,44 @@ export class WorkspaceService {
             });
           }
         }
-      const keys = new Set(projected.keys()),
-        previous = new Set(original.keys());
-      for (const [key, operation] of planned)
-        if (operation.text !== undefined) {
-          const old = original.get(key),
-            broken = old ? referenceErrors(old, previous, priorBeats) : [];
-          const invalid = referenceErrors(projected.get(key)!, keys, nextBeats).filter(
-            (r) => !broken.includes(r),
-          );
-          if (invalid.length)
-            throw new WorkspaceError(`${key}：无效引用 ${invalid.join('、')}`, 'invalid_references');
-        }
       const ordered = [...planned.values()].sort(
         (a, b) => Number(a.text === undefined) - Number(b.text === undefined),
       );
       pending = ordered.map((item) => item.ref);
+      const keys = new Set(projected.keys()),
+        previous = new Set(original.keys()),
+        beforeBeats = new Set(priorBeats),
+        afterBeats = new Set(nextBeats);
+      for (const [key, item] of planned)
+        if (item.text !== undefined) {
+          const old = original.get(key);
+          const broken = old && referenceIssues(old, previous, beforeBeats);
+          const invalid = [...referenceIssues(projected.get(key)!, keys, afterBeats)]
+            .filter(([identity]) => !broken?.has(identity))
+            .map(([, issue]) => ({ document: item.ref, ...issue }));
+          if (invalid.length) {
+            // Send a bounded set of concrete repairs; the next attempt is validated again.
+            invalidReferences = invalid.slice(0, 64);
+            const targets = new Set(invalidReferences.map((issue) => referenceKey(issue.target)));
+            throw new WorkspaceError(
+              `${key}：无效引用 ${[...targets].slice(0, 6).join('、')}`,
+              'invalid_references',
+            );
+          }
+        }
+      if (bindNewClues)
+        for (const item of ordered) {
+          if (item.ref.type !== 'clue' || item.expect !== null || item.text === undefined) continue;
+          const { setupChapterId, payoffChapterId } = projected.get(docKey(item.ref))!.fields;
+          const missing = [setupChapterId, payoffChapterId].some(
+            (id) => !id || !previous.has(`chapter/${id}`),
+          );
+          if (missing)
+            throw new WorkspaceError(
+              `${docKey(item.ref)}：新增伏笔须用现有章节设置埋设和回收点（setupChapterId、payoffChapterId）`,
+              'unbound_foreshadowing',
+            );
+        }
       preconditionsPassed = true;
       operation.trace('workspace.preconditions', {
         outcome: 'ok',
@@ -456,7 +487,13 @@ export class WorkspaceService {
         });
       for (const ref of pending.slice(0, 64))
         operation.trace('workspace.document.pending', traceDocument(ref));
-      return { committed, pending, reason: failure, error: e instanceof Error ? e.message : '写入失败' };
+      return {
+        committed,
+        pending,
+        ...(invalidReferences && { invalidReferences }),
+        reason: failure,
+        error: e instanceof Error ? e.message : '写入失败',
+      };
     } finally {
       const outcome = !failure
         ? 'ok'

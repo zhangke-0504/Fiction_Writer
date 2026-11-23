@@ -833,7 +833,7 @@ dialog::backdrop {
 .run-status.running {
   color: #246449;
 }
-.workflow-status {
+.writing-progress {
   display: flex;
   justify-content: space-between;
   gap: 6px;
@@ -1018,10 +1018,10 @@ dialog::backdrop {
     padding: 15px;
   }
 }
-.workflow-status {
+.writing-progress {
   flex-wrap: wrap;
 }
-.workflow-status p {
+.writing-progress p {
   flex-basis: 100%;
   margin: 0;
   overflow-wrap: anywhere;

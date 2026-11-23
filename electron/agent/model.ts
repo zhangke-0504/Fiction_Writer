@@ -23,6 +23,8 @@ export interface ModelRequest {
   history: Turn[];
   tools: ToolSpec[];
   maxTokens?: number;
+  /** A prose-only subrequest may use the endpoint's documented direct generation option. */
+  directProse?: boolean;
   signal: AbortSignal;
   onText: (text: string) => void;
   diagnostic?: ReportDiagnostic;
@@ -32,5 +34,6 @@ export interface ModelRequest {
 }
 export interface ModelProvider {
   effort: Effort | 'default';
+  extendedOutputTokens?: number;
   turn(input: ModelRequest): Promise<AssistantTurn>;
 }
