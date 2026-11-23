@@ -29,5 +29,8 @@ secrets.json
 .git-credentials
 .netrc
 .npmrc
-/.claude/settings.local.json
-/.codex/auth.json
+
+# Local agent commands, prompts and skills
+/.claude/
+/.codex/
+/.github/
