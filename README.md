@@ -29,6 +29,44 @@ Windows 的作品库在系统「文档」文件夹下的 `Fiction_Writer/library
 
 模型配置、加密的 API Key、Session JSONL 和整书检查点在当前用户的 Electron 应用数据目录下（Windows 通常是 `%APPDATA%\fiction-writer`），不在作品库中。API Key 由操作系统保护，不随稿件导出。不要把真实 Key 放进项目文件、参考文件或命令。
 
+## 本地诊断日志
+
+日志默认开启，只写本机，不上传。实际目录是 Electron 的 `app.getPath('userData')` 下的 `logs`，Windows 默认是 **`%APPDATA%\fiction-writer\logs`**。应用启动过后，在 PowerShell 打开它：
+
+```powershell
+$logDir = Join-Path $env:APPDATA 'fiction-writer\logs'
+explorer.exe $logDir
+```
+
+- `frontend-YYYY-MM-DD.jsonl` 记录界面启动、关键操作、通知序号缺口、重读文档及显示新修订或保留草稿的结果。
+- `backend-YYYY-MM-DD.jsonl` 记录主进程和后台生命周期、模型请求、Agent 轮次、工具校验与实际执行、Skill 加载与采用、整书检查点及文件提交。工具结果已回传指交给下一次请求的传输层，不代表模型确认；Skill 已采用不代表模型遵循了规则。
+
+两份日志都是 UTF-8，每行一个 JSON 对象。按电脑的**本地日历日期**分文件，同日重启追加到原文件，跨午夜自动切换。启动时和运行中清理，保留今天和之前 29 天的应用日志。临时清理失败时，同一天最多再尝试两次，重试至少间隔一分钟；应用关闭期间不清理，下次启动再处理。日志异步写入，正常退出给日志最多 750 毫秒收尾；硬崩溃、磁盘写入失败或队列溢出可能缺记录。一份日志拒写时，其他可写文件继续写入；可在后台日志恢复可写后查 `diagnostics.loss`。崩溃留下的破损行可跳过，不影响读取后续记录。
+
+### 按 Harness 诊断编号排查
+
+复制 Harness 错误旁的诊断编号：**运行已开始**时是 `runId`，**尚未启动就被拒绝**时是 `requestId`。下面的命令跨日期查两类文件，并把 Run 对应的原始请求一并找出来：
+
+```powershell
+$logDir = Join-Path $env:APPDATA 'fiction-writer\logs'
+$id = '粘贴诊断编号'
+$rows = @(Get-ChildItem -LiteralPath $logDir -File |
+  Where-Object { $_.Name -match '^(frontend|backend)-\d{4}-\d{2}-\d{2}\.jsonl$' } |
+  ForEach-Object {
+    Get-Content -LiteralPath $_.FullName -Encoding UTF8 | ForEach-Object {
+      if ($_.Trim()) { try { $_ | ConvertFrom-Json -ErrorAction Stop } catch {} }
+    }
+  })
+$requestIds = @($id; $rows | Where-Object { $_.fields.runId -eq $id } |
+  ForEach-Object { if ($_.fields.requestId) { $_.fields.requestId } })
+$rows | Where-Object { $_.fields.runId -eq $id -or $requestIds -contains $_.fields.requestId } |
+  Sort-Object time, logSeq | Format-List time, bootId, logSeq, source, event, fields
+```
+
+追查工具时用 `callId` 和 `spanId` 看调用是哪一轮发起、是否执行以及结果进了哪次请求。追查界面没更新时，在同一个 `workerId` 下用 `changeId`、`journalSeq`、修订指纹对照后台落盘和前台重读；`via: snapshot` 表示快照比已收到的通知更新，并不单独证明掉包。整书续跑可用 `jobRef` 对照重启前后的检查点，再看 `chapterIndex` 和跳过原因。文档和普通路径的引用是同一次启动内可比对的短指纹，不是文件名。
+
+日志不会保存 API Key、提示词、正文、附件、原始工具参数或输出、命令、隐藏推理和异常原文，也不替代作品备份或 Session 历史。排障优先提供诊断编号及核对过的必要事件，不要提交日志文件或粘贴密钥配置。
+
 ## V1 边界
 
 - 书籍、资料、章节和 Session 的删除是硬删除，无撤销、归档或确认弹窗。删除运行中的 Session 或作品时先停止对应的后台任务；此前已经写成的其他内容不会回滚。
@@ -42,10 +80,10 @@ Windows 的作品库在系统「文档」文件夹下的 `Fiction_Writer/library
 npm run typecheck
 npm test
 npm run test:e2e
-openspec validate build-fiction-writer-v1 --strict
+openspec validate --all --strict
 ```
 
-回归测试使用临时库和本地合成端点，覆盖三种协议、普通目录工具、切页后接回流式预览、未保存草稿、硬删除以及整书工作流继续。Windows 上另用 `deepseek-v4-flash` 验证了真实的 Chat Completions 流式工具往返；Responses 和 Anthropic Messages 的验证是本地协议夹具，不代表每个兼容网关都能工作。
+回归测试使用临时库和本地合成端点，覆盖三种协议、普通目录工具、切页后接回流式预览、未保存草稿、硬删除以及整书工作流继续。诊断测试使用合成敏感值核对两份日志，并从日志回溯工具参数拒绝、文件通知缺口和整书重启恢复。Windows 上另用 `deepseek-v4-flash` 验证了真实的 Chat Completions 流式工具往返；Responses 和 Anthropic Messages 的验证是本地协议夹具，不代表每个兼容网关都能工作。
 
 可选真实 DeepSeek 验证（读取已被 Git 忽略的 `design/ds_config.txt`，只向官方端点发少量合成请求，不读取作品，也不打印 Key）：
 

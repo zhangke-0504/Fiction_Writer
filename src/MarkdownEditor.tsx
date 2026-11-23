@@ -8,10 +8,12 @@ export function MarkdownEditor({
   value,
   onChange,
   readOnly = false,
+  onApplied,
 }: {
   value: string;
   onChange: (s: string) => void;
   readOnly?: boolean;
+  onApplied?: () => void;
 }) {
   const container = useRef<HTMLDivElement>(null),
     view = useRef<EditorView | null>(null);
@@ -44,12 +46,14 @@ export function MarkdownEditor({
     const editor = view.current;
     if (!editor) return;
     const previous = editor.state.doc.toString();
-    if (previous === value) return;
-    const changes = value.startsWith(previous)
-      ? { from: previous.length, insert: value.slice(previous.length) }
-      : { from: 0, to: previous.length, insert: value };
-    editor.dispatch({ changes, annotations: [external.of(true), Transaction.addToHistory.of(false)] });
-  }, [value]);
+    if (previous !== value) {
+      const changes = value.startsWith(previous)
+        ? { from: previous.length, insert: value.slice(previous.length) }
+        : { from: 0, to: previous.length, insert: value };
+      editor.dispatch({ changes, annotations: [external.of(true), Transaction.addToHistory.of(false)] });
+    }
+    onApplied?.();
+  }, [value, onApplied]);
   useEffect(() => {
     view.current?.dispatch({
       effects: mode.current.reconfigure([

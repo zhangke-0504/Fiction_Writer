@@ -1,5 +1,7 @@
-import { lazy, Suspense, useEffect, useRef, useState, type FormEvent } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { api } from './bridge';
+import { startReload } from './diagnostics';
+import type { UiRefreshContext } from '../shared/diagnostics';
 import { Dialog, ErrorText, Icon, errorMessage, kinds, labels, norm } from './ui';
 import type {
   BookView,
@@ -44,14 +46,17 @@ export function Workspace({
   onChapter,
 }: {
   bookId: string;
-  refresh: number;
+  refresh: UiRefreshContext;
   preview?: ChapterPreview;
   drafts: Drafts;
   back: () => void;
   onChapter?: (chapter: ActiveChapter | undefined) => void;
 }) {
   const [view, setView] = useState<BookView>(),
-    [doc, setDoc] = useState<Manuscript>(),
+    [loaded, setLoaded] = useState<{
+      doc: Manuscript;
+      origin?: ReturnType<typeof startReload>['origin'];
+    }>(),
     [selection, setSelection] = useState<DocRef>({ type: 'book', id: bookId });
   const [error, setError] = useState(''),
     [tick, setTick] = useState(0),
@@ -60,6 +65,9 @@ export function Workspace({
     [editing, setEditing] = useState<{ type: 'subject' | 'clue' | 'chapter'; item?: Manuscript }>();
   const [orphan, setOrphan] = useState<Draft>(),
     [, redraw] = useState(0);
+  const doc = loaded?.doc;
+  const bookReadOrigin = useRef<UiRefreshContext>({ reason: 'load' });
+  const lastReadDocument = useRef<string>(undefined);
   const documents = view?.documents ?? [],
     book = documents.find((d) => d.type === 'book');
   const chapters = documents.filter((d) => d.type === 'chapter'),
@@ -96,12 +104,22 @@ export function Workspace({
   const refreshLocal = () => setTick((n) => n + 1);
   useEffect(() => {
     let active = true;
+    const context = { ...refresh, workspaceRef: bookId };
+    const reload = startReload('workspace', context);
     void api.request<BookView>('book.read', { bookId }).then(
       (v) => {
-        if (active) setView(v);
+        if (active) {
+          bookReadOrigin.current = context;
+          setView(v);
+        }
+        reload.finish(active ? 'ok' : 'superseded', {
+          count: v.documents.length,
+          issueCount: v.diagnostics.length,
+        });
       },
       (e) => {
         if (active) setError(errorMessage(e));
+        reload.finish(active ? 'failed' : 'superseded');
       },
     );
     return () => {
@@ -110,34 +128,91 @@ export function Workspace({
   }, [bookId, refresh, tick]);
   useEffect(() => {
     onChapter?.(selection.type === 'chapter' ? { bookId, chapterId: selection.id } : undefined);
+    api.diagnostic('ui.section', {
+      section: selection.type,
+      workspaceRef: bookId,
+      documentRef: selection.id ? `${selection.type}/${selection.id}` : undefined,
+    });
     return () => onChapter?.(undefined);
   }, [bookId, selection, onChapter]);
   useEffect(() => {
     if (!selection.id) {
-      setDoc(undefined);
+      setLoaded(undefined);
+      lastReadDocument.current = undefined;
       return;
     }
     let active = true;
+    const documentRef = `${selection.type}/${selection.id}`;
+    const origin = bookReadOrigin.current;
+    const reason =
+      lastReadDocument.current !== documentRef && origin.reason !== 'load' ? 'user' : origin.reason;
+    lastReadDocument.current = documentRef;
+    const reload = startReload('document', { ...origin, reason, workspaceRef: bookId, documentRef });
     void api.request<Manuscript>('book.doc.read', { bookId, doc: selection }).then(
       (d) => {
-        if (active) setDoc(d);
+        if (active) setLoaded({ doc: d, origin: reload.origin });
+        reload.finish(active ? 'ok' : 'superseded', { revision: d.revision });
       },
       (e) => {
         if (active) {
-          setDoc(undefined);
+          setLoaded(undefined);
           if (selected) setError(errorMessage(e));
         }
+        reload.finish(active ? 'failed' : 'superseded');
       },
     );
     return () => {
       active = false;
     };
   }, [bookId, selection, selected?.revision]);
+  const lastVisible = useRef('');
+  const currentRef = current && `${current.type}/${current.id}`;
+  const revision = current?.revision,
+    base = draft?.base;
+  const showingPreview = !!live,
+    showingDraft = !!draft;
+  const observeVisible = useCallback(() => {
+    if (!currentRef || !revision || showingPreview) {
+      lastVisible.current = '';
+      return;
+    }
+    const context = { workspaceRef: bookId, documentRef: currentRef, ...loaded?.origin };
+    const key = `${currentRef}/${revision}/${showingDraft}/${base ?? ''}`;
+    if (lastVisible.current === key) return;
+    lastVisible.current = key;
+    if (conflict && base)
+      api.diagnostic('ui.draft_preserved', {
+        ...context,
+        expectedRevision: base,
+        revision,
+        reason: 'conflict',
+      });
+    else if (!showingDraft) api.diagnostic('ui.revision_applied', { ...context, revision });
+  }, [currentRef, revision, showingDraft, showingPreview, conflict, base, bookId, loaded?.origin]);
+  const markdown = current?.type === 'chapter' || current?.type === 'outline';
+  useEffect(() => {
+    if (!markdown) observeVisible();
+  }, [markdown, observeVisible]);
+  useEffect(() => {
+    if (!showingPreview || !currentRef) return;
+    const fields = { workspaceRef: bookId, documentRef: currentRef };
+    api.diagnostic('ui.preview', { ...fields, outcome: 'started' });
+    return () => api.diagnostic('ui.preview', { ...fields, outcome: 'cleared' });
+  }, [bookId, currentRef, showingPreview]);
   useEffect(() => {
     if (view && selection.id && !selected && ['chapter', 'subject', 'clue'].includes(selection.type)) {
       if (draft) {
         setOrphan(draft);
         drafts.delete(draftKey);
+        const { journalSeq, workerId } = bookReadOrigin.current;
+        api.diagnostic('ui.draft_preserved', {
+          workspaceRef: bookId,
+          documentRef: `${selection.type}/${selection.id}`,
+          journalSeq,
+          workerId,
+          expectedRevision: draft.base,
+          reason: 'missing',
+        });
       }
       setSelection(
         selection.type === 'chapter' ? { type: 'book', id: bookId } : { type: selection.type, id: '' },
@@ -168,7 +243,7 @@ export function Workspace({
         if (next?.base === draft.base && latest.body === draft.text)
           drafts.set(draftKey, { base: latest.revision, text: next.text });
       }
-      setDoc((old) => (old && matches(old, current) ? latest : old));
+      setLoaded((old) => (old && matches(old.doc, current) ? { doc: latest } : old));
       refreshLocal();
     } catch (e) {
       setError(errorMessage(e));
@@ -233,7 +308,7 @@ export function Workspace({
       );
       const latest = await api.request<Manuscript>('book.doc.read', { bookId, doc: current });
       if (drafts.get(draftKey) === draft) drafts.delete(draftKey);
-      setDoc((old) => (old && matches(old, current) ? latest : old));
+      setLoaded((old) => (old && matches(old.doc, current) ? { doc: latest } : old));
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -321,6 +396,7 @@ export function Workspace({
         }),
       );
       const nextView = await api.request<BookView>('book.read', { bookId });
+      bookReadOrigin.current = { reason: 'user' };
       setView(nextView);
       if (type === 'chapter' && draft && selected?.id === id && draft.base === original?.revision) {
         const latest = await api.request<Manuscript>('book.doc.read', { bookId, doc: { type, id } });
@@ -690,6 +766,7 @@ export function Workspace({
                     value={live?.content ?? draft?.text ?? current.body}
                     onChange={editText}
                     readOnly={!!live}
+                    onApplied={observeVisible}
                   />
                 </Suspense>
                 <div className="editor-footer">

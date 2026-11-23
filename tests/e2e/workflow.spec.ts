@@ -1,5 +1,6 @@
 import { test, expect, _electron as electron } from '@playwright/test';
 import { createServer } from 'node:http';
+import { readDiagnostics, diagnosticText } from './diagnostic-files';
 import type { BookView, LibraryView, Manuscript, RuntimeView } from '../../shared/contracts';
 
 test('generate a novel from the panel and continue chapter two after an application restart', async ({}, info) => {
@@ -8,12 +9,35 @@ test('generate a novel from the panel and continue chapter two after an applicat
   const steps: string[] = [];
   const resumedRequests: string[] = [];
   const originalDirection = '写两章短篇，全书使用第一人称';
+  const readbackMarker = 'ONLY_IN_PRIOR_CHAPTER_FIXTURE',
+    missingMarker = 'NO_SUCH_PASSAGE_FIXTURE';
+  let selectedReadbacks = 0;
   let allowSecond = false;
   const server = createServer(async (req, res) => {
     let source = '';
     for await (const bytes of req) source += bytes;
     const body = JSON.parse(source),
       user = body.messages.at(-1).content;
+    if (
+      body.tools?.some(
+        (tool: { function: { name: string } }) => tool.function.name === 'book_read_chapter',
+      )
+    ) {
+      selectedReadbacks++;
+      const tool_calls = [readbackMarker, missingMarker].map((query, index) => ({
+        id: `read_${index}`,
+        index,
+        function: {
+          name: 'book_read_chapter',
+          arguments: JSON.stringify({ chapterId: 'one', query, length: 80 }),
+        },
+      }));
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls }, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`,
+      );
+      return;
+    }
     const match = (pattern: string) => user.includes(pattern);
     let text: string;
     if (match('当前步骤：确定全书大纲')) {
@@ -49,7 +73,7 @@ test('generate a novel from the panel and continue chapter two after an applicat
       });
     } else if (match('"id": "one"')) {
       steps.push('one');
-      text = '第一章正文。她坐船离开。';
+      text = '第一章正文。她坐船离开。' + '海'.repeat(22_000) + readbackMarker + '浪'.repeat(22_000);
     } else {
       steps.push('two');
       if (!allowSecond) {
@@ -127,12 +151,104 @@ test('generate a novel from the panel and continue chapter two after an applicat
     expect(steps).toEqual(['outline', 'subjects', 'clues', 'catalog', 'one', 'two', 'two']);
     expect(resumedRequests).toHaveLength(1);
     expect(resumedRequests[0]).toContain(originalDirection);
+    expect(resumedRequests[0]).toContain(readbackMarker);
+    expect(selectedReadbacks).toBe(2);
     expect((await read('one')).revision).toBe(first.revision);
     expect((await read('two')).body).toContain('她看到了灯');
     expect((await rpc<RuntimeView>('runtime.snapshot')).sessions[0].workflow?.complete).toBe(true);
     await button('归航').click();
     await expect(page.getByLabel('Markdown 编辑器')).toContainText('她看到了灯');
     await page.screenshot({ path: info.outputPath('workspace.png') });
+    // From local diaries alone: same checkpoint slot, different boot and Run, only chapter two reruns.
+    await expect
+      .poll(async () =>
+        (await readDiagnostics(root, 'backend'))
+          .filter((e) => e.event === 'workflow.finished')
+          .map((e) => e.fields.outcome),
+      )
+      .toEqual(['failed', 'ok']);
+    const rows = await readDiagnostics(root, 'backend');
+    const terminal = rows.filter((e) => e.event === 'workflow.finished');
+    expect(terminal[0].bootId).not.toBe(terminal[1].bootId);
+    expect(terminal[0].fields.jobRef).toBeDefined();
+    expect(terminal[0].fields.jobRef).toBe(terminal[1].fields.jobRef);
+    const beforeRestart = rows.filter((e) => e.fields.runId === terminal[0].fields.runId),
+      resumed = rows.filter((e) => e.fields.runId === terminal[1].fields.runId);
+    expect(
+      beforeRestart.some(
+        (e) =>
+          e.event === 'workflow.stage.finished' &&
+          e.fields.chapterIndex === 1 &&
+          e.fields.outcome === 'ok',
+      ),
+    ).toBe(true);
+    expect(
+      beforeRestart.some(
+        (e) =>
+          e.event === 'workflow.stage.finished' &&
+          e.fields.chapterIndex === 2 &&
+          e.fields.outcome === 'failed',
+      ),
+    ).toBe(true);
+    expect(
+      resumed.some(
+        (e) =>
+          e.event === 'workflow.checkpoint' &&
+          e.fields.operation === 'open' &&
+          e.fields.reason === 'resume' &&
+          e.fields.done === 5,
+      ),
+    ).toBe(true);
+    expect(
+      resumed.some(
+        (e) =>
+          e.event === 'workflow.checkpoint' &&
+          e.fields.operation === 'verify' &&
+          e.fields.outcome === 'ok',
+      ),
+    ).toBe(true);
+    expect(resumed.find((e) => e.event === 'workflow.chapter.skipped')?.fields).toMatchObject({
+      reason: 'already_completed',
+      chapterIndex: 1,
+    });
+    expect(
+      resumed.filter((e) => e.event === 'chapter.generation.started').map((e) => e.fields.chapterIndex),
+    ).toEqual([2]);
+    expect(resumed.filter((e) => e.event === 'model.started').map((e) => e.fields.lane)).toEqual([
+      'readback',
+      'draft',
+    ]);
+    expect(resumed.find((e) => e.event === 'chapter.readback.finished')?.fields).toMatchObject({
+      hits: 1,
+      missing: 1,
+      requested: 2,
+    });
+    expect(resumed.filter((e) => e.event === 'chapter.preview').map((e) => e.fields.outcome)).toEqual([
+      'started',
+      'cleared',
+    ]);
+    const requestId = resumed.find((e) => e.event === 'run.started')!.fields.requestId;
+    const loaded = rows.filter((e) => e.event === 'skill.loaded' && e.fields.requestId === requestId);
+    expect(loaded.map((e) => e.fields.skill).sort()).toEqual([
+      'generate-novel',
+      'story-consistency',
+      'write-chapter',
+    ]);
+    const applied = resumed.filter((e) => e.event === 'skill.applied');
+    expect(applied.map((e) => e.fields.skill)).toEqual(['write-chapter']);
+    expect(applied[0].fields.fingerprint).toBe(
+      loaded.find((e) => e.fields.skill === 'write-chapter')!.fields.fingerprint,
+    );
+    expect(
+      beforeRestart
+        .filter((e) => e.event === 'skill.applied' && e.fields.skill === 'generate-novel')
+        .map((e) => e.fields.phase),
+    ).toEqual(['outline', 'subjects', 'clues', 'catalog']);
+    for (const stream of ['frontend', 'backend'] as const) {
+      const text = await diagnosticText(root, stream);
+      for (const secret of [readbackMarker, missingMarker, originalDirection, '玻璃灯塔', '她看到了灯'])
+        expect(text).not.toContain(secret);
+    }
   } finally {
     await app.close().catch(() => {});
     server.closeAllConnections();

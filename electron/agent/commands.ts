@@ -1,12 +1,25 @@
+import { noDiagnostic } from '../../shared/diagnostics.js';
+import { classified, elapsed, safeReporter } from '../diagnostics/trace.js';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 
-export class CommandStopError extends Error {}
+export class CommandStopError extends Error {
+  override name = 'CommandStopError';
+}
 const shellEnvNames =
   /^(systemroot|windir|path|pathext|comspec|temp|tmp|home|userprofile|appdata|localappdata|programdata|programfiles(?:\(x86\))?|programw6432|processor_architecture|os|number_of_processors|cmdcmdline|homedrive|homepath)$/i;
-export async function runCommand(cwd: string, command: string, timeoutMs: number, signal: AbortSignal) {
+export async function runCommand(
+  cwd: string,
+  command: string,
+  timeoutMs: number,
+  signal: AbortSignal,
+  diagnostic = noDiagnostic,
+) {
   signal.throwIfAborted();
+  const report = safeReporter(diagnostic),
+    started = performance.now();
+  report('command.started', { timeoutMs });
   const win = process.platform === 'win32',
     env = Object.fromEntries(Object.entries(process.env).filter(([key]) => shellEnvNames.test(key)));
   const shell = win
@@ -109,13 +122,18 @@ export async function runCommand(cwd: string, command: string, timeoutMs: number
   }, timeoutMs);
   signal.addEventListener('abort', stop, { once: true });
   if (signal.aborted) stop();
+  let result: Awaited<typeof closed> | undefined;
+  let failure: string | undefined;
+  let stopConfirmed = false;
   try {
-    const result = await Promise.race([closed, stopFailure]);
+    result = await Promise.race([closed, stopFailure]);
     await stopping;
+    stopConfirmed = !!stopping;
     signal.throwIfAborted();
     const decode = (parts: Buffer[]) => new StringDecoder('utf8').end(Buffer.concat(parts));
     return { ...result, timeout: timedOut, truncated, stdout: decode(stdout), stderr: decode(stderr) };
   } catch (error) {
+    failure = classified(error, signal);
     if (error instanceof CommandStopError) {
       child.stdout.destroy();
       child.stderr.destroy();
@@ -126,5 +144,23 @@ export async function runCommand(cwd: string, command: string, timeoutMs: number
     clearTimeout(timer);
     clearTimeout(drainTimer);
     signal.removeEventListener('abort', stop);
+    const reason =
+      failure ?? (timedOut ? 'command_timeout' : result?.code === 0 ? undefined : 'command_failed');
+    report('command.finished', {
+      elapsedMs: elapsed(started),
+      reason,
+      outcome:
+        reason === 'cancelled'
+          ? 'cancelled'
+          : reason === 'command_timeout'
+            ? 'timeout'
+            : reason
+              ? 'failed'
+              : 'ok',
+      exitCode: result?.code ?? undefined,
+      timedOut,
+      truncated,
+      termination: stopConfirmed ? 'confirmed' : stopping ? 'uncertain' : 'none',
+    });
   }
 }

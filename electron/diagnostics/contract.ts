@@ -1,0 +1,460 @@
+import { createHmac } from 'node:crypto';
+import { diagnosticMethods, requestIdPattern, type DiagnosticSource } from '../../shared/diagnostics.js';
+
+type Scalar = string | number | boolean;
+type Rule = (value: unknown) => Scalar | undefined;
+type Schema = Readonly<Record<string, Rule>>;
+const one =
+  <T extends string>(...values: T[]): Rule =>
+  (v) =>
+    typeof v === 'string' && values.includes(v as T) ? v : undefined;
+const regexp =
+  (re: RegExp): Rule =>
+  (v) =>
+    typeof v === 'string' && re.test(v) ? v : undefined;
+const uuid = regexp(requestIdPattern);
+const revision = regexp(/^[a-f0-9]{8,64}$/);
+const version = regexp(/^\d{1,4}\.\d{1,4}\.\d{1,4}(?:-(?:dev|alpha|beta|rc)(?:\.\d{1,5})?)?$/);
+const count: Rule = (v) => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : undefined);
+const sequence: Rule = (v) =>
+  typeof v === 'number' && Number.isSafeInteger(v) && v > 0 ? v : undefined;
+const duration: Rule = (v) =>
+  typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 86_400_000 ? Math.round(v) : undefined;
+const exitCode: Rule = (v) =>
+  typeof v === 'number' && Number.isSafeInteger(v) && v >= -2_147_483_648 && v <= 4_294_967_295
+    ? v
+    : undefined;
+const httpStatus: Rule = (v) =>
+  typeof v === 'number' && Number.isInteger(v) && v >= 100 && v <= 599 ? v : undefined;
+const bool: Rule = (v) => (typeof v === 'boolean' ? v : undefined);
+const ref: Rule = (v) =>
+  typeof v === 'string' && v.length > 0 && v.length <= 2048 && !/[\x00-\x1f]/.test(v) ? v : undefined;
+const op = one(...diagnosticMethods);
+const outcome = one(
+  'ok',
+  'failed',
+  'partial',
+  'rejected',
+  'cancelled',
+  'interrupted',
+  'timeout',
+  'skipped',
+  'conflict',
+  'missing',
+  'superseded',
+  'started',
+  'cleared',
+  'unknown',
+);
+const reason = one(
+  'exception',
+  'unhandled_rejection',
+  'react_error',
+  'load_failed',
+  'preload_error',
+  'clean-exit',
+  'abnormal-exit',
+  'killed',
+  'crashed',
+  'oom',
+  'launch-failed',
+  'integrity-failure',
+  'initialization_failed',
+  'application_exit',
+  'backend_exit',
+  'unavailable',
+  'busy',
+  'missing',
+  'invalid_request',
+  'invalid_options',
+  'input_validation',
+  'attachment_invalid',
+  'profile_missing',
+  'credential_unavailable',
+  'transport',
+  'network',
+  'auth',
+  'http_error',
+  'protocol',
+  'malformed_stream',
+  'incomplete_stream',
+  'provider_error',
+  'unknown_tool',
+  'invalid_json',
+  'batch_invalid',
+  'invalid_call',
+  'result_limit',
+  'invalid_arguments',
+  'tool_failed',
+  'command_failed',
+  'command_timeout',
+  'termination_uncertain',
+  'cancelled',
+  'timeout',
+  'conflict',
+  'partial_write',
+  'io_failure',
+  'iteration_limit',
+  'continue_tools',
+  'complete',
+  'checkpoint_invalid',
+  'checkpoint_conflict',
+  'checkpoint_saved',
+  'no_plan',
+  'verified_commit',
+  'recovered_commit',
+  'retry_unwritten',
+  'resume',
+  'new_plan',
+  'existing_outline',
+  'existing_subjects',
+  'existing_clues',
+  'existing_chapters',
+  'existing_content',
+  'already_completed',
+  'no_source',
+  'no_match',
+  'not_requested',
+  'agent',
+  'draft',
+  'append',
+  'replace',
+  'workflow',
+  'readback',
+  'managed',
+  'watcher',
+  'command',
+  'focus',
+  'sequence_gap',
+  'backend_reset',
+  'load',
+  'user',
+  'unknown',
+);
+const lane = one('agent', 'draft', 'readback', 'workflow', 'probe');
+const tool = one(
+  'list_files',
+  'search_text',
+  'read_file',
+  'write_file',
+  'edit_file',
+  'delete_file',
+  'run_command',
+  'book_get_context',
+  'book_apply_changes',
+  'book_generate_chapter',
+  'book_read_chapter',
+  'fixture_value',
+  'unknown',
+);
+const skill = one('story-consistency', 'write-chapter', 'generate-novel');
+const area = one('runtime', 'library', 'workspace', 'document');
+const refreshReason = one(
+  'load',
+  'focus',
+  'book_change',
+  'sequence_gap',
+  'snapshot_advanced',
+  'backend_reset',
+  'user',
+  'profiles_change',
+);
+const applied = {
+  workspaceRef: ref,
+  documentRef: ref,
+  reloadId: uuid,
+  journalSeq: count,
+  workerId: uuid,
+};
+const phase = one('outline', 'subjects', 'clues', 'catalog', 'chapters', 'finished');
+const action = one('chat', 'draft', 'append', 'replace', 'novel');
+const docType = one('book', 'outline', 'subject', 'clue', 'chapter');
+const core: Schema = {
+  requestId: uuid,
+  runId: uuid,
+  spanId: uuid,
+  workerId: uuid,
+  rendererId: uuid,
+  sessionRef: ref,
+  workspaceRef: ref,
+  documentRef: ref,
+  fileRef: ref,
+  profileRef: ref,
+  jobRef: regexp(/^[a-f0-9]{16}$/),
+  phase,
+  chapterIndex: count,
+  changeId: uuid,
+  turn: count,
+  callId: uuid,
+  lane,
+};
+const final: Schema = { outcome, reason, elapsedMs: duration };
+const bookEvent: Schema = {
+  journalSeq: count,
+  revision,
+  expectedRevision: revision,
+  actualRevision: revision,
+  docType,
+};
+interface Definition {
+  sources: readonly DiagnosticSource[];
+  fields: Schema;
+  level?: 'info' | 'warn' | 'error';
+  ui?: true;
+  required?: readonly string[];
+}
+const main = (fields: Schema, level?: Definition['level']): Definition => ({
+  sources: ['main'],
+  fields,
+  level,
+});
+const worker = (fields: Schema, level?: Definition['level']): Definition => ({
+  sources: ['worker'],
+  fields,
+  level,
+});
+const ui = (fields: Schema, required: readonly string[], level?: Definition['level']): Definition => ({
+  sources: ['renderer'],
+  fields,
+  level,
+  ui: true,
+  required,
+});
+const diag = new Map<string, Definition>(
+  Object.entries({
+    'app.started': main({ version, pid: count }),
+    'app.stopping': main({ reason }),
+    'app.stopped': main({ ...final }),
+    'app.fatal': main({ reason }, 'error'),
+    'window.started': main({}),
+    'window.closed': main({}),
+    'window.closing': main({ reason }),
+    'window.load_failed': main({ code: exitCode, reason }, 'error'),
+    'window.renderer_gone': main({ code: exitCode, reason }, 'error'),
+    'worker.spawned': main({ pid: count }),
+    'worker.exited': main({ code: exitCode, reason, expected: bool, pending: count }),
+    'worker.restarting': main({ reason }, 'warn'),
+    'worker.ready': worker({ pid: count }),
+    'worker.initialization_failed': worker({ reason }, 'error'),
+    'credential.finished': main({ operation: one('encrypt', 'decrypt'), ...final }),
+    'ipc.started': main({ method: op }),
+    'ipc.finished': main({ method: op, ...final }),
+    'ipc.worker.started': worker({ method: op }),
+    'ipc.worker.finished': worker({ method: op, ...final }),
+    'ui.operation.started': { sources: ['renderer'], fields: { method: op } },
+    'ui.operation.finished': { sources: ['renderer'], fields: { method: op, ...final } },
+    'ui.ready': ui({}, []),
+    'ui.error': ui(
+      { reason: one('exception', 'unhandled_rejection', 'react_error') },
+      ['reason'],
+      'error',
+    ),
+    'ui.section': ui(
+      {
+        section: one('library', 'settings', 'book', 'outline', 'subject', 'clue', 'chapter', 'harness'),
+        workspaceRef: ref,
+        documentRef: ref,
+      },
+      ['section'],
+    ),
+    'ui.book_change_received': ui(
+      {
+        journalSeq: sequence,
+        workerId: uuid,
+        changeId: uuid,
+        workspaceRef: ref,
+      },
+      ['journalSeq', 'workerId', 'changeId'],
+    ),
+    'ui.sequence_gap': ui(
+      { journalSeq: sequence, workerId: uuid, expectedSeq: sequence, via: one('push', 'snapshot') },
+      ['journalSeq', 'expectedSeq', 'via'],
+      'warn',
+    ),
+    'ui.reload.started': ui({ area, ...applied, reason: refreshReason }, ['area', 'reloadId']),
+    'ui.reload.finished': ui(
+      {
+        area,
+        ...applied,
+        reason: refreshReason,
+        outcome: one('ok', 'failed', 'superseded'),
+        elapsedMs: duration,
+        revision,
+        count,
+        issueCount: count,
+      },
+      ['area', 'reloadId', 'outcome', 'elapsedMs'],
+    ),
+    'ui.revision_applied': ui({ ...applied, revision }, ['workspaceRef', 'documentRef', 'revision']),
+    'ui.draft_preserved': ui(
+      { ...applied, expectedRevision: revision, revision, reason: one('conflict', 'missing') },
+      ['workspaceRef', 'documentRef', 'expectedRevision', 'reason'],
+      'warn',
+    ),
+    'ui.preview': ui({ workspaceRef: ref, documentRef: ref, outcome: one('started', 'cleared') }, [
+      'workspaceRef',
+      'documentRef',
+      'outcome',
+    ]),
+    'session.created': worker({}),
+    'session.deleted': worker({}),
+    'session.workspace_unavailable': worker({}),
+    'run.rejected': worker({ action, reason }, 'warn'),
+    'run.started': worker({ action, effort: one('low', 'medium', 'high', 'default') }),
+    'run.finished': worker({ ...final }),
+    'run.recovered': worker({ ...final }),
+    'run.stop_requested': worker({ reason }),
+    'run.stop_finished': worker({ ...final }),
+    'model.started': worker({
+      protocol: one('chat', 'responses', 'messages'),
+      effort: one('low', 'medium', 'high', 'default'),
+      messageCount: count,
+      toolCount: count,
+    }),
+    'probe.finished': worker({ ...final, step: one('connection', 'tools') }),
+    'model.http': worker({ httpStatus, elapsedMs: duration }),
+    'model.first_event': worker({ elapsedMs: duration }),
+    'model.finished': worker({ ...final, httpStatus, textLength: count, toolCount: count }),
+    'loop.round.started': worker({}),
+    'loop.round.finished': worker({ ...final, toolCount: count }),
+    'tool.batch_rejected': worker({ count, omitted: count, reason }, 'warn'),
+    'tool.requested': worker({ tool, fieldCount: count, unknownFieldCount: count }),
+    'tool.validated': worker({ tool, fieldCount: count }),
+    'tool.rejected': worker({ tool, reason }, 'warn'),
+    'tool.started': worker({ tool }),
+    'tool.finished': worker({
+      tool,
+      ...final,
+      transportOk: bool,
+      exitCode,
+      timedOut: bool,
+      truncated: bool,
+      termination: one('none', 'confirmed', 'uncertain'),
+      affected: count,
+      bytes: count,
+    }),
+    'tool.file': worker({
+      operation: one('read', 'write', 'delete', 'list', 'search'),
+      affected: count,
+      bytes: count,
+      truncated: bool,
+    }),
+    'command.started': worker({ timeoutMs: duration }),
+    'command.finished': worker({
+      ...final,
+      exitCode,
+      timedOut: bool,
+      truncated: bool,
+      termination: one('none', 'confirmed', 'uncertain'),
+    }),
+    'tool.result_ready': worker({ tool, outcome }),
+    'tool.result_sent': worker({ tool, nextTurn: count }),
+    'skill.loaded': worker({ skill, fingerprint: revision }),
+    'skill.failed': worker({ skill, reason }, 'warn'),
+    'skill.applied': worker({ skill, fingerprint: revision, phase, reason }),
+    'chapter.generation.started': worker({ action }),
+    'chapter.generation.finished': worker({ ...final, action, revision }),
+    'chapter.preview': worker({ outcome: one('started', 'cleared'), textLength: count }),
+    'chapter.readback.started': worker({ candidates: count }),
+    'chapter.readback.item': worker({ ...final, textLength: count }),
+    'chapter.readback.finished': worker({
+      ...final,
+      requested: count,
+      hits: count,
+      missing: count,
+      rejected: count,
+      ignored: count,
+    }),
+    'workflow.started': worker({}),
+    'workflow.finished': worker({ ...final }),
+    'workflow.stage.reused': worker({ phase, reason }),
+    'workflow.stage.started': worker({ phase }),
+    'workflow.stage.finished': worker({ phase, ...final }),
+    'workflow.checkpoint': worker({
+      phase,
+      ...final,
+      done: count,
+      total: count,
+      planned: count,
+      operation: one('open', 'save', 'verify', 'recover'),
+    }),
+    'workflow.chapter.skipped': worker({ reason }),
+    'workspace.commit.started': worker({ count, operation: one('create', 'write', 'delete') }),
+    'workspace.commit.finished': worker({
+      ...final,
+      committed: count,
+      pending: count,
+      operation: one('create', 'write', 'delete'),
+    }),
+    'workspace.preconditions': worker({ ...final, ...bookEvent, count, guardCount: count }),
+    'workspace.document.pending': worker({ docType }),
+    'workspace.document.committed': worker({ ...bookEvent, operation: one('write', 'delete') }),
+    'workspace.conflict': worker(
+      { ...bookEvent, reason, step: one('guard', 'plan', 'replace') },
+      'warn',
+    ),
+    'workspace.notified': worker({ journalSeq: count, count, reason }),
+    'diagnostics.loss': main({ overflow: count, io: count, expired: count, cleanup: count }, 'warn'),
+  }),
+);
+const promoted = new Set([
+  'failed',
+  'partial',
+  'rejected',
+  'timeout',
+  'conflict',
+  'interrupted',
+  'missing',
+]);
+function record(value: unknown): value is Record<string, unknown> {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
+  );
+}
+/** Writes only reconstructed values; a producer can never supply the public log envelope. */
+export function validateDiagnostic(
+  source: DiagnosticSource,
+  input: unknown,
+  salt: Uint8Array,
+  fromRenderer = false,
+) {
+  if (
+    !record(input) ||
+    Object.keys(input).some((key) => key !== 'event' && key !== 'fields') ||
+    typeof input.event !== 'string'
+  )
+    return;
+  const definition = diag.get(input.event);
+  if (
+    !definition?.sources.includes(source) ||
+    (fromRenderer && (source !== 'renderer' || !definition.ui))
+  )
+    return;
+  const raw = input.fields === undefined ? {} : input.fields;
+  if (!record(raw) || Object.keys(raw).length > 32) return;
+  const out: Record<string, Scalar> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const rule = Object.hasOwn(definition.fields, key)
+      ? definition.fields[key]
+      : !fromRenderer && Object.hasOwn(core, key)
+        ? core[key]
+        : undefined;
+    if (!rule) return;
+    if (value === undefined) continue;
+    const checked = rule(value);
+    if (checked === undefined) return;
+    out[key] =
+      rule === ref || (rule === revision && key !== 'fingerprint')
+        ? createHmac('sha256', salt)
+            .update((rule === revision ? 'revision' : key) + '\0' + checked)
+            .digest('hex')
+            .slice(0, 16)
+        : checked;
+  }
+  if (definition.required?.some((key) => !Object.hasOwn(out, key))) return;
+  const level =
+    definition.level ?? (typeof out.outcome === 'string' && promoted.has(out.outcome) ? 'warn' : 'info');
+  return { event: input.event, level, fields: out };
+}

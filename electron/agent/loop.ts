@@ -1,8 +1,12 @@
+import { randomUUID } from 'node:crypto';
+import { diagnosticScope, noDiagnostic, type ReportDiagnostic } from '../../shared/diagnostics.js';
+import { classified, DiagnosticFailure, elapsed, safeReporter } from '../diagnostics/trace.js';
 import { runAgentLoop, type AgentTool, type StreamFn } from '@earendil-works/pi-agent-core';
 import {
   createAssistantMessageEventStream,
   type AssistantMessage,
   type Model,
+  type JsonObject,
   type UserMessage,
 } from '@earendil-works/pi-ai';
 import type { ModelProvider, ToolSpec, Turn } from './model.js';
@@ -46,12 +50,43 @@ const usage = {
 function safeText(thing: unknown) {
   return (thing instanceof Error ? thing.message : String(thing)).slice(0, 2000);
 }
-function parseArgs(raw: string): Record<string, unknown> {
+function parseArgs(raw: string): JsonObject {
   const value: unknown = JSON.parse(raw);
   if (value === null || Array.isArray(value) || typeof value !== 'object')
-    throw new Error('工具参数不是对象');
-  return value as Record<string, unknown>;
+    throw new DiagnosticFailure('invalid_arguments', '工具参数不是对象');
+  return value as JsonObject;
 }
+interface Candidate {
+  report: ReportDiagnostic;
+  context: ReportDiagnostic;
+  fieldCount?: number;
+  parseFailure?: string;
+  rejected?: boolean;
+  executed?: boolean;
+}
+interface Round {
+  started: number;
+  report: ReportDiagnostic;
+  candidates: Map<string, Candidate>;
+  failure?: string;
+}
+function reject(candidate: Candidate, reason: string) {
+  if (candidate.rejected || candidate.executed) return;
+  candidate.rejected = true;
+  candidate.report('tool.rejected', { reason });
+}
+function commandOutcome(value: unknown) {
+  const result = value as { code: number | null; timeout: boolean; truncated: boolean };
+  return {
+    outcome: result.timeout ? 'timeout' : result.code === 0 ? 'ok' : 'failed',
+    reason: result.timeout ? 'command_timeout' : result.code === 0 ? undefined : 'command_failed',
+    exitCode: result.code ?? undefined,
+    timedOut: result.timeout,
+    truncated: result.truncated,
+    termination: result.timeout ? 'confirmed' : 'none',
+  };
+}
+
 export async function runAgent(
   ctx: RunContext,
   provider: ModelProvider,
@@ -60,20 +95,54 @@ export async function runAgent(
   prompt: string,
   tools: LocalTool[],
   limit = 24,
+  onFirstDispatch?: (report: ReportDiagnostic) => void,
 ) {
   const history: Turn[] = [...previous, { role: 'user', text: prompt }];
-  const malformed = new Set<string>();
+  const trace = diagnosticScope(safeReporter(ctx.diagnostic ?? noDiagnostic), { lane: 'agent' });
+  const registered = new Map(tools.map((tool) => [tool.name, tool]));
+  const outbound: Candidate[] = [];
+  let rounds = 0;
+  let active: Round | undefined;
+  let failure: string | undefined;
+  const finish = (outcome: string, reason: string, toolCount = 0) => {
+    active?.report('loop.round.finished', {
+      outcome,
+      reason,
+      toolCount,
+      elapsedMs: elapsed(active.started),
+    });
+    active = undefined;
+  };
   const wrapped: AgentTool[] = tools.map((tool) => ({
     name: tool.name,
     label: tool.name,
     description: tool.description,
     parameters: tool.schema,
     replay: 'never',
-    async execute(_id, params) {
+    async execute(id, params) {
       ctx.signal.throwIfAborted();
+      const call = active?.candidates.get(id);
+      const started = performance.now();
+      if (call) {
+        call.executed = true;
+        call.report('tool.started');
+      }
       try {
-        const value = await tool.execute(params as Record<string, unknown>, ctx);
+        const value = await tool.execute(params as Record<string, unknown>, {
+          ...ctx,
+          diagnostic: call?.context ?? ctx.diagnostic,
+        });
         const payload = JSON.stringify({ ok: true, value } satisfies ToolResult);
+        const oversized = payload.length > 120_000;
+        call?.report('tool.finished', {
+          transportOk: !oversized,
+          elapsedMs: elapsed(started),
+          ...(oversized
+            ? { outcome: 'failed', reason: 'result_limit', truncated: true }
+            : tool.name === 'run_command'
+              ? commandOutcome(value)
+              : { outcome: 'ok' }),
+        });
         return {
           content: [
             {
@@ -88,6 +157,14 @@ export async function runAgent(
           isError: payload.length > 120_000,
         };
       } catch (e) {
+        const reason = classified(e, ctx.signal);
+        call?.report('tool.finished', {
+          reason: reason === 'unknown' ? 'tool_failed' : reason,
+          outcome: reason === 'cancelled' ? 'cancelled' : 'failed',
+          elapsedMs: elapsed(started),
+          transportOk: false,
+          termination: reason === 'termination_uncertain' ? 'uncertain' : undefined,
+        });
         return {
           content: [
             {
@@ -101,8 +178,13 @@ export async function runAgent(
       }
     },
   }));
-  let rounds = 0;
   const stream: StreamFn = () => {
+    const number = ++rounds,
+      spanId = randomUUID();
+    const report = diagnosticScope(trace, { turn: number, spanId });
+    const round: Round = { started: performance.now(), report, candidates: new Map() };
+    active = round;
+    report('loop.round.started');
     const feed = createAssistantMessageEventStream();
     const base: AssistantMessage = {
       api: model.api,
@@ -122,26 +204,60 @@ export async function runAgent(
           tools,
           signal: ctx.signal,
           onText: ctx.text,
+          diagnostic: report,
+          spanId,
+          onDispatch(nextSpanId) {
+            if (number === 1) onFirstDispatch?.(report);
+            for (const candidate of outbound.splice(0))
+              candidate.report('tool.result_sent', { spanId: nextSpanId, nextTurn: number });
+          },
         });
         ctx.signal.throwIfAborted();
-        if (
+        const badBatch =
           answer.calls.length > 16 ||
-          new Set(answer.calls.map((c) => c.id)).size !== answer.calls.length
-        )
-          throw new Error('工具调用 ID 重复或数量超限');
-        history.push(answer);
-        if (answer.text) base.content.push({ type: 'text', text: answer.text });
-        for (const call of answer.calls) {
-          let args = {};
+          new Set(answer.calls.map((c) => c.id)).size !== answer.calls.length;
+        if (badBatch && answer.calls.length > 32)
+          report('tool.batch_rejected', {
+            count: answer.calls.length,
+            omitted: answer.calls.length - 32,
+            reason: 'invalid_call',
+          });
+        for (const call of badBatch ? answer.calls.slice(0, 32) : answer.calls) {
+          const tool = registered.get(call.name);
+          const context = diagnosticScope(report, { callId: randomUUID() });
+          const candidate: Candidate = {
+            context,
+            report: (event, fields) => context(event, { tool: tool?.name ?? 'unknown', ...fields }),
+          };
+          let args: JsonObject = {};
           try {
             args = parseArgs(call.args);
-          } catch {
-            malformed.add(call.id);
+            candidate.fieldCount = Object.keys(args).length;
+          } catch (error) {
+            candidate.parseFailure =
+              error instanceof DiagnosticFailure ? error.diagnosticReason : 'invalid_json';
           }
-          base.content.push({ type: 'toolCall', id: call.id, name: call.name, arguments: args });
+          const properties = tool?.schema.properties;
+          candidate.report('tool.requested', {
+            fieldCount: candidate.fieldCount,
+            unknownFieldCount:
+              candidate.fieldCount !== undefined && properties && typeof properties === 'object'
+                ? Object.keys(args).filter((field) => !Object.hasOwn(properties, field)).length
+                : undefined,
+          });
+          if (badBatch) reject(candidate, 'invalid_call');
+          else if (!tool) reject(candidate, 'unknown_tool');
+          else if (candidate.parseFailure) reject(candidate, candidate.parseFailure);
+          round.candidates.set(call.id, candidate);
+          if (!badBatch)
+            base.content.push({ type: 'toolCall', id: call.id, name: call.name, arguments: args });
         }
+        if (badBatch) throw new DiagnosticFailure('invalid_call', '工具调用 ID 重复或数量超限');
+        history.push(answer);
+        if (answer.text) base.content.unshift({ type: 'text', text: answer.text });
         base.stopReason = answer.calls.length ? 'toolUse' : 'stop';
       } catch (e) {
+        round.failure = classified(e, ctx.signal);
         base.stopReason = ctx.signal.aborted ? 'aborted' : 'error';
         base.errorMessage = safeText(e);
       } finally {
@@ -151,56 +267,88 @@ export async function runAgent(
     return feed;
   };
   const message: UserMessage = { role: 'user', content: prompt, timestamp: Date.now() };
-  const result = await runAgentLoop(
-    [message],
-    { messages: [], tools: wrapped },
-    {
-      model,
-      toolExecution: 'sequential',
-      convertToLlm: (messages) => messages,
-      async beforeToolCall({ toolCall }) {
-        if (malformed.has(toolCall.id)) return { block: true, reason: '工具参数不是完整的 JSON 对象' };
-      },
-      finishTurn({ toolResults }) {
-        for (const tool of toolResults) {
-          const text = tool.content.find((block) => block.type === 'text')?.text ?? '';
-          let detail: ToolResult;
-          try {
-            detail = JSON.parse(text) as ToolResult;
-            if (typeof detail.ok !== 'boolean') throw new Error();
-          } catch {
-            detail = { ok: !tool.isError, ...(tool.isError ? { error: text } : { value: text }) };
+  let result: Awaited<ReturnType<typeof runAgentLoop>>;
+  try {
+    result = await runAgentLoop(
+      [message],
+      { messages: [], tools: wrapped },
+      {
+        model,
+        toolExecution: 'sequential',
+        convertToLlm: (messages) => messages,
+        async beforeToolCall({ toolCall }) {
+          const candidate = active?.candidates.get(toolCall.id);
+          if (candidate?.parseFailure) return { block: true, reason: '工具参数不是完整的 JSON 对象' };
+          if (!ctx.signal.aborted)
+            candidate?.report('tool.validated', { fieldCount: candidate.fieldCount });
+        },
+        finishTurn({ message, toolResults }) {
+          for (const tool of toolResults) {
+            const text = tool.content.find((block) => block.type === 'text')?.text ?? '';
+            let detail: ToolResult;
+            try {
+              detail = JSON.parse(text) as ToolResult;
+              if (typeof detail.ok !== 'boolean') throw new Error();
+            } catch {
+              detail = { ok: !tool.isError, ...(tool.isError ? { error: text } : { value: text }) };
+            }
+            history.push({ role: 'tool', id: tool.toolCallId, result: detail });
+            const candidate = active?.candidates.get(tool.toolCallId);
+            if (candidate) {
+              if (!candidate.executed)
+                reject(candidate, ctx.signal.aborted ? 'cancelled' : 'invalid_arguments');
+              candidate.report('tool.result_ready', { outcome: detail.ok ? 'ok' : 'failed' });
+              outbound.push(candidate);
+            }
           }
-          history.push({ role: 'tool', id: tool.toolCallId, result: detail });
-        }
-        if (++rounds >= limit && toolResults.length) return { action: 'end' };
+          if (ctx.signal.aborted || message.stopReason === 'aborted') {
+            for (const candidate of active?.candidates.values() ?? []) reject(candidate, 'cancelled');
+            finish('cancelled', 'cancelled', toolResults.length);
+          } else if (message.stopReason === 'error') {
+            failure = active?.failure ?? 'provider_error';
+            finish('failed', failure);
+          } else if (rounds >= limit && toolResults.length) {
+            finish('failed', 'iteration_limit', toolResults.length);
+            return { action: 'end' };
+          } else {
+            finish('ok', toolResults.length ? 'continue_tools' : 'complete', toolResults.length);
+          }
+        },
       },
-    },
-    async (event) => {
-      if (
-        event.type === 'message_end' &&
-        event.message.role === 'assistant' &&
-        event.message.stopReason !== 'error' &&
-        event.message.stopReason !== 'aborted'
-      ) {
-        const text = event.message.content.flatMap((c) => (c.type === 'text' ? [c.text] : [])).join('');
-        if (text) await ctx.line({ role: 'assistant', text });
-      }
-      if (event.type === 'tool_execution_start')
-        await ctx.line({ role: 'tool', text: `运行 ${event.toolName}` });
-      if (event.type === 'tool_execution_end')
-        await ctx.line({
-          role: 'tool',
-          text: `${event.toolName} · ${event.isError ? '未完成' : '已完成'}`,
-        });
-    },
-    ctx.signal,
-    stream,
-  );
+      async (event) => {
+        if (
+          event.type === 'message_end' &&
+          event.message.role === 'assistant' &&
+          event.message.stopReason !== 'error' &&
+          event.message.stopReason !== 'aborted'
+        ) {
+          const text = event.message.content
+            .flatMap((c) => (c.type === 'text' ? [c.text] : []))
+            .join('');
+          if (text) await ctx.line({ role: 'assistant', text });
+        }
+        if (event.type === 'tool_execution_start')
+          await ctx.line({ role: 'tool', text: `运行 ${event.toolName}` });
+        if (event.type === 'tool_execution_end')
+          await ctx.line({
+            role: 'tool',
+            text: `${event.toolName} · ${event.isError ? '未完成' : '已完成'}`,
+          });
+      },
+      ctx.signal,
+      stream,
+    );
+  } catch (error) {
+    const reason = classified(error, ctx.signal);
+    for (const candidate of active?.candidates.values() ?? []) reject(candidate, reason);
+    finish(reason === 'cancelled' ? 'cancelled' : 'failed', reason);
+    throw error;
+  }
   ctx.signal.throwIfAborted();
   const last = [...result].reverse().find((message) => message.role === 'assistant');
-  if (last?.stopReason === 'error') throw new Error(last.errorMessage ?? '模型请求失败');
+  if (last?.stopReason === 'error')
+    throw new DiagnosticFailure(failure ?? 'provider_error', last.errorMessage ?? '模型请求失败');
   if (last?.stopReason === 'toolUse' && rounds >= limit)
-    throw new Error('已达到模型往返上限；已提交的文件仍保留');
+    throw new DiagnosticFailure('iteration_limit', '已达到模型往返上限；已提交的文件仍保留');
   return history;
 }

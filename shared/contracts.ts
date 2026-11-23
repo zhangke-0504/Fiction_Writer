@@ -50,6 +50,7 @@ export type Change =
 export interface WriteReport {
   committed: DocRef[];
   pending: DocRef[];
+  reason?: string;
   error?: string;
 }
 export type Protocol = 'chat' | 'responses' | 'messages';
@@ -106,6 +107,7 @@ export interface SessionView {
   workflow?: WorkProgress;
 }
 export interface RuntimeView {
+  workerId?: string;
   cursor: number;
   sessions: SessionView[];
 }

@@ -1,3 +1,5 @@
+import { DiagnosticFailure } from '../diagnostics/trace.js';
+import { noDiagnostic, type ReportDiagnostic } from '../../shared/diagnostics.js';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   lstat,
@@ -89,7 +91,7 @@ export class FileTools {
   constructor(
     private workspace: WorkspaceService,
     private stateRoot: string,
-    private rescan: () => void = () => {},
+    private rescan: (report?: ReportDiagnostic) => void = () => {},
   ) {}
   private async path(cwd: string, name: string, allowMissing: boolean) {
     const path = resolve(cwd, name);
@@ -128,8 +130,20 @@ export class FileTools {
   }
   private async write(path: string, content: string, ctx: RunContext, expect?: string) {
     const managed = this.workspace.managedPath(path);
+    ctx.diagnostic?.('tool.file', {
+      operation: 'write',
+      fileRef: path,
+      bytes: Buffer.byteLength(content),
+    });
     if (managed)
-      return this.workspace.writeRaw(managed.bookId, managed.doc, content, ctx.signal, expect);
+      return this.workspace.writeRaw(
+        managed.bookId,
+        managed.doc,
+        content,
+        ctx.signal,
+        expect,
+        ctx.diagnostic,
+      );
     if (Buffer.byteLength(content) > MAX_FILE) throw new Error('文本文件超出大小限制');
     await mkdir(dirname(path), { recursive: true });
     if (
@@ -171,6 +185,12 @@ export class FileTools {
             files.push(relative(ctx.session.cwd, file));
             if (files.length === 250) break;
           }
+          ctx.diagnostic?.('tool.file', {
+            operation: 'list',
+            fileRef: root,
+            affected: files.length,
+            truncated: files.length === 250,
+          });
           return { files, limited: files.length === 250 };
         },
       ),
@@ -182,6 +202,13 @@ export class FileTools {
           const root = await this.path(ctx.session.cwd, path, false),
             found: { path: string; line: number; text: string }[] = [];
           const needle = String(query).toLowerCase();
+          const finish = (truncated: boolean) =>
+            ctx.diagnostic?.('tool.file', {
+              operation: 'search',
+              fileRef: root,
+              affected: found.length,
+              truncated,
+            });
           for await (const file of walk(root, ctx.signal, { left: 1600 })) {
             if (inside(this.stateRoot, file)) continue;
             let text: string;
@@ -198,9 +225,13 @@ export class FileTools {
                   line: i + 1,
                   text: line.slice(0, 500),
                 });
-                if (found.length === 80) return { matches: found, limited: true };
+                if (found.length === 80) {
+                  finish(true);
+                  return { matches: found, limited: true };
+                }
               }
           }
+          finish(false);
           return { matches: found };
         },
       ),
@@ -220,6 +251,12 @@ export class FileTools {
           if (!(await stat(file)).isFile()) throw new Error('不是普通文件');
           const text = await readText(file, ctx.signal);
           const all = text.split('\n');
+          ctx.diagnostic?.('tool.file', {
+            operation: 'read',
+            fileRef: file,
+            bytes: Buffer.byteLength(text),
+            affected: all.length,
+          });
           return {
             start,
             total: all.length,
@@ -265,10 +302,17 @@ export class FileTools {
           const direct = await lstat(resolve(ctx.session.cwd, path));
           if (direct.isSymbolicLink() || !(await lstat(file)).isFile())
             throw new Error('只支持删除普通文件，不跟随文件链接');
+          ctx.diagnostic?.('tool.file', { operation: 'delete', fileRef: file });
           const managed = this.workspace.managedPath(file);
           if (managed) {
-            const report = await this.workspace.deleteDocument(managed.bookId, managed.doc, ctx.signal);
-            if (report.error) throw new Error(JSON.stringify(report));
+            const report = await this.workspace.deleteDocument(
+              managed.bookId,
+              managed.doc,
+              ctx.signal,
+              ctx.diagnostic,
+            );
+            if (report.error)
+              throw new DiagnosticFailure(report.reason ?? 'unknown', JSON.stringify(report));
           } else await unlink(file);
           return { deleted: true };
         },
@@ -285,12 +329,18 @@ export class FileTools {
         ),
         async ({ command, timeoutMs = 30_000 }, ctx) => {
           try {
-            return await runCommand(ctx.session.cwd, command, timeoutMs, ctx.signal);
+            return await runCommand(
+              ctx.session.cwd,
+              command,
+              timeoutMs,
+              ctx.signal,
+              ctx.diagnostic ?? noDiagnostic,
+            );
           } catch (error) {
             if (error instanceof CommandStopError) ctx.uncertainStop?.(error.message);
             throw error;
           } finally {
-            this.rescan();
+            this.rescan(ctx.diagnostic);
           }
         },
       ),

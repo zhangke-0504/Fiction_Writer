@@ -1,3 +1,4 @@
+import { collectDiagnostics } from './diagnostic-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { access, appendFile, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -93,7 +94,11 @@ test('timeout terminates a real process tree and session work is independent', a
   await runs.stop(a.id);
   assert.equal(runs.get(a.id).run?.status, 'cancelled');
   const command = `node -e "setTimeout(() => require('fs').writeFileSync('late.txt','x'),1800)"`;
-  const result = await runCommand(dir, command, 650, new AbortController().signal);
+  const trace = collectDiagnostics();
+  const result = await runCommand(dir, command, 650, new AbortController().signal, trace.report);
+  assert.deepEqual(trace.rejected, []);
+  assert.equal(trace.rows.at(-1)?.fields.termination, 'confirmed');
+  assert.equal(trace.rows.at(-1)?.fields.timedOut, true);
   assert.equal(result.timeout, true);
   await delay(1900);
   await assert.rejects(access(join(dir, 'late.txt')));
@@ -175,4 +180,50 @@ test('deleting a workspace cannot recreate a concurrently deleted session record
   );
   assert.equal(sessions[0].session.missing, true);
   assert.equal(sessions[0].messages[0].text, 'preserved history');
+});
+
+test('the real loop records its cap and does not claim to dispatch a final tool result', async (t) => {
+  const { workspace, runs, dir, state } = await fixture(t);
+  const session = await runs.create({ cwd: dir }, 'Fixture');
+  const trace = collectDiagnostics();
+  const provider = new ScriptedProvider([() => assistant('', [['list_files', {}]])]);
+  runs.start(
+    session.id,
+    'fixture',
+    async (ctx) => {
+      await runAgent(ctx, provider, '', [], 'fixture', new FileTools(workspace, state).tools(), 1);
+    },
+    'high',
+    trace.report,
+  );
+  await runs.wait(session.id);
+  assert.equal(runs.get(session.id).run?.status, 'failed');
+  assert.deepEqual(trace.rejected, []);
+  const first = trace.rows.find((e) => e.event === 'loop.round.started')!,
+    end = trace.rows.find((e) => e.event === 'loop.round.finished')!;
+  assert.equal(first.fields.turn, 1);
+  assert.equal(end.fields.spanId, first.fields.spanId);
+  assert.equal(end.fields.reason, 'iteration_limit');
+  assert.ok(trace.rows.some((e) => e.event === 'tool.result_ready' && e.fields.outcome === 'ok'));
+  assert.ok(!trace.rows.some((e) => e.event === 'tool.result_sent'));
+});
+
+test('a cancelled command records the observed stop, not just the abort request', async (t) => {
+  const { dir } = await fixture(t);
+  const trace = collectDiagnostics(),
+    ab = new AbortController();
+  const work = runCommand(
+    dir,
+    process.platform === 'win32' ? 'Start-Sleep -Seconds 20' : 'sleep 20',
+    8000,
+    ab.signal,
+    trace.report,
+  );
+  await delay(450);
+  ab.abort();
+  await assert.rejects(work, { name: 'AbortError' });
+  assert.deepEqual(trace.rejected, []);
+  assert.equal(trace.rows.at(-1)?.event, 'command.finished');
+  assert.equal(trace.rows.at(-1)?.fields.termination, 'confirmed');
+  assert.equal(trace.rows.at(-1)?.fields.outcome, 'cancelled');
 });

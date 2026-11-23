@@ -1,3 +1,5 @@
+import { diagnosticScope, noDiagnostic, type ReportDiagnostic } from '../shared/diagnostics.js';
+import { classified, elapsed, safeReporter } from './diagnostics/trace.js';
 import { randomUUID } from 'node:crypto';
 import { watch, type FSWatcher } from 'node:fs';
 import { promises as fs } from 'node:fs';
@@ -30,7 +32,7 @@ export { WorkspaceError } from './documents.js';
 export type Guard = DocRef & { revision: string };
 interface WorkspaceOptions {
   libraryRoot: string;
-  onChange?: (bookId: string, docs: DocRef[]) => void;
+  onChange?: (bookId: string, docs: DocRef[], changeId: string) => number | void;
   beforeReplace?: (path: string) => void | Promise<void>;
 }
 const itemTypes = Object.keys(itemFolders) as (keyof typeof itemFolders)[];
@@ -51,6 +53,33 @@ function docPath(root: string, bookId: string, ref: DocRef) {
   if (itemTypes.includes(ref.type as keyof typeof itemFolders))
     return join(root, itemFolders[ref.type as keyof typeof itemFolders], `${ref.id}.md`);
   throw new WorkspaceError('未知文档类型或身份');
+}
+
+const traceDocument = (ref: DocRef) => ({ documentRef: docKey(ref), docType: ref.type });
+function beginCommit(
+  bookId: string,
+  report: ReportDiagnostic,
+  operation: 'create' | 'write' | 'delete',
+  count: number,
+  changeId = randomUUID(),
+) {
+  const trace = diagnosticScope(safeReporter(report), { workspaceRef: bookId, changeId });
+  const started = performance.now();
+  trace('workspace.commit.started', { operation, count });
+  return {
+    changeId,
+    trace,
+    finish(outcome: string, committed: number, pending: number, reason?: string) {
+      trace('workspace.commit.finished', {
+        operation,
+        outcome,
+        committed,
+        pending,
+        reason,
+        elapsedMs: elapsed(started),
+      });
+    },
+  };
 }
 
 export class WorkspaceService {
@@ -174,31 +203,52 @@ export class WorkspaceService {
     books.sort((a, b) => a.title.localeCompare(b.title, 'zh-CN'));
     return { books, diagnostics };
   }
-  async createBook(input: { title: string; summary: string; genre?: string; style?: string }) {
-    const id = randomUUID(),
-      root = this.bookRoot(id);
-    const title = input.title?.trim(),
-      body = input.summary?.trim();
-    const text = renderDocument(
-      { type: 'book', id },
-      { title, genre: input.genre?.trim() || undefined, style: input.style?.trim() || undefined },
-      body,
-    );
-    const staging = join(this.canonicalRoot, `.pending-${id}`);
-    await fs.mkdir(staging);
+  async createBook(
+    input: { title: string; summary: string; genre?: string; style?: string },
+    diagnostic = noDiagnostic,
+  ) {
+    const id = randomUUID();
+    const operation = beginCommit(id, diagnostic, 'create', 2);
     try {
-      for (const folder of Object.values(itemFolders)) await fs.mkdir(join(staging, folder));
-      await fs.writeFile(join(staging, 'book.md'), text, 'utf8');
-      await fs.writeFile(join(staging, 'outline.md'), '', 'utf8');
-      await fs.rename(staging, root);
+      const root = this.bookRoot(id);
+      const title = input.title?.trim(),
+        body = input.summary?.trim();
+      const text = renderDocument(
+        { type: 'book', id },
+        { title, genre: input.genre?.trim() || undefined, style: input.style?.trim() || undefined },
+        body,
+      );
+      const staging = join(this.canonicalRoot, `.pending-${id}`);
+      await fs.mkdir(staging);
+      try {
+        for (const folder of Object.values(itemFolders)) await fs.mkdir(join(staging, folder));
+        await fs.writeFile(join(staging, 'book.md'), text, 'utf8');
+        await fs.writeFile(join(staging, 'outline.md'), '', 'utf8');
+        await fs.rename(staging, root);
+      } catch (error) {
+        const actual = await fs.realpath(staging).catch(() => undefined);
+        if (actual && beneath(this.canonicalRoot, actual) && !relative(actual, staging))
+          await fs.rm(actual, { recursive: true, force: true }).catch(() => undefined);
+        throw error;
+      }
+      const ref = { type: 'book', id } as const;
+      operation.trace('workspace.document.committed', {
+        ...traceDocument(ref),
+        operation: 'write',
+        revision: digest(text),
+      });
+      operation.trace('workspace.document.committed', {
+        ...traceDocument({ type: 'outline', id: 'outline' }),
+        operation: 'write',
+        revision: digest(''),
+      });
+      operation.finish('ok', 2, 0);
+      this.changed(id, [ref], operation);
+      return { id, title };
     } catch (error) {
-      const actual = await fs.realpath(staging).catch(() => undefined);
-      if (actual && beneath(this.canonicalRoot, actual) && !relative(actual, staging))
-        await fs.rm(actual, { recursive: true, force: true }).catch(() => undefined);
+      operation.finish('failed', 0, 2, classified(error));
       throw error;
     }
-    this.changed(id, [{ type: 'book', id }]);
-    return { id, title };
   }
   private enqueue<T>(bookId: string, issue: () => Promise<T>) {
     const turn = (this.writes.get(bookId) ?? Promise.resolve()).then(issue);
@@ -209,14 +259,26 @@ export class WorkspaceService {
     });
     return turn;
   }
-  private changed(bookId: string, docs: DocRef[]) {
-    this.options.onChange?.(bookId, docs);
+  private changed(bookId: string, docs: DocRef[], operation: ReturnType<typeof beginCommit>) {
+    const journalSeq = this.options.onChange?.(bookId, docs, operation.changeId);
+    if (typeof journalSeq === 'number')
+      operation.trace('workspace.notified', { journalSeq, count: docs.length, reason: 'managed' });
   }
-  deleteBook(bookId: string) {
+  deleteBook(bookId: string, diagnostic = noDiagnostic) {
     return this.enqueue(bookId, async () => {
-      const dir = await this.checkedRoot(bookId);
-      await fs.rm(dir, { recursive: true, force: false });
-      this.changed(bookId, [{ type: 'book', id: bookId }]);
+      const operation = beginCommit(bookId, diagnostic, 'delete', 1);
+      const ref = { type: 'book', id: bookId } as const;
+      try {
+        const dir = await this.checkedRoot(bookId);
+        operation.trace('workspace.preconditions', { outcome: 'ok', count: 1 });
+        await fs.rm(dir, { recursive: true, force: false });
+        operation.trace('workspace.document.committed', { ...traceDocument(ref), operation: 'delete' });
+        operation.finish('ok', 1, 0);
+      } catch (error) {
+        operation.finish('failed', 0, 1, classified(error));
+        throw error;
+      }
+      this.changed(bookId, [ref], operation);
     });
   }
   private async revision(root: string, bookId: string, ref: DocRef) {
@@ -244,18 +306,45 @@ export class WorkspaceService {
     changes: Change[],
     signal?: AbortSignal,
     guards: Guard[] = [],
+    diagnostic = noDiagnostic,
   ): Promise<WriteReport> {
-    return this.enqueue(bookId, () => this.commit(bookId, changes, signal, guards));
+    return this.enqueue(bookId, () => this.commit(bookId, changes, signal, guards, diagnostic));
   }
   private async commit(
     bookId: string,
     changes: Change[],
-    signal?: AbortSignal,
-    guards: Guard[] = [],
+    signal: AbortSignal | undefined,
+    guards: Guard[],
+    diagnostic: ReportDiagnostic,
   ): Promise<WriteReport> {
     let pending = changes.map(refOf);
     const committed: DocRef[] = [];
     if (!changes.length) return { committed, pending };
+    const operation = beginCommit(
+      bookId,
+      diagnostic,
+      changes.every((change) => 'delete' in change) ? 'delete' : 'write',
+      changes.length,
+    );
+    let preconditionsPassed = false;
+    let failure: string | undefined;
+    const matchesRevision = async (
+      root: string,
+      ref: DocRef,
+      expected: string | null,
+      step: 'guard' | 'plan' | 'replace',
+    ) => {
+      const actual = await this.revision(root, bookId, ref);
+      if (actual === expected) return true;
+      operation.trace('workspace.conflict', {
+        ...traceDocument(ref),
+        step,
+        reason: 'conflict',
+        expectedRevision: expected ?? undefined,
+        actualRevision: actual ?? undefined,
+      });
+      return false;
+    };
     try {
       signal?.throwIfAborted();
       const root = await this.checkedRoot(bookId);
@@ -267,7 +356,7 @@ export class WorkspaceService {
       )
         throw new WorkspaceError('同一次批量操作不能重复修改同一文档');
       for (const guard of guards)
-        if ((await this.revision(root, bookId, guard)) !== guard.revision)
+        if (!(await matchesRevision(root, guard, guard.revision, 'guard')))
           throw new WorkspaceError(`${docKey(guard)} 已变化，请重新读取`, 'conflict');
       const { documents } = await this.load(root, bookId);
       const original = new Map(documents.map((doc) => [docKey(doc), doc])),
@@ -278,7 +367,7 @@ export class WorkspaceService {
         const ref = refOf(change),
           path = docPath(root, bookId, ref),
           key = docKey(ref);
-        if ((await this.revision(root, bookId, ref)) !== change.expect)
+        if (!(await matchesRevision(root, ref, change.expect, 'plan')))
           throw new WorkspaceError(`${key} 的文件已变化，请重新读取`, 'conflict');
         if ('delete' in change) {
           if (ref.type === 'book' || ref.type === 'outline')
@@ -330,10 +419,16 @@ export class WorkspaceService {
         (a, b) => Number(a.text === undefined) - Number(b.text === undefined),
       );
       pending = ordered.map((item) => item.ref);
+      preconditionsPassed = true;
+      operation.trace('workspace.preconditions', {
+        outcome: 'ok',
+        count: pending.length,
+        guardCount: guards.length,
+      });
       for (const item of ordered) {
         signal?.throwIfAborted();
         const path = docPath(root, bookId, item.ref);
-        if ((await this.revision(root, bookId, item.ref)) !== item.expect)
+        if (!(await matchesRevision(root, item.ref, item.expect, 'replace')))
           throw new WorkspaceError(`${docKey(item.ref)} 的文件已变化，请重新读取`, 'conflict');
         if (item.text === undefined) await fs.unlink(path);
         else {
@@ -342,26 +437,67 @@ export class WorkspaceService {
         }
         committed.push(item.ref);
         pending.shift();
+        operation.trace('workspace.document.committed', {
+          ...traceDocument(item.ref),
+          operation: item.text === undefined ? 'delete' : 'write',
+          revision: item.text === undefined ? undefined : projected.get(docKey(item.ref))?.revision,
+          expectedRevision: item.expect ?? undefined,
+        });
       }
       return { committed, pending };
     } catch (e) {
-      return { committed, pending, error: e instanceof Error ? e.message : '写入失败' };
+      failure = classified(e, signal);
+      if (!preconditionsPassed)
+        operation.trace('workspace.preconditions', {
+          outcome: 'failed',
+          reason: failure,
+          count: pending.length,
+          guardCount: guards.length,
+        });
+      for (const ref of pending.slice(0, 64))
+        operation.trace('workspace.document.pending', traceDocument(ref));
+      return { committed, pending, reason: failure, error: e instanceof Error ? e.message : '写入失败' };
     } finally {
-      if (committed.length) this.changed(bookId, committed);
+      const outcome = !failure
+        ? 'ok'
+        : committed.length
+          ? 'partial'
+          : ['conflict', 'cancelled'].includes(failure)
+            ? failure
+            : 'failed';
+      operation.finish(outcome, committed.length, pending.length, failure);
+      if (committed.length) this.changed(bookId, committed, operation);
     }
   }
-  async deleteDocument(bookId: string, ref: DocRef, signal?: AbortSignal) {
-    await this.writes.get(bookId);
-    const root = await this.checkedRoot(bookId),
-      expect = await this.revision(root, bookId, ref);
-    if (!expect) throw new WorkspaceError('文档不存在');
-    return this.writeChanges(bookId, [{ ...refOf(ref), expect, delete: true }], signal);
+  async deleteDocument(bookId: string, ref: DocRef, signal?: AbortSignal, diagnostic = noDiagnostic) {
+    let expect: string;
+    try {
+      await this.writes.get(bookId);
+      const root = await this.checkedRoot(bookId),
+        current = await this.revision(root, bookId, ref);
+      if (!current) throw new WorkspaceError('文档不存在', 'ENOENT');
+      expect = current;
+    } catch (error) {
+      const operation = beginCommit(bookId, diagnostic, 'delete', 1),
+        reason = classified(error, signal);
+      operation.trace('workspace.preconditions', {
+        ...traceDocument(ref),
+        outcome: 'failed',
+        reason,
+        count: 1,
+      });
+      operation.finish('failed', 0, 1, reason);
+      throw error;
+    }
+    return this.writeChanges(bookId, [{ ...refOf(ref), expect, delete: true }], signal, [], diagnostic);
   }
-  writeDocument(bookId: string, doc: Manuscript, signal?: AbortSignal) {
+  writeDocument(bookId: string, doc: Manuscript, signal?: AbortSignal, diagnostic = noDiagnostic) {
     return this.writeChanges(
       bookId,
       [{ ...refOf(doc), expect: doc.revision || null, fields: doc.fields, body: doc.body }],
       signal,
+      [],
+      diagnostic,
     );
   }
   managedPath(path: string): { bookId: string; doc: DocRef } | undefined {
@@ -378,13 +514,48 @@ export class WorkspaceService {
       if (type && isId(id)) return { bookId, doc: { type, id } };
     }
   }
-  async writeRaw(bookId: string, doc: DocRef, content: string, signal: AbortSignal, expect?: string) {
-    const current = await this.revision(await this.checkedRoot(bookId), bookId, doc);
-    if (expect !== undefined && current !== expect)
-      throw new WorkspaceError('文件已变化，请重新读取', 'conflict');
-    const parsed = parseDocument(doc, Buffer.from(content));
-    const report = await this.writeChanges(bookId, [{ ...parsed, expect: current }], signal);
-    if (report.error) throw new WorkspaceError(JSON.stringify(report));
+  async writeRaw(
+    bookId: string,
+    doc: DocRef,
+    content: string,
+    signal: AbortSignal,
+    expect?: string,
+    diagnostic = noDiagnostic,
+  ) {
+    let current: string | null | undefined, parsed: Manuscript;
+    try {
+      current = await this.revision(await this.checkedRoot(bookId), bookId, doc);
+      if (expect !== undefined && current !== expect)
+        throw new WorkspaceError('文件已变化，请重新读取', 'conflict');
+      parsed = parseDocument(doc, Buffer.from(content));
+    } catch (error) {
+      const operation = beginCommit(bookId, diagnostic, 'write', 1),
+        reason = classified(error, signal);
+      if (reason === 'conflict')
+        operation.trace('workspace.conflict', {
+          ...traceDocument(doc),
+          reason,
+          step: 'plan',
+          actualRevision: current ?? undefined,
+          expectedRevision: expect,
+        });
+      operation.trace('workspace.preconditions', {
+        ...traceDocument(doc),
+        outcome: 'failed',
+        reason,
+        count: 1,
+      });
+      operation.finish(reason === 'conflict' ? 'conflict' : 'failed', 0, 1, reason);
+      throw error;
+    }
+    const report = await this.writeChanges(
+      bookId,
+      [{ ...parsed, expect: current }],
+      signal,
+      [],
+      diagnostic,
+    );
+    if (report.error) throw new WorkspaceError(JSON.stringify(report), report.reason);
     return report;
   }
   watchExternal(invalidate: (bookId?: string) => void) {

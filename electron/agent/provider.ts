@@ -1,34 +1,81 @@
+import { randomUUID } from 'node:crypto';
+import { diagnosticScope, noDiagnostic, type ReportDiagnostic } from '../../shared/diagnostics.js';
+import { classified, elapsed, safeReporter } from '../diagnostics/trace.js';
 import type { Effort, ModelProfile } from '../../shared/contracts.js';
 import type { AssistantTurn, ModelProvider, ModelRequest, ToolCall, ToolSpec } from './model.js';
-import { sse } from './sse.js';
+import { ModelStreamReadError, sse } from './sse.js';
 
 const operation = { chat: '/chat/completions', responses: '/responses', messages: '/messages' } as const;
 export class ProviderError extends Error {
   constructor(
     message: string,
     readonly kind: 'auth' | 'network' | 'protocol' | 'timeout' = 'protocol',
+    readonly detail?: 'http_error' | 'malformed_stream' | 'incomplete_stream' | 'provider_error',
   ) {
     super(message);
   }
 }
-const error = (message: string) => new ProviderError(message);
+const error = (message: string, detail?: ProviderError['detail']) =>
+  new ProviderError(message, 'protocol', detail);
 function reply(text: string, calls: ToolCall[], native?: unknown): AssistantTurn {
   return { role: 'assistant', text, calls, native };
 }
 function failStatus(status: number) {
   if (status === 401 || status === 403)
     return new ProviderError(`HTTP ${status}：鉴权失败，请核对 API Key 与访问权限`, 'auth');
-  return error(`HTTP ${status}：接口未接受请求，请核对地址、模型 ID 与协议`);
+  return error(`HTTP ${status}：接口未接受请求，请核对地址、模型 ID 与协议`, 'http_error');
 }
-function assertCalls(calls: ToolCall[]) {
-  for (const call of calls)
-    if (
-      !call.id ||
-      !/^[A-Za-z0-9_-]{1,128}$/.test(call.name) ||
-      typeof call.args !== 'string' ||
-      call.args.length > 300_000
+function rejectCalls(
+  calls: readonly Pick<ToolCall, 'name'>[],
+  request: ModelRequest,
+  report: ReportDiagnostic,
+  reason: string,
+  individualReasons?: ReadonlyMap<number, string>,
+) {
+  // An oversized invalid batch must not flood the message pipe before the writer can bound its queue.
+  if (calls.length > 32)
+    report('tool.batch_rejected', { count: calls.length, omitted: calls.length - 32, reason });
+  for (const [index, call] of calls.slice(0, 32).entries()) {
+    const trace = diagnosticScope(report, {
+      callId: randomUUID(),
+      tool: request.tools.some((t) => t.name === call.name) ? call.name : 'unknown',
+    });
+    trace('tool.requested');
+    trace('tool.rejected', { reason: individualReasons?.get(index) ?? reason });
+  }
+}
+function rejectObservedCalls(
+  cause: unknown,
+  calls: readonly Pick<ToolCall, 'name'>[],
+  request: ModelRequest,
+  report: ReportDiagnostic,
+): never {
+  const reason = classified(cause, request.signal);
+  rejectCalls(
+    calls,
+    request,
+    report,
+    reason !== 'unknown'
+      ? reason
+      : cause instanceof ModelStreamReadError
+        ? 'incomplete_stream'
+        : 'malformed_stream',
+  );
+  throw cause;
+}
+function assertCalls(calls: ToolCall[], request: ModelRequest, report: ReportDiagnostic) {
+  if (
+    calls.some(
+      (call) =>
+        !call.id ||
+        !/^[A-Za-z0-9_-]{1,128}$/.test(call.name) ||
+        typeof call.args !== 'string' ||
+        call.args.length > 300_000,
     )
-      throw error('模型返回了无效或不完整的工具调用');
+  ) {
+    rejectCalls(calls, request, report, 'invalid_call');
+    throw error('模型返回了无效或不完整的工具调用', 'malformed_stream');
+  }
 }
 function settings(profile: ModelProfile, effort: Effort) {
   const name = profile.model.toLowerCase();
@@ -136,79 +183,117 @@ function messagesBody(request: ModelRequest) {
   return { messages, system: request.system, max_tokens: request.maxTokens ?? 8192 };
 }
 type Payload = { label: string; value: any };
-async function* stream(body: ReadableStream<Uint8Array>, signal: AbortSignal): AsyncGenerator<Payload> {
+async function* stream(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+  first: () => void,
+): AsyncGenerator<Payload> {
+  let observed = false;
   for await (const frame of sse(body, signal)) {
+    if (!observed) {
+      observed = true;
+      first();
+    }
     if (frame.data.trim() === '[DONE]') break;
     let value: any;
     try {
       value = JSON.parse(frame.data);
     } catch {
-      throw error('模型返回无法解析的流式数据');
+      throw error('模型返回无法解析的流式数据', 'malformed_stream');
     }
     if (value?.error || value?.type === 'error' || frame.type === 'error')
-      throw error('模型在流式响应中报告错误');
-    if (!value || typeof value !== 'object') throw error('模型返回无效流式事件');
+      throw error('模型在流式响应中报告错误', 'provider_error');
+    if (!value || typeof value !== 'object') throw error('模型返回无效流式事件', 'malformed_stream');
     yield { label: value.type ?? frame.type, value };
   }
 }
-async function parseChat(events: AsyncIterable<Payload>, textOut: (delta: string) => void) {
+async function parseChat(
+  events: AsyncIterable<Payload>,
+  textOut: (delta: string) => void,
+  request: ModelRequest,
+  report: ReportDiagnostic,
+) {
   let text = '',
     reasoning = '',
     stop = '';
   const calls = new Map<number, ToolCall>();
-  for await (const { value } of events) {
-    const choice = value.choices?.find((c: any) => (c.index ?? 0) === 0);
-    if (!choice) continue;
-    const delta = choice.delta ?? {};
-    if (typeof delta.content === 'string' && delta.content) {
-      text += delta.content;
-      textOut(delta.content);
+  try {
+    for await (const { value } of events) {
+      const choice = value.choices?.find((c: any) => (c.index ?? 0) === 0);
+      if (!choice) continue;
+      const delta = choice.delta ?? {};
+      if (typeof delta.content === 'string' && delta.content) {
+        text += delta.content;
+        textOut(delta.content);
+      }
+      if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content;
+      for (const call of delta.tool_calls ?? []) {
+        if (!Number.isInteger(call.index) || call.index < 0 || call.index >= 32)
+          throw error('工具调用索引无效');
+        const current = calls.get(call.index) ?? { id: '', name: '', args: '' };
+        if (call.id) current.id = call.id;
+        if (call.function?.name) current.name += call.function.name;
+        if (call.function?.arguments) current.args += call.function.arguments;
+        calls.set(call.index, current);
+      }
+      if (typeof choice.finish_reason === 'string') stop = choice.finish_reason;
     }
-    if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content;
-    for (const call of delta.tool_calls ?? []) {
-      if (!Number.isInteger(call.index) || call.index < 0 || call.index >= 32)
-        throw error('工具调用索引无效');
-      const current = calls.get(call.index) ?? { id: '', name: '', args: '' };
-      if (call.id) current.id = call.id;
-      if (call.function?.name) current.name += call.function.name;
-      if (call.function?.arguments) current.args += call.function.arguments;
-      calls.set(call.index, current);
-    }
-    if (typeof choice.finish_reason === 'string') stop = choice.finish_reason;
+  } catch (cause) {
+    rejectObservedCalls(cause, [...calls.values()], request, report);
   }
-  if (!['stop', 'tool_calls'].includes(stop))
-    throw error(stop === 'length' ? '模型达到输出上限，未提交响应' : '流式回复中断或未正常结束');
   const ordered = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
-  if (stop === 'tool_calls' && !ordered.length) throw error('模型未传回工具调用');
-  assertCalls(ordered);
+  if (!['stop', 'tool_calls'].includes(stop)) {
+    rejectCalls(ordered, request, report, 'incomplete_stream');
+    throw error(
+      stop === 'length' ? '模型达到输出上限，未提交响应' : '流式回复中断或未正常结束',
+      'incomplete_stream',
+    );
+  }
+  if (stop === 'tool_calls' && !ordered.length) throw error('模型未传回工具调用', 'incomplete_stream');
+  assertCalls(ordered, request, report);
   return reply(text, ordered, reasoning || undefined);
 }
-async function parseResponses(events: AsyncIterable<Payload>, textOut: (delta: string) => void) {
+async function parseResponses(
+  events: AsyncIterable<Payload>,
+  textOut: (delta: string) => void,
+  request: ModelRequest,
+  report: ReportDiagnostic,
+) {
   let text = '',
     ended = false;
   let output: any[] = [];
   const interim = new Map<number, any>();
-  for await (const { label, value } of events) {
-    if (label === 'response.output_text.delta' && typeof value.delta === 'string') {
-      text += value.delta;
-      textOut(value.delta);
+  try {
+    for await (const { label, value } of events) {
+      if (label === 'response.output_text.delta' && typeof value.delta === 'string') {
+        text += value.delta;
+        textOut(value.delta);
+      }
+      if (label === 'response.output_item.done' && value.item)
+        interim.set(value.output_index, value.item);
+      if (
+        label === 'response.failed' ||
+        label === 'response.incomplete' ||
+        label === 'response.cancelled'
+      )
+        throw error('Responses 输出中断或未完成', 'incomplete_stream');
+      if (label === 'response.completed') {
+        ended = true;
+        output = Array.isArray(value.response?.output)
+          ? value.response.output
+          : [...interim].sort(([a], [b]) => a - b).map(([, item]) => item);
+        break;
+      }
     }
-    if (label === 'response.output_item.done' && value.item) interim.set(value.output_index, value.item);
-    if (label === 'response.failed' || label === 'response.incomplete' || label === 'response.cancelled')
-      throw error('Responses 输出中断或未完成');
-    if (label === 'response.completed') {
-      ended = true;
-      output = Array.isArray(value.response?.output)
-        ? value.response.output
-        : [...interim].sort(([a], [b]) => a - b).map(([, item]) => item);
-      break;
-    }
+    if (!ended) throw error('Responses 流缺少完成事件', 'incomplete_stream');
+  } catch (cause) {
+    const completedCalls = [...interim.values()].filter((item) => item?.type === 'function_call');
+    rejectObservedCalls(cause, completedCalls, request, report);
   }
-  if (!ended) throw error('Responses 流缺少完成事件');
   const calls = output
     .filter((item) => item?.type === 'function_call')
     .map((item) => ({ id: item.call_id, name: item.name, args: item.arguments }));
-  assertCalls(calls);
+  assertCalls(calls, request, report);
   if (!text) {
     text = output
       .flatMap((item) =>
@@ -225,53 +310,74 @@ async function parseResponses(events: AsyncIterable<Payload>, textOut: (delta: s
     output.filter((item) => ['function_call', 'message', 'reasoning'].includes(item?.type)),
   );
 }
-async function parseMessages(events: AsyncIterable<Payload>, textOut: (delta: string) => void) {
+async function parseMessages(
+  events: AsyncIterable<Payload>,
+  textOut: (delta: string) => void,
+  request: ModelRequest,
+  report: ReportDiagnostic,
+) {
   const blocks = new Map<number, any>();
   const json = new Map<number, string>();
   let finish = '',
     closed = false;
-  for await (const { label, value } of events) {
-    if (label === 'content_block_start') {
-      blocks.set(value.index, value.content_block);
-      if (value.content_block?.type === 'text' && value.content_block.text)
-        textOut(value.content_block.text);
-    }
-    if (label === 'content_block_delta') {
-      const block = blocks.get(value.index);
-      if (!block) throw error('Messages 内容块顺序无效');
-      const datum = value.delta ?? {};
-      if (datum.type === 'text_delta' && typeof datum.text === 'string') {
-        block.text = (block.text ?? '') + datum.text;
-        textOut(datum.text);
+  const completedToolBlocks = new Set<number>();
+  try {
+    for await (const { label, value } of events) {
+      if (label === 'content_block_start') {
+        blocks.set(value.index, value.content_block);
+        if (value.content_block?.type === 'text' && value.content_block.text)
+          textOut(value.content_block.text);
       }
-      if (datum.type === 'input_json_delta' && typeof datum.partial_json === 'string')
-        json.set(value.index, (json.get(value.index) ?? '') + datum.partial_json);
-      if (datum.type === 'thinking_delta')
-        block.thinking = (block.thinking ?? '') + (datum.thinking ?? '');
-      if (datum.type === 'signature_delta')
-        block.signature = (block.signature ?? '') + (datum.signature ?? '');
+      if (label === 'content_block_delta') {
+        const block = blocks.get(value.index);
+        if (!block) throw error('Messages 内容块顺序无效');
+        const datum = value.delta ?? {};
+        if (datum.type === 'text_delta' && typeof datum.text === 'string') {
+          block.text = (block.text ?? '') + datum.text;
+          textOut(datum.text);
+        }
+        if (datum.type === 'input_json_delta' && typeof datum.partial_json === 'string')
+          json.set(value.index, (json.get(value.index) ?? '') + datum.partial_json);
+        if (datum.type === 'thinking_delta')
+          block.thinking = (block.thinking ?? '') + (datum.thinking ?? '');
+        if (datum.type === 'signature_delta')
+          block.signature = (block.signature ?? '') + (datum.signature ?? '');
+      }
+      if (label === 'content_block_stop' && blocks.get(value.index)?.type === 'tool_use')
+        completedToolBlocks.add(value.index);
+      if (label === 'message_delta' && value.delta?.stop_reason) finish = value.delta.stop_reason;
+      if (label === 'message_stop') {
+        closed = true;
+        break;
+      }
     }
-    if (label === 'message_delta' && value.delta?.stop_reason) finish = value.delta.stop_reason;
-    if (label === 'message_stop') {
-      closed = true;
-      break;
-    }
+    if (!closed || !['end_turn', 'tool_use', 'stop_sequence'].includes(finish))
+      throw error('Messages 输出中断或未完成', 'incomplete_stream');
+  } catch (cause) {
+    const completedCalls = [...completedToolBlocks]
+      .map((index) => blocks.get(index))
+      .filter((block) => block?.type === 'tool_use');
+    rejectObservedCalls(cause, completedCalls, request, report);
   }
-  if (!closed || !['end_turn', 'tool_use', 'stop_sequence'].includes(finish))
-    throw error('Messages 输出中断或未完成');
   const ordered = [...blocks].sort(([a], [b]) => a - b);
   const calls: ToolCall[] = [];
+  const invalid = new Map<number, string>();
   for (const [index, block] of ordered)
     if (block.type === 'tool_use') {
       const args = json.get(index) ?? JSON.stringify(block.input ?? {});
       try {
         block.input = JSON.parse(args);
       } catch {
-        throw error('Messages 工具参数不是完整 JSON');
+        invalid.set(calls.length, 'invalid_json');
       }
       calls.push({ id: block.id, name: block.name, args });
     }
-  assertCalls(calls);
+  if (invalid.size) {
+    // A malformed block rejects the entire turn, including its otherwise parseable candidates.
+    rejectCalls(calls, request, report, 'batch_invalid', invalid);
+    throw error('Messages 工具参数不是完整 JSON', 'malformed_stream');
+  }
+  assertCalls(calls, request, report);
   const native = ordered
     .map(([, block]) => block)
     .filter((block) => ['text', 'tool_use', 'thinking', 'redacted_thinking'].includes(block.type));
@@ -294,86 +400,133 @@ export function createProvider(
   return {
     effort: configuration.used,
     async turn(request) {
-      const signal = AbortSignal.any([request.signal, AbortSignal.timeout(timeoutMs)]);
-      const url = profile.baseUrl + operation[profile.protocol];
-      const hdr: Record<string, string> = {
-        'content-type': 'application/json',
-        accept: 'text/event-stream',
-      };
-      if (profile.protocol === 'messages') {
-        hdr['x-api-key'] = key;
-        hdr['anthropic-version'] = '2023-06-01';
-      } else hdr.authorization = `Bearer ${key}`;
-      const params =
-        profile.protocol === 'chat'
-          ? chatBody(request, profile)
-          : profile.protocol === 'responses'
-            ? responsesBody(request)
-            : messagesBody(request);
-      const body = JSON.stringify({
-        ...params,
-        model: profile.model,
-        stream: true,
-        ...configuration.fields,
-        ...(request.tools.length ? { tools: toolDefinitions(request.tools, profile.protocol) } : {}),
+      const spanId = request.spanId ?? randomUUID();
+      const report = diagnosticScope(safeReporter(request.diagnostic ?? noDiagnostic), {
+        spanId,
+        profileRef: profile.id,
       });
-      let response: Response;
+      const started = performance.now();
+      report('model.started', {
+        protocol: profile.protocol,
+        effort: configuration.used,
+        messageCount: request.history.length,
+        toolCount: request.tools.length,
+      });
+      let httpStatus: number | undefined;
       try {
-        response = await fetch(url, { method: 'POST', headers: hdr, redirect: 'error', body, signal });
-      } catch {
-        request.signal.throwIfAborted();
-        throw new ProviderError(
-          signal.aborted ? '模型请求超时' : '连接模型失败（网络、证书或重定向）',
-          signal.aborted ? 'timeout' : 'network',
-        );
-      }
-      if (!response.ok) {
-        await response.body?.cancel().catch(() => {});
-        throw failStatus(response.status);
-      }
-      if (
-        !response.body ||
-        !response.headers.get('content-type')?.toLowerCase().includes('text/event-stream')
-      ) {
-        await response.body?.cancel().catch(() => {});
-        throw error('接口没有返回 SSE 流，请核对协议');
-      }
-      let pending = '';
-      const display = (delta: string, final = false) => {
-        pending = (pending + delta).replaceAll(key, '[已隐藏]');
-        let tail = 0;
-        if (!final)
-          for (let i = Math.min(pending.length, key.length - 1); i > 0; i--) {
-            if (key.startsWith(pending.slice(-i))) {
-              tail = i;
-              break;
+        const signal = AbortSignal.any([request.signal, AbortSignal.timeout(timeoutMs)]);
+        const url = profile.baseUrl + operation[profile.protocol];
+        const hdr: Record<string, string> = {
+          'content-type': 'application/json',
+          accept: 'text/event-stream',
+        };
+        if (profile.protocol === 'messages') {
+          hdr['x-api-key'] = key;
+          hdr['anthropic-version'] = '2023-06-01';
+        } else hdr.authorization = `Bearer ${key}`;
+        const params =
+          profile.protocol === 'chat'
+            ? chatBody(request, profile)
+            : profile.protocol === 'responses'
+              ? responsesBody(request)
+              : messagesBody(request);
+        const body = JSON.stringify({
+          ...params,
+          model: profile.model,
+          stream: true,
+          ...configuration.fields,
+          ...(request.tools.length ? { tools: toolDefinitions(request.tools, profile.protocol) } : {}),
+        });
+        let response: Response;
+        try {
+          signal.throwIfAborted();
+          const pending = fetch(url, { method: 'POST', headers: hdr, redirect: 'error', body, signal });
+          request.onDispatch?.(spanId);
+          response = await pending;
+        } catch {
+          request.signal.throwIfAborted();
+          throw new ProviderError(
+            signal.aborted ? '模型请求超时' : '连接模型失败（网络、证书或重定向）',
+            signal.aborted ? 'timeout' : 'network',
+          );
+        }
+        httpStatus = response.status;
+        report('model.http', { httpStatus, elapsedMs: elapsed(started) });
+        if (!response.ok) {
+          await response.body?.cancel().catch(() => {});
+          throw failStatus(response.status);
+        }
+        if (
+          !response.body ||
+          !response.headers.get('content-type')?.toLowerCase().includes('text/event-stream')
+        ) {
+          await response.body?.cancel().catch(() => {});
+          throw error('接口没有返回 SSE 流，请核对协议');
+        }
+        let pending = '';
+        const display = (delta: string, final = false) => {
+          pending = (pending + delta).replaceAll(key, '[已隐藏]');
+          let tail = 0;
+          if (!final)
+            for (let i = Math.min(pending.length, key.length - 1); i > 0; i--) {
+              if (key.startsWith(pending.slice(-i))) {
+                tail = i;
+                break;
+              }
             }
-          }
-        const visible = pending.slice(0, pending.length - tail);
-        pending = pending.slice(pending.length - tail);
-        if (visible) request.onText(visible);
-      };
-      try {
-        const events = stream(response.body, signal);
-        const result = await (profile.protocol === 'chat'
-          ? parseChat(events, display)
-          : profile.protocol === 'responses'
-            ? parseResponses(events, display)
-            : parseMessages(events, display));
-        request.signal.throwIfAborted();
-        display('', true);
-        if (JSON.stringify(result).includes(key)) throw error('模型返回了受保护的凭据信息，已拒绝写入');
-        return result;
+          const visible = pending.slice(0, pending.length - tail);
+          pending = pending.slice(pending.length - tail);
+          if (visible) request.onText(visible);
+        };
+        try {
+          const events = stream(response.body, signal, () =>
+            report('model.first_event', { elapsedMs: elapsed(started) }),
+          );
+          const result = await (profile.protocol === 'chat'
+            ? parseChat(events, display, request, report)
+            : profile.protocol === 'responses'
+              ? parseResponses(events, display, request, report)
+              : parseMessages(events, display, request, report));
+          request.signal.throwIfAborted();
+          display('', true);
+          if (JSON.stringify(result).includes(key))
+            throw error('模型返回了受保护的凭据信息，已拒绝写入');
+          report('model.finished', {
+            outcome: 'ok',
+            httpStatus,
+            elapsedMs: elapsed(started),
+            textLength: result.text.length,
+            toolCount: result.calls.length,
+          });
+          return result;
+        } catch (cause) {
+          request.signal.throwIfAborted();
+          if (signal.aborted) throw new ProviderError('模型流超时', 'timeout');
+          if (cause instanceof ProviderError) throw cause;
+          if (cause instanceof ModelStreamReadError)
+            throw error('模型流读取失败或不符合所选协议', 'incomplete_stream');
+          throw error('模型流读取失败或不符合所选协议', 'malformed_stream');
+        }
       } catch (cause) {
-        request.signal.throwIfAborted();
-        if (signal.aborted) throw new ProviderError('模型流超时', 'timeout');
-        if (cause instanceof ProviderError) throw cause;
-        throw error('模型流读取失败或不符合所选协议');
+        const reason = classified(cause, request.signal);
+        report('model.finished', {
+          outcome: reason === 'cancelled' || reason === 'timeout' ? reason : 'failed',
+          reason,
+          elapsedMs: elapsed(started),
+          httpStatus,
+        });
+        throw cause;
       }
     },
   };
 }
-export async function checkProvider(profile: ModelProfile, key: string, signal: AbortSignal) {
+export async function checkProvider(
+  profile: ModelProfile,
+  key: string,
+  signal: AbortSignal,
+  diagnostic = noDiagnostic,
+) {
+  const report = diagnosticScope(safeReporter(diagnostic), { lane: 'probe', profileRef: profile.id });
   const provider = createProvider(profile, key, 'high', 18_000);
   const system = 'You are a connectivity fixture. Follow the request using only fixture values.';
   const request: ModelRequest = {
@@ -381,14 +534,17 @@ export async function checkProvider(profile: ModelProfile, key: string, signal: 
     history: [{ role: 'user', text: 'Reply with exactly FW_OK.' }],
     tools: [],
     signal,
+    diagnostic: report,
     maxTokens: 1024,
     onText: () => {},
   };
   try {
     const initial = await provider.turn(request);
     if (!initial.text.trim()) throw error('模型未返回文本');
+    report('probe.finished', { step: 'connection', outcome: 'ok' });
   } catch (cause) {
     const e = cause instanceof ProviderError ? cause : error('连接测试未完成');
+    report('probe.finished', { step: 'connection', outcome: 'failed', reason: classified(e, signal) });
     return { connection: false, tools: false, issue: e.message, kind: e.kind };
   }
   try {
@@ -416,8 +572,10 @@ export async function checkProvider(profile: ModelProfile, key: string, signal: 
     });
     if (!result.text.includes('FW_TOOL_OK') || result.calls.length)
       throw error('模型未返回测试工具结果');
+    report('probe.finished', { step: 'tools', outcome: 'ok' });
     return { connection: true, tools: true };
   } catch (cause) {
+    report('probe.finished', { step: 'tools', outcome: 'failed', reason: classified(cause, signal) });
     return {
       connection: true,
       tools: false,

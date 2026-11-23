@@ -1,22 +1,40 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import type { LibraryView } from '../shared/contracts';
 import { api } from './bridge';
+import type { UiRefreshContext } from '../shared/diagnostics';
+import { startReload } from './diagnostics';
 import { Dialog, ErrorText, Icon, errorMessage, norm } from './ui';
-export function Library({ refresh, open }: { refresh: number; open: (id: string) => void }) {
+export function Library({ refresh, open }: { refresh: UiRefreshContext; open: (id: string) => void }) {
   const [view, setView] = useState<LibraryView>(),
     [query, setQuery] = useState(''),
     [create, setCreate] = useState(false);
   const [error, setError] = useState(''),
     [busy, setBusy] = useState(false);
-  const sync = async () => setView(await api.request<LibraryView>('library.list'));
+  const sync = async () => {
+    const reload = startReload('library', { reason: 'user' });
+    try {
+      const result = await api.request<LibraryView>('library.list');
+      setView(result);
+      reload.finish('ok', { count: result.books.length, issueCount: result.diagnostics.length });
+    } catch (error) {
+      reload.finish('failed');
+      throw error;
+    }
+  };
   useEffect(() => {
     let active = true;
+    const reload = startReload('library', refresh);
     void api.request<LibraryView>('library.list').then(
       (v) => {
         if (active) setView(v);
+        reload.finish(active ? 'ok' : 'superseded', {
+          count: v.books.length,
+          issueCount: v.diagnostics.length,
+        });
       },
       (e) => {
         if (active) setError(errorMessage(e));
+        reload.finish(active ? 'failed' : 'superseded');
       },
     );
     return () => {

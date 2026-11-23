@@ -1,3 +1,5 @@
+export class ModelStreamReadError extends Error {}
+
 export async function* sse(
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal,
@@ -31,7 +33,14 @@ export async function* sse(
   try {
     for (;;) {
       signal.throwIfAborted();
-      const { value, done } = await reader.read();
+      let chunk: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        chunk = await reader.read();
+      } catch (cause) {
+        signal.throwIfAborted();
+        throw new ModelStreamReadError('模型流读取失败', { cause });
+      }
+      const { value, done } = chunk;
       signal.throwIfAborted();
       if (value) {
         count += value.byteLength;

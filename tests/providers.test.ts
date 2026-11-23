@@ -1,3 +1,4 @@
+import { collectDiagnostics } from './diagnostic-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -71,7 +72,8 @@ test('Chat Completions joins fragmented calls and returns tool ID plus DeepSeek 
     );
   });
   const provider = createProvider(profile, key, 'high');
-  const request = ctx();
+  const trace = collectDiagnostics();
+  const request = { ...ctx(), diagnostic: trace.report };
   const first = await provider.turn(request);
   assert.equal(first.calls[0].args, '{"path":"a.md"}');
   assert.equal(provider.effort, 'high');
@@ -91,6 +93,23 @@ test('Chat Completions joins fragmented calls and returns tool ID plus DeepSeek 
   assert.equal(requests[1].headers.authorization, `Bearer ${key}`);
   assert.equal(requests[1].body.messages.at(-2).reasoning_content, 'fixture reasoning');
   assert.equal(requests[1].body.messages.at(-1).tool_call_id, 'call_1');
+  assert.deepEqual(trace.rejected, []);
+  const starts = trace.rows.filter((e) => e.event === 'model.started');
+  assert.equal(new Set(starts.map((e) => e.fields.spanId)).size, 2);
+  for (const start of starts) {
+    assert.equal(start.fields.protocol, 'chat');
+    assert.equal(start.fields.effort, 'high');
+    assert.equal(typeof start.fields.profileRef, 'string');
+    const events = trace.rows.filter((e) => e.fields.spanId === start.fields.spanId);
+    assert.deepEqual(
+      events.map((e) => e.event),
+      ['model.started', 'model.http', 'model.first_event', 'model.finished'],
+    );
+    assert.equal(events.at(-1)!.fields.outcome, 'ok');
+    assert.equal(events[1].fields.httpStatus, 200);
+    assert.equal(typeof events[2].fields.elapsedMs, 'number');
+  }
+  assert.doesNotMatch(JSON.stringify(trace.rows), /fixture reasoning|call_1|a\.md/);
 });
 
 test('Responses resubmits completed native output and function_call_output by call_id', async (t) => {
@@ -209,9 +228,19 @@ test('auth diagnostics never include provider response body and ordinary chat ca
     res.writeHead(401);
     res.end(`bad ${key}`);
   });
-  const result = await checkProvider(auth.profile, key, AbortSignal.timeout(3000));
+  const trace = collectDiagnostics();
+  const result = await checkProvider(auth.profile, key, AbortSignal.timeout(3000), trace.report);
   assert.equal('kind' in result && result.kind, 'auth');
   assert.ok(!JSON.stringify(result).includes(key));
+  assert.deepEqual(trace.rejected, []);
+  assert.deepEqual(
+    trace.rows.map((e) => e.event),
+    ['model.started', 'model.http', 'model.finished', 'probe.finished'],
+  );
+  assert.equal(trace.rows[2].fields.httpStatus, 401);
+  assert.equal(trace.rows[2].fields.reason, 'auth');
+  assert.equal(trace.rows[2].fields.lane, 'probe');
+  assert.ok(!JSON.stringify(trace.rows).includes(key));
   const chatOnly = await fixture(t, 'chat', (_body, res) =>
     sse(res, chat({ content: 'OK' }), chat({}, 'stop')),
   );
@@ -223,6 +252,7 @@ test('auth diagnostics never include provider response body and ordinary chat ca
 });
 
 test('missing terminal event, error events and explicit cancellation do not return a committable turn', async (t) => {
+  const trace = collectDiagnostics();
   for (const protocol of ['chat', 'responses', 'messages'] as const) {
     const { profile } = await fixture(t, protocol, (_body, res) =>
       sse(
@@ -231,7 +261,7 @@ test('missing terminal event, error events and explicit cancellation do not retu
       ),
     );
     await assert.rejects(
-      createProvider(profile, key).turn(ctx()),
+      createProvider(profile, key).turn({ ...ctx(), diagnostic: trace.report }),
       (error: Error) => !error.message.includes(key),
     );
   }
@@ -245,6 +275,7 @@ test('missing terminal event, error events and explicit cancellation do not retu
     createProvider(profile, key).turn({
       ...ctx(),
       signal: abort.signal,
+      diagnostic: trace.report,
       onText: (t) => {
         chunks.push(t);
         abort.abort();
@@ -253,4 +284,198 @@ test('missing terminal event, error events and explicit cancellation do not retu
     { name: 'AbortError' },
   );
   assert.deepEqual(chunks, ['partial']);
+  assert.deepEqual(trace.rejected, []);
+  assert.deepEqual(
+    trace.rows
+      .filter((e) => e.event === 'model.finished')
+      .map((e) => [e.fields.outcome, e.fields.reason, e.fields.httpStatus]),
+    [
+      ['failed', 'incomplete_stream', 200],
+      ['failed', 'provider_error', 200],
+      ['failed', 'provider_error', 200],
+      ['cancelled', 'cancelled', 200],
+    ],
+  );
+  assert.equal(trace.rows.filter((e) => e.event === 'model.first_event').length, 4);
+});
+
+test('transport loss and malformed SSE reach distinct terminal diagnoses', async (t) => {
+  const trace = collectDiagnostics();
+  let disconnect: (() => void) | undefined;
+  const dropped = await fixture(t, 'chat', (_body, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    disconnect = () => res.destroy();
+    res.write(
+      [
+        chat({
+          tool_calls: [
+            {
+              index: 0,
+              id: 'private-native-id',
+              function: { name: 'read_file', arguments: '{"path":"private-filename"}' },
+            },
+          ],
+        }),
+        chat({ content: 'partial transport' }),
+      ]
+        .map((e) => `data: ${JSON.stringify(e)}\n\n`)
+        .join(''),
+    );
+  });
+  await assert.rejects(
+    createProvider(dropped.profile, key).turn({
+      ...ctx(),
+      diagnostic: trace.report,
+      onText: () => disconnect?.(),
+    }),
+  );
+  const malformed = await fixture(t, 'chat', (_body, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`data: ${key}\n\n`);
+  });
+  await assert.rejects(
+    createProvider(malformed.profile, key).turn({ ...ctx(), diagnostic: trace.report }),
+  );
+  assert.deepEqual(trace.rejected, []);
+  assert.deepEqual(
+    trace.rows.filter((e) => e.event === 'model.finished').map((e) => e.fields.reason),
+    ['incomplete_stream', 'malformed_stream'],
+  );
+  assert.equal(trace.rows.filter((e) => e.event === 'model.first_event').length, 2);
+  assert.deepEqual(
+    trace.rows
+      .filter((e) => e.event.startsWith('tool.'))
+      .map((e) => [e.event, e.fields.tool, e.fields.reason]),
+    [
+      ['tool.requested', 'read_file', undefined],
+      ['tool.rejected', 'read_file', 'incomplete_stream'],
+    ],
+  );
+  assert.doesNotMatch(JSON.stringify(trace.rows), /private-native-id|private-filename/);
+  assert.ok(!JSON.stringify(trace.rows).includes(key));
+});
+
+test('Responses leaves a rejected candidate when a finished tool item is followed by an incomplete turn', async (t) => {
+  const trace = collectDiagnostics();
+  const { profile } = await fixture(t, 'responses', (_body, res) =>
+    sse(
+      res,
+      {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: {
+          type: 'function_call',
+          id: 'private-item-id',
+          call_id: 'private-call-id',
+          name: 'read_file',
+          arguments: '{"path":"private-argument-value"}',
+        },
+      },
+      { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call' } },
+      { type: 'response.incomplete', response: { status: 'incomplete' } },
+    ),
+  );
+  await assert.rejects(createProvider(profile, key).turn({ ...ctx(), diagnostic: trace.report }));
+  assert.deepEqual(trace.rejected, []);
+  const tools = trace.rows.filter((e) => e.event.startsWith('tool.'));
+  assert.deepEqual(
+    tools.map((e) => e.event),
+    ['tool.requested', 'tool.rejected'],
+  );
+  assert.equal(tools[0].fields.tool, 'read_file');
+  assert.equal(tools[0].fields.callId, tools[1].fields.callId);
+  assert.equal(tools[1].fields.reason, 'incomplete_stream');
+  assert.equal(tools[1].fields.spanId, trace.rows.at(-1)?.fields.spanId);
+  assert.equal(trace.rows.at(-1)?.fields.reason, 'incomplete_stream');
+  assert.doesNotMatch(
+    JSON.stringify(trace.rows),
+    /private-item-id|private-call-id|private-argument-value/,
+  );
+});
+
+test('Messages records other candidates as not executed when one block invalidates the batch', async (t) => {
+  const trace = collectDiagnostics();
+  const { profile } = await fixture(t, 'messages', (_body, res) =>
+    sse(
+      res,
+      {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'private-call-a', name: 'read_file', input: {} },
+      },
+      { type: 'content_block_stop', index: 0 },
+      {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'tool_use', id: 'private-call-b', name: 'list_files', input: {} },
+      },
+      {
+        type: 'content_block_delta',
+        index: 1,
+        delta: { type: 'input_json_delta', partial_json: '{"path":"private-malformed' },
+      },
+      { type: 'content_block_stop', index: 1 },
+      {
+        type: 'content_block_start',
+        index: 2,
+        content_block: { type: 'tool_use', id: 'private-call-c', name: 'read_file', input: {} },
+      },
+      { type: 'content_block_stop', index: 2 },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+      { type: 'message_stop' },
+    ),
+  );
+  const request = ctx();
+  request.tools.push({ name: 'list_files', description: 'Fixture', schema: { type: 'object' } });
+  await assert.rejects(createProvider(profile, key).turn({ ...request, diagnostic: trace.report }));
+  assert.deepEqual(trace.rejected, []);
+  const rows = trace.rows.filter((e) => e.event.startsWith('tool.'));
+  assert.equal(rows.length, 6);
+  const candidates = rows.filter((e) => e.event === 'tool.requested');
+  assert.equal(new Set(candidates.map((e) => e.fields.callId)).size, 3);
+  assert.deepEqual(
+    candidates.map((request) => {
+      const affected = rows.filter((row) => row.fields.callId === request.fields.callId);
+      assert.deepEqual(
+        affected.map((row) => row.event),
+        ['tool.requested', 'tool.rejected'],
+      );
+      return [affected[1].fields.tool, affected[1].fields.reason];
+    }),
+    [
+      ['read_file', 'batch_invalid'],
+      ['list_files', 'invalid_json'],
+      ['read_file', 'batch_invalid'],
+    ],
+  );
+  assert.equal(trace.rows.at(-1)?.fields.reason, 'malformed_stream');
+  assert.doesNotMatch(JSON.stringify(trace.rows), /private-call-|private-malformed/);
+});
+
+test('Messages distinguishes closed tool blocks from unfinished blocks on early EOF', async (t) => {
+  const trace = collectDiagnostics();
+  const { profile } = await fixture(t, 'messages', (_body, res) =>
+    sse(
+      res,
+      {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'closed', name: 'read_file', input: {} },
+      },
+      { type: 'content_block_stop', index: 0 },
+      {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'tool_use', id: 'open', name: 'read_file', input: {} },
+      },
+    ),
+  );
+  await assert.rejects(createProvider(profile, key).turn({ ...ctx(), diagnostic: trace.report }));
+  assert.deepEqual(trace.rejected, []);
+  const rows = trace.rows.filter((e) => e.event.startsWith('tool.'));
+  assert.deepEqual(
+    rows.map((e) => e.event),
+    ['tool.requested', 'tool.rejected'],
+  );
+  assert.equal(rows[1].fields.reason, 'incomplete_stream');
 });

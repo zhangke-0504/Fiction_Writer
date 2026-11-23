@@ -1,3 +1,4 @@
+import { collectDiagnostics } from './diagnostic-fixture.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
@@ -181,10 +182,34 @@ test('mid-batch failure preserves the old bytes of uncommitted files and reports
   );
   const before = (await service.readAll(id)).documents.filter((d) => d.type === 'chapter');
   inject = true;
+  const trace = collectDiagnostics();
   const report = await service.writeChanges(
     id,
     before.map((doc) => ({ ...doc, expect: doc.revision, body: 'new text' })),
+    undefined,
+    [],
+    trace.report,
   );
+  assert.deepEqual(trace.rejected, []);
+  assert.deepEqual(
+    trace.rows.map((e) => e.event),
+    [
+      'workspace.commit.started',
+      'workspace.preconditions',
+      'workspace.document.committed',
+      'workspace.document.pending',
+      'workspace.commit.finished',
+      'workspace.notified',
+    ],
+  );
+  const final = trace.rows.find((e) => e.event === 'workspace.commit.finished')!;
+  assert.equal(final.fields.outcome, 'partial');
+  assert.equal(final.fields.committed, 1);
+  assert.equal(final.fields.pending, 1);
+  assert.equal(trace.rows.at(-1)?.fields.changeId, final.fields.changeId);
+  assert.equal(trace.rows.at(-1)?.fields.journalSeq, events.length);
+  assert.notEqual(trace.rows[2].fields.documentRef, trace.rows[3].fields.documentRef);
+  assert.doesNotMatch(JSON.stringify(trace.rows), /sharing violation|new text/);
   assert.deepEqual(report.committed, [{ type: 'chapter', id: 'a' }]);
   assert.deepEqual(report.pending, [{ type: 'chapter', id: 'b' }]);
   assert.match(report.error ?? '', /sharing violation/);

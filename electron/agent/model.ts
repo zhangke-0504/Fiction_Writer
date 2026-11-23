@@ -1,4 +1,5 @@
 import type { Effort, ToolResult } from '../../shared/contracts.js';
+import type { ReportDiagnostic } from '../../shared/diagnostics.js';
 export interface ToolSpec {
   name: string;
   description: string;
@@ -24,6 +25,10 @@ export interface ModelRequest {
   maxTokens?: number;
   signal: AbortSignal;
   onText: (text: string) => void;
+  diagnostic?: ReportDiagnostic;
+  spanId?: string;
+  /** Once the request body has been handed to fetch, not a remote acknowledgement. */
+  onDispatch?: (spanId: string) => void;
 }
 export interface ModelProvider {
   effort: Effort | 'default';

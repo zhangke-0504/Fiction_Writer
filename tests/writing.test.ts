@@ -1,3 +1,4 @@
+import { collectDiagnostics } from './diagnostic-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -263,9 +264,11 @@ test('writing based on a reread passage rejects a later change to that source', 
     undefined,
   );
   const before = await workspace.readDocument(id, { type: 'chapter', id: 'two' });
+  const trace = collectDiagnostics();
   const provider = new ScriptedProvider([
     () => call('lookup', 'book_read_chapter', { chapterId: 'one', offset: 100, length: 100 }),
-    async () => {
+    async ({ onText }) => {
+      onText('不应提交这一稿。');
       const current = await workspace.readDocument(id, original);
       assert.equal(
         (await workspace.writeDocument(id, { ...current, body: '作者修订了前章。' })).error,
@@ -274,15 +277,83 @@ test('writing based on a reread passage rejects a later change to that source', 
       return text('不应提交这一稿。');
     },
   ]);
-  runs.start(session.id, '续写', (ctx) =>
-    draftChapter(workspace, ctx, provider, 'two', 'append', '核对前章', { skill: skills.chapter }).then(
-      () => {},
-    ),
+  runs.start(
+    session.id,
+    '续写',
+    (ctx) =>
+      draftChapter(workspace, ctx, provider, 'two', 'append', '核对前章', {
+        skill: skills.chapter,
+      }).then(() => {}),
+    'high',
+    trace.report,
   );
   await runs.wait(session.id);
   const run = runs.get(session.id).run;
   assert.equal(run?.status, 'failed');
   assert.match(run?.error ?? '', /chapter\/one 已变化/);
   assert.equal(run?.preview, undefined);
+  assert.deepEqual(trace.rejected, []);
+  const conflict = trace.rows.find((e) => e.event === 'workspace.conflict')!;
+  assert.equal(conflict.fields.step, 'guard');
+  assert.notEqual(conflict.fields.expectedRevision, conflict.fields.actualRevision);
+  assert.equal(
+    trace.rows.find((e) => e.event === 'chapter.generation.finished')?.fields.outcome,
+    'conflict',
+  );
+  assert.deepEqual(
+    trace.rows.filter((e) => e.event === 'chapter.preview').map((e) => e.fields.outcome),
+    ['started', 'cleared'],
+  );
   assert.equal((await workspace.readDocument(id, before)).revision, before.revision);
+});
+
+test('stopping a direct chapter draft clears its preview and records no commit', async (t) => {
+  const { workspace, id, runs, session, skills } = await fixture(t);
+  const before = await workspace.readDocument(id, { type: 'chapter', id: 'two' });
+  const trace = collectDiagnostics();
+  let entered!: () => void;
+  const previewed = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const provider = new ScriptedProvider([
+    async ({ signal, onText }) => {
+      onText('仅临时预览');
+      entered();
+      await new Promise<never>((_resolve, reject) =>
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+      );
+      throw new Error('unexpected');
+    },
+  ]);
+  runs.start(
+    session.id,
+    '续写',
+    async (ctx) => {
+      await draftChapter(workspace, ctx, provider, 'two', 'append', 'fixture', {
+        skill: skills.chapter,
+      });
+    },
+    'high',
+    trace.report,
+  );
+  await previewed;
+  await runs.stop(session.id, trace.report);
+  assert.equal(runs.get(session.id).run?.status, 'cancelled');
+  assert.equal(runs.get(session.id).run?.preview, undefined);
+  assert.equal((await workspace.readDocument(id, before)).revision, before.revision);
+  assert.deepEqual(trace.rejected, []);
+  assert.deepEqual(
+    trace.rows.filter((e) => e.event === 'chapter.preview').map((e) => e.fields.outcome),
+    ['started', 'cleared'],
+  );
+  assert.equal(
+    trace.rows.find((e) => e.event === 'chapter.generation.finished')?.fields.outcome,
+    'cancelled',
+  );
+  assert.ok(
+    !trace.rows.some(
+      (e) => e.event === 'workspace.document.committed' || e.event === 'loop.round.started',
+    ),
+  );
+  assert.doesNotMatch(JSON.stringify(trace.rows), /仅临时预览/);
 });

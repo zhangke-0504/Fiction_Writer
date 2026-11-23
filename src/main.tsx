@@ -17,6 +17,27 @@ function App() {
     [profiles, setProfiles] = useState<ModelProfile[]>([]);
   const { view, refresh, error } = useRuntime();
   const drafts = useRef<Drafts>(new Map());
+  useEffect(() => {
+    api.diagnostic('ui.ready', {});
+    const error = () => api.diagnostic('ui.error', { reason: 'exception' });
+    const rejection = () => api.diagnostic('ui.error', { reason: 'unhandled_rejection' });
+    window.addEventListener('error', error);
+    window.addEventListener('unhandledrejection', rejection);
+    return () => {
+      window.removeEventListener('error', error);
+      window.removeEventListener('unhandledrejection', rejection);
+    };
+  }, []);
+  useEffect(() => {
+    api.diagnostic('ui.section', {
+      section: settings ? 'settings' : bookId ? 'book' : 'library',
+      workspaceRef: settings ? undefined : bookId,
+    });
+  }, [settings, bookId]);
+  useEffect(() => {
+    if (open)
+      api.diagnostic('ui.section', { section: 'harness', workspaceRef: settings ? undefined : bookId });
+  }, [open, settings, bookId]);
   const preview = view.sessions.find((s) => s.run?.preview?.bookId === bookId)?.run?.preview;
   const loadProfiles = () => {
     void api.request<ModelProfile[]>('profiles.list').then(setProfiles, () => {});
@@ -104,4 +125,8 @@ function App() {
     </div>
   );
 }
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById('root')!, {
+  onCaughtError: () => api.diagnostic('ui.error', { reason: 'react_error' }),
+  onUncaughtError: () => api.diagnostic('ui.error', { reason: 'react_error' }),
+  onRecoverableError: () => api.diagnostic('ui.error', { reason: 'react_error' }),
+}).render(<App />);

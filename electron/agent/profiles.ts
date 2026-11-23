@@ -1,3 +1,4 @@
+import { DiagnosticFailure } from '../diagnostics/trace.js';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -29,7 +30,7 @@ export class ProfileStore {
   private path: string;
   constructor(
     private folder: string,
-    private decrypt: (cipher: string) => Promise<string>,
+    private decrypt: (cipher: string, requestId?: string) => Promise<string>,
   ) {
     this.path = join(folder, 'profiles.json');
   }
@@ -59,11 +60,11 @@ export class ProfileStore {
   list() {
     return this.stored.map(({ cipher: _, ...profile }) => ({ ...profile }));
   }
-  async resolve(id: string) {
+  async resolve(id: string, requestId?: string) {
     const record = this.stored.find((profile) => profile.id === id);
-    if (!record) throw new Error('请先选择一个已保存的模型配置');
+    if (!record) throw new DiagnosticFailure('profile_missing', '请先选择一个已保存的模型配置');
     const { cipher, ...profile } = record;
-    return { profile, key: await this.decrypt(cipher) };
+    return { profile, key: await this.decrypt(cipher, requestId) };
   }
   save(input: Settings): Promise<ModelProfile> {
     const next = this.chain.then(async () => {

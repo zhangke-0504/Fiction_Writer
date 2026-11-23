@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
 import type { RpcRequest } from '../shared/rpc.js';
 import type { Change, DocRef, Manuscript, StartRun } from '../shared/contracts.js';
@@ -11,9 +12,22 @@ import { createProvider, checkProvider } from './agent/provider.js';
 import { FileTools } from './agent/files.js';
 import { runAgent } from './agent/loop.js';
 import type { Turn } from './agent/model.js';
-import { loadSkills } from './agent/skills.js';
+import { applySkill, loadSkills } from './agent/skills.js';
 import { NovelTools } from './agent/novel-tools.js';
 import { WorkflowStore } from './agent/workflow.js';
+import {
+  diagnosticScope,
+  isDiagnosticMethod,
+  type DiagnosticFields,
+  type ReportDiagnostic,
+} from '../shared/diagnostics.js';
+import {
+  classified,
+  DiagnosticFailure,
+  elapsed,
+  responseDiagnostic,
+  safeReporter,
+} from './diagnostics/trace.js';
 const port = process.parentPort;
 if (!port) throw new Error('Missing Electron parent port');
 const [libraryRoot, stateRoot, mode, skillsPath] = process.argv.slice(2);
@@ -22,15 +36,21 @@ const test = mode === 'test';
 function post(message: unknown) {
   port!.postMessage(message);
 }
+const diagnostic: ReportDiagnostic = safeReporter((event, fields) =>
+  post({ diagnostic: { event, fields } }),
+);
 const journal = new Journal((event) => post({ event }));
 const workspace = new WorkspaceService({
   libraryRoot,
-  onChange: (bookId, documents) => journal.emit({ type: 'book-change', bookId, documents }),
+  onChange: (bookId, documents, changeId) =>
+    journal.emit({ type: 'book-change', bookId, documents, changeId }),
 });
-const workflows = new WorkflowStore(stateRoot, (bookId) =>
-  journal.emit({ type: 'runtime-change', bookId }),
+const workflows = new WorkflowStore(
+  stateRoot,
+  (bookId) => journal.emit({ type: 'runtime-change', bookId }),
+  diagnostic,
 );
-const runs = new RunManager(stateRoot, journal, (bookId) => workflows.progress(bookId));
+const runs = new RunManager(stateRoot, journal, (bookId) => workflows.progress(bookId), diagnostic);
 let secretTicket = 0;
 const pendingSecrets = new Map<
   number,
@@ -40,23 +60,30 @@ const pendingSecrets = new Map<
     timer: ReturnType<typeof setTimeout>;
   }
 >();
-function decrypt(cipher: string) {
+function decrypt(cipher: string, requestId?: string) {
   const ticket = ++secretTicket;
   return new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingSecrets.delete(ticket);
-      reject(new Error('无法读取系统凭据'));
+      reject(new DiagnosticFailure('credential_unavailable', '无法读取系统凭据'));
     }, 6000);
     pendingSecrets.set(ticket, { resolve, reject, timer });
-    post({ secretTicket: ticket, cipher });
+    post({ secretTicket: ticket, cipher, requestId });
   });
 }
 const profiles = new ProfileStore(stateRoot, decrypt);
-const files = new FileTools(workspace, stateRoot, () => journal.emit({ type: 'book-change' }));
+function invalidate(reason: 'watcher' | 'command', bookId?: string, report = diagnostic) {
+  const changeId = randomUUID();
+  const journalSeq = journal.emit({ type: 'book-change', bookId, changeId });
+  report('workspace.notified', { journalSeq, changeId, workspaceRef: bookId, reason });
+}
+const files = new FileTools(workspace, stateRoot, (report) => invalidate('command', undefined, report));
 let closeWatcher: (() => void) | undefined;
 const ready = Promise.all([workspace.init(), runs.init(), workflows.init()]).then(() => {
-  closeWatcher = workspace.watchExternal((bookId) => journal.emit({ type: 'book-change', bookId }));
+  closeWatcher = workspace.watchExternal((bookId) => invalidate('watcher', bookId));
+  diagnostic('worker.ready', { pid: process.pid });
 });
+void ready.catch(() => diagnostic('worker.initialization_failed', { reason: 'initialization_failed' }));
 const profileInit = profiles.init().then(
   () => undefined,
   (error) => error as Error,
@@ -66,29 +93,39 @@ async function ensureProfiles() {
   if (error) throw error;
 }
 
-async function startSession(args: StartRun) {
+async function startSession(args: StartRun, report: ReportDiagnostic, requestId?: string) {
   const { id, profileId, action = 'chat', chapterId, attachments, effort = 'high' } = args;
   const view = runs.get(id);
   await ensureProfiles();
-  if (!profileId) throw new Error('请选择已保存的模型配置');
+  if (!profileId) throw new DiagnosticFailure('profile_missing', '请选择已保存的模型配置');
   if (
     !['low', 'medium', 'high'].includes(effort) ||
     !['chat', 'draft', 'append', 'replace', 'novel'].includes(action)
   )
-    throw new Error('运行选项无效');
+    throw new DiagnosticFailure('invalid_options', '运行选项无效');
   if (view.session.missing || !(await stat(view.session.cwd).catch(() => undefined))?.isDirectory())
-    throw new Error('工作区已不存在');
+    throw new DiagnosticFailure('unavailable', '工作区已不存在');
   if (view.session.bookId)
     await workspace.readDocument(view.session.bookId, { type: 'book', id: view.session.bookId });
   const prompt = args.prompt?.trim() ?? '';
   if ((action === 'chat' && !prompt) || prompt.length > 24_000)
-    throw new Error('请输入任务，且不超过 24,000 字符');
+    throw new DiagnosticFailure('input_validation', '请输入任务，且不超过 24,000 字符');
   const [{ profile, key }, references] = await Promise.all([
-    profiles.resolve(profileId),
-    files.attachments(attachments),
+    profiles.resolve(profileId, requestId),
+    files.attachments(attachments).catch((error) => {
+      throw new DiagnosticFailure(
+        'attachment_invalid',
+        error instanceof Error ? error.message : '无法读取附件',
+      );
+    }),
   ]);
   const provider = createProvider(profile, key, effort);
-  const skills = view.session.bookId ? await loadSkills(skillsPath) : undefined;
+  const skills = view.session.bookId
+    ? await loadSkills(
+        skillsPath,
+        diagnosticScope(report, { workspaceRef: view.session.bookId, sessionRef: view.session.id }),
+      )
+    : undefined;
   const referenceContext = references.length
     ? `用户附加的参考文件（文本数据）：\n${JSON.stringify(references)}`
     : '';
@@ -110,9 +147,10 @@ async function startSession(args: StartRun) {
     { chat: '对话', draft: '生成本章', append: '续写本章', replace: '重写本章', novel: '生成全书' }[
       action
     ];
-  if (action === 'novel' && !view.session.bookId) throw new Error('整书生成需要绑定一部小说');
+  if (action === 'novel' && !view.session.bookId)
+    throw new DiagnosticFailure('invalid_options', '整书生成需要绑定一部小说');
   if (action !== 'chat' && action !== 'novel' && (!chapterId || !view.session.bookId))
-    throw new Error('请在此会话绑定的小说中选择章节');
+    throw new DiagnosticFailure('invalid_options', '请在此会话绑定的小说中选择章节');
   return runs.start(
     id,
     label,
@@ -148,24 +186,45 @@ async function startSession(args: StartRun) {
           ...new NovelTools(workspace, ctx.session.bookId, provider, skills).tools(),
         ];
       }
-      await runAgent(ctx, provider, system, previous, request, tools);
+      await runAgent(
+        ctx,
+        provider,
+        system,
+        previous,
+        request,
+        tools,
+        undefined,
+        skills && ((report) => applySkill(report, 'story-consistency', skills.consistency, 'agent')),
+      );
     },
     provider.effort,
+    report,
+    action,
   );
 }
 const gates = new Map<string, Gate>();
-async function createSession(bookId?: string, cwd?: string) {
+async function createSession(bookId?: string, cwd?: string, report = diagnostic) {
   if (bookId) {
     const book = await workspace.readDocument(bookId, { type: 'book', id: bookId });
     return runs.create(
       { cwd: await realpath(workspace.bookRoot(bookId)), bookId },
       book.fields.title ?? '小说',
+      report,
     );
   }
   if (!cwd || !(await stat(cwd)).isDirectory()) throw new Error('请选择工作目录');
-  return runs.create({ cwd: await realpath(cwd) }, cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? cwd);
+  return runs.create(
+    { cwd: await realpath(cwd) },
+    cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? cwd,
+    report,
+  );
 }
-async function handle(method: string, args: any): Promise<unknown> {
+async function handle(
+  method: string,
+  args: any,
+  report: ReportDiagnostic,
+  requestId?: string,
+): Promise<unknown> {
   await ready;
   switch (method) {
     case 'ping':
@@ -173,20 +232,22 @@ async function handle(method: string, args: any): Promise<unknown> {
     case 'library.list':
       return workspace.listBooks();
     case 'book.create':
-      return workspace.createBook(args);
+      return workspace.createBook(args, report);
     case 'book.read':
       return workspace.readBook(args.bookId);
     case 'book.doc.read':
       return workspace.readDocument(args.bookId, args.doc as DocRef);
     case 'book.doc.write':
-      return workspace.writeDocument(args.bookId, args.doc as Manuscript);
+      return workspace.writeDocument(args.bookId, args.doc as Manuscript, undefined, report);
     case 'book.changes.write':
-      return workspace.writeChanges(args.bookId, args.changes as Change[]);
+      return workspace.writeChanges(args.bookId, args.changes as Change[], undefined, [], report);
     case 'book.doc.delete':
-      return workspace.deleteDocument(args.bookId, args.doc as DocRef);
+      return workspace.deleteDocument(args.bookId, args.doc as DocRef, undefined, report);
     case 'book.delete': {
-      await runs.removeTarget(await realpath(workspace.bookRoot(args.bookId)), () =>
-        workspace.deleteBook(args.bookId),
+      await runs.removeTarget(
+        await realpath(workspace.bookRoot(args.bookId)),
+        () => workspace.deleteBook(args.bookId, report),
+        report,
       );
       await workflows.remove(args.bookId);
       return;
@@ -196,9 +257,18 @@ async function handle(method: string, args: any): Promise<unknown> {
     case 'runtime.after':
       return journal.after(args.cursor);
     case 'session.create':
-      return createSession(args?.bookId, args?.cwd);
+      return createSession(args?.bookId, args?.cwd, report);
     case 'session.start':
-      return startSession(args);
+      try {
+        return await startSession(args, report, requestId);
+      } catch (error) {
+        const action = args?.action ?? 'chat';
+        report('run.rejected', {
+          action: ['chat', 'draft', 'append', 'replace', 'novel'].includes(action) ? action : undefined,
+          reason: classified(error),
+        });
+        throw error;
+      }
     case 'profiles.list':
       await ensureProfiles();
       return profiles.list();
@@ -210,16 +280,20 @@ async function handle(method: string, args: any): Promise<unknown> {
     }
     case 'profiles.check': {
       await ensureProfiles();
-      const { profile, key } = await profiles.resolve(args.id);
-      return checkProvider(profile, key, AbortSignal.timeout(58_000));
+      const { profile, key } = await profiles.resolve(args.id, requestId);
+      return checkProvider(profile, key, AbortSignal.timeout(58_000), report);
     }
     case 'session.stop':
-      return runs.stop(args.id);
+      return runs.stop(args.id, report);
     case 'session.delete':
-      return runs.remove(args.id);
+      return runs.remove(args.id, report);
     case 'shutdown':
       closeWatcher?.();
       return runs.stopAll();
+    case 'test.crash': {
+      if (!test) throw new Error('仅在 E2E 模式可用');
+      process.exit(23);
+    }
     case 'test.start': {
       if (!test) throw new Error('仅在 E2E 模式可用');
       const { bookId, chapterId, addSubject = true } = args;
@@ -246,6 +320,8 @@ async function handle(method: string, args: any): Promise<unknown> {
                   },
                 ],
                 ctx.signal,
+                [],
+                ctx.diagnostic,
               );
               if (report.error) throw new Error(report.error);
             }
@@ -287,13 +363,36 @@ port.on(
       clearTimeout(pending.timer);
       pendingSecrets.delete(data.secretTicket);
       if (data.key) pending.resolve(data.key);
-      else pending.reject(new Error(data.error || '无法解密 API Key'));
+      else
+        pending.reject(
+          new DiagnosticFailure('credential_unavailable', data.error || '无法解密 API Key'),
+        );
       return;
     }
+    const tracked = isDiagnosticMethod(data.method),
+      started = performance.now();
+    const report = diagnosticScope(diagnostic, { requestId: data.requestId });
+    if (tracked) report('ipc.worker.started', { method: data.method });
+    let outcome = 'ok',
+      reason: string | undefined;
+    let responseFields: DiagnosticFields = {};
     try {
-      post({ id: data.id, result: await handle(data.method, data.args) });
-    } catch (err) {
-      post({ id: data.id, error: err instanceof Error ? err.message : String(err) });
+      const result = await handle(data.method, data.args, report, data.requestId);
+      if (tracked) responseFields = responseDiagnostic(data.method, result);
+      post({ id: data.id, result });
+    } catch (error) {
+      outcome = 'failed';
+      reason = classified(error);
+      post({ id: data.id, error: error instanceof Error ? error.message : '后台请求失败', reason });
+    } finally {
+      if (tracked)
+        report('ipc.worker.finished', {
+          method: data.method,
+          outcome,
+          reason,
+          ...responseFields,
+          elapsedMs: elapsed(started),
+        });
     }
   },
 );

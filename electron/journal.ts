@@ -15,6 +15,7 @@ export class Journal {
     this.#buffer.push(item);
     if (this.#buffer.length > this.retained) this.#buffer.shift();
     this.notify(item);
+    return item.seq;
   }
   after(cursor: number): Event[] | null {
     if (cursor > this.cursor || cursor < (this.#buffer[0]?.seq ?? 1) - 1) return null;

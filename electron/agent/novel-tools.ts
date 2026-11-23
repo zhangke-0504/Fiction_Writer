@@ -1,3 +1,4 @@
+import { DiagnosticFailure } from '../diagnostics/trace.js';
 import type { Change, DocRef, Fields, Manuscript } from '../../shared/contracts.js';
 import type { WorkspaceService, Guard } from '../workspace.js';
 import { docKey, isId } from '../documents.js';
@@ -145,8 +146,14 @@ export class NovelTools {
         body: m.type === 'chapter' ? (old?.body ?? '') : (m.body ?? old?.body ?? ''),
       };
     });
-    const report = await this.workspace.writeChanges(this.bookId, changes, ctx.signal, guards);
-    if (report.error) throw new Error(JSON.stringify(report));
+    const report = await this.workspace.writeChanges(
+      this.bookId,
+      changes,
+      ctx.signal,
+      guards,
+      ctx.diagnostic,
+    );
+    if (report.error) throw new DiagnosticFailure(report.reason ?? 'unknown', JSON.stringify(report));
     // A later independent batch needs a fresh view of the changed files.
     for (const doc of report.committed) this.readSet.delete(docKey(doc));
     return report;

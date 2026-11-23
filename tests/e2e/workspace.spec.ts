@@ -1,6 +1,7 @@
 import { test, expect, _electron as electron, type Page } from '@playwright/test';
 import { access, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { readDiagnostics } from './diagnostic-files';
 import type {
   BookView,
   LibraryView,
@@ -199,6 +200,16 @@ test('basic information keeps an unsaved form when a new file revision arrives',
     await save.click();
     await expect.poll(async () => (await read()).body).toBe('确认后的简介');
     await expect(page.getByText(/磁盘上的文档已变化/)).toHaveCount(0);
+    await expect
+      .poll(async () =>
+        (await readDiagnostics(info.outputPath('app'), 'frontend')).some(
+          (e) =>
+            e.event === 'ui.draft_preserved' &&
+            e.fields.reason === 'conflict' &&
+            e.fields.revision !== e.fields.expectedRevision,
+        ),
+      )
+      .toBe(true);
     expect((await read()).fields.style).toBe('后台修改的文风');
   } finally {
     await app.close();
@@ -237,6 +248,62 @@ test('a missed book-change event is recovered from the next runtime sequence gap
       )
       .toBe(chapterId);
     await expect(button(page, '潮汐钥匙')).toBeVisible();
+    await button(page, '潮汐钥匙').click();
+    const root = info.outputPath('app');
+    await expect
+      .poll(async () => {
+        const back = await readDiagnostics(root, 'backend'),
+          front = await readDiagnostics(root, 'frontend');
+        const committed = back.find(
+          (e) =>
+            e.event === 'workspace.document.committed' &&
+            e.fields.runId &&
+            e.fields.docType === 'subject',
+        );
+        if (!committed) return 'commit not yet observed';
+        const { changeId, documentRef, revision, workerId, workspaceRef } = committed.fields;
+        const published = back.find(
+          (e) => e.event === 'workspace.notified' && e.fields.changeId === changeId,
+        );
+        if (!published) return 'publication not yet observed';
+        const seq = published.fields.journalSeq;
+        if (front.some((e) => e.event === 'ui.book_change_received' && e.fields.changeId === changeId))
+          return 'notification was received';
+        const gap = front.find(
+          (e) =>
+            e.event === 'ui.sequence_gap' &&
+            e.fields.workerId === workerId &&
+            e.fields.expectedSeq <= seq &&
+            (e.fields.via === 'snapshot' ? seq <= e.fields.journalSeq : seq < e.fields.journalSeq),
+        );
+        if (!gap) return 'gap not yet observed';
+        const reload = front.find(
+          (e) =>
+            e.event === 'ui.reload.finished' &&
+            e.fields.area === 'workspace' &&
+            e.fields.outcome === 'ok' &&
+            e.fields.workspaceRef === workspaceRef &&
+            e.fields.workerId === workerId &&
+            e.fields.journalSeq >= gap.fields.journalSeq,
+        );
+        if (!reload) return 'workspace reread not yet observed';
+        const applied = front.find(
+          (e) =>
+            e.event === 'ui.revision_applied' &&
+            e.fields.documentRef === documentRef &&
+            e.fields.revision === revision,
+        );
+        if (!applied) return 'visible revision not yet observed';
+        const reread = front.find(
+          (e) =>
+            e.event === 'ui.reload.finished' &&
+            e.fields.reloadId === applied.fields.reloadId &&
+            e.fields.revision === revision &&
+            e.fields.outcome === 'ok',
+        );
+        return reread ? 'commit → publish → gap → reread → apply' : 'document reread not yet observed';
+      })
+      .toBe('commit → publish → gap → reread → apply');
   } finally {
     await app.close();
   }

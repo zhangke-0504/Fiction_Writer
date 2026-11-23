@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { api } from './bridge';
-import { ErrorText, Icon, errorMessage, norm } from './ui';
+import { ErrorText, Icon, errorDetails, norm } from './ui';
 import type { ActiveChapter } from './Workspace';
 import type { Effort, ModelProfile, RuntimeView, Session, StartRun } from '../shared/contracts';
 const statuses = {
@@ -12,6 +12,28 @@ const statuses = {
 };
 const roles = { user: '你', assistant: 'Agent', tool: '工具', status: '状态' };
 const basename = (path: string) => path.split(/[\\/]/).at(-1) || path;
+function DiagnosticId({ id }: { id?: string }) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => setCopied(false), [id]);
+  if (!id) return null;
+  return (
+    <p className="muted diagnostic-id">
+      <code aria-label="诊断编号">{id}</code>
+      <button
+        type="button"
+        className="text-button"
+        onClick={() => {
+          void navigator.clipboard.writeText(id).then(
+            () => setCopied(true),
+            () => setCopied(false),
+          );
+        }}
+      >
+        {copied ? '已复制' : '复制诊断编号'}
+      </button>
+    </p>
+  );
+}
 export function Harness({
   open,
   close,
@@ -39,6 +61,7 @@ export function Harness({
     [effort, setEffort] = useState<Effort>('high');
   const [attachments, setAttachments] = useState<string[]>([]),
     [error, setError] = useState(''),
+    [failureId, setFailureId] = useState<string>(),
     [busy, setBusy] = useState(false);
   const [action, setAction] = useState<StartRun['action']>('chat');
   const feed = useRef<HTMLDivElement>(null),
@@ -58,10 +81,13 @@ export function Harness({
   async function perform(work: () => Promise<void>) {
     setBusy(true);
     setError('');
+    setFailureId(undefined);
     try {
       await work();
     } catch (e) {
-      setError(errorMessage(e));
+      const failure = errorDetails(e);
+      setError(failure.message);
+      setFailureId(failure.requestId);
     } finally {
       setBusy(false);
     }
@@ -70,6 +96,7 @@ export function Harness({
     select(id);
     setList(false);
     setError('');
+    setFailureId(undefined);
     setAction('chat');
     setAttachments([]);
     sticky.current = true;
@@ -206,6 +233,7 @@ export function Harness({
             </div>
           )}
           <ErrorText text={error || backendError} />
+          <DiagnosticId id={failureId} />
         </section>
       ) : (
         <>
@@ -279,6 +307,14 @@ export function Harness({
           </div>
           <form className="composer" onSubmit={(e) => void send(e)}>
             <ErrorText text={error || backendError} />
+            <DiagnosticId
+              id={
+                failureId ??
+                (current.run?.status === 'failed' || current.run?.status === 'interrupted'
+                  ? current.run.id
+                  : undefined)
+              }
+            />
             {!profile && (
               <p className="composer-note">
                 尚未配置模型。

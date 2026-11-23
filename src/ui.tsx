@@ -1,3 +1,4 @@
+import { diagnosticFailure } from '../shared/diagnostics';
 import { useEffect, useId, useRef, type ReactNode } from 'react';
 export const labels = {
   book: '基本信息',
@@ -99,10 +100,15 @@ export function ErrorText({ text }: { text?: string }) {
     </p>
   ) : null;
 }
-export function errorMessage(error: unknown) {
-  return (error instanceof Error ? error.message : String(error)).replace(
-    /^Error invoking remote method '[^']+': Error: /,
-    '',
+export function errorDetails(error: unknown) {
+  return diagnosticFailure(
+    (error instanceof Error ? error.message : String(error)).replace(
+      /^Error invoking remote method '[^']+': Error: /,
+      '',
+    ),
   );
+}
+export function errorMessage(error: unknown) {
+  return errorDetails(error).message;
 }
 export const norm = (text: string) => text.normalize('NFKC').trim().toLocaleLowerCase();
