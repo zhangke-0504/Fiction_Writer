@@ -16,6 +16,12 @@ export class ProviderError extends Error {
     super(message);
   }
 }
+/** The provider never exposes this batch to a tool executor. Only the outer loop can retry it. */
+export class MalformedMessagesArguments extends ProviderError {
+  constructor() {
+    super('Messages 工具参数不是完整 JSON', 'protocol', 'malformed_stream');
+  }
+}
 const error = (message: string, detail?: ProviderError['detail']) =>
   new ProviderError(message, 'protocol', detail);
 function reply(text: string, calls: ToolCall[], native?: unknown): AssistantTurn {
@@ -318,7 +324,7 @@ async function parseMessages(
   report: ReportDiagnostic,
 ) {
   const blocks = new Map<number, any>();
-  const json = new Map<number, string>();
+  const json = new Map<number, { text: string; fragments: number }>();
   let finish = '',
     closed = false;
   const completedToolBlocks = new Set<number>();
@@ -337,8 +343,12 @@ async function parseMessages(
           block.text = (block.text ?? '') + datum.text;
           textOut(datum.text);
         }
-        if (datum.type === 'input_json_delta' && typeof datum.partial_json === 'string')
-          json.set(value.index, (json.get(value.index) ?? '') + datum.partial_json);
+        if (datum.type === 'input_json_delta' && typeof datum.partial_json === 'string') {
+          const input = json.get(value.index) ?? { text: '', fragments: 0 };
+          input.text += datum.partial_json;
+          input.fragments++;
+          json.set(value.index, input);
+        }
         if (datum.type === 'thinking_delta')
           block.thinking = (block.thinking ?? '') + (datum.thinking ?? '');
         if (datum.type === 'signature_delta')
@@ -365,20 +375,43 @@ async function parseMessages(
   const ordered = [...blocks].sort(([a], [b]) => a - b);
   const calls: ToolCall[] = [];
   const invalid = new Map<number, string>();
+  const invalidBlocks: { index: number; fragmentCount: number; bytes: number }[] = [];
   for (const [index, block] of ordered)
     if (block.type === 'tool_use') {
-      const args = json.get(index) ?? JSON.stringify(block.input ?? {});
+      const fragments = json.get(index);
+      const args = fragments?.text ?? JSON.stringify(block.input ?? {});
       try {
         block.input = JSON.parse(args);
       } catch {
         invalid.set(calls.length, 'invalid_json');
+        if (invalidBlocks.length < 16)
+          invalidBlocks.push({
+            index,
+            fragmentCount: fragments?.fragments ?? 0,
+            bytes: Buffer.byteLength(args),
+          });
       }
       calls.push({ id: block.id, name: block.name, args });
     }
   if (invalid.size) {
     // A malformed block rejects the entire turn, including its otherwise parseable candidates.
     rejectCalls(calls, request, report, 'batch_invalid', invalid);
-    throw error('Messages 工具参数不是完整 JSON', 'malformed_stream');
+    report('model.messages_arguments_invalid', {
+      messageClosed: closed,
+      stopType: finish,
+      reason: 'invalid_json',
+      count: calls.length,
+      invalidCount: invalid.size,
+      omitted: invalid.size - invalidBlocks.length,
+    });
+    for (const { index, fragmentCount, bytes } of invalidBlocks)
+      report('model.messages_argument_block', {
+        blockIndex: index,
+        fragmentCount,
+        bytes,
+        reason: 'invalid_json',
+      });
+    throw new MalformedMessagesArguments();
   }
   assertCalls(calls, request, report);
   const native = ordered
@@ -455,8 +488,8 @@ export function createProvider(
           stream: true,
           ...configuration.fields,
           ...(extendedOutputTokens &&
-            request.directProse &&
-            !request.tools.length && {
+            ((request.directProse && !request.tools.length) ||
+              (request.directToolResult && request.tools.length === 1)) && {
               thinking: { type: 'disabled' },
             }),
           ...(request.tools.length ? { tools: toolDefinitions(request.tools, profile.protocol) } : {}),

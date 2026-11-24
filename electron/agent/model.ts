@@ -25,6 +25,8 @@ export interface ModelRequest {
   maxTokens?: number;
   /** A prose-only subrequest may use the endpoint's documented direct generation option. */
   directProse?: boolean;
+  /** A bounded task projecting saved text into a single result tool. */
+  directToolResult?: boolean;
   signal: AbortSignal;
   onText: (text: string) => void;
   diagnostic?: ReportDiagnostic;

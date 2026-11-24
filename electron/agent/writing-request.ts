@@ -7,7 +7,12 @@ import type { ModelProvider, ModelRequest, ToolSpec, Turn } from './model.js';
 export type AssetKind = 'subject' | 'clue';
 export type ChapterAction = 'draft' | 'append' | 'replace' | 'insert';
 export type AssetAction = 'create' | 'fill' | 'update';
-export type WritingIntent = { author?: string; continued?: readonly string[]; arrangement?: string };
+export type WritingIntent = {
+  author?: string;
+  continued?: readonly string[];
+  confirmed?: string;
+  arrangement?: string;
+};
 export type WritingTarget = DocRef & { revision: string; range?: [number, number] };
 export type WritingGroup =
   | 'target'
@@ -79,10 +84,11 @@ export const assetResultTool = {
   },
 } satisfies ToolSpec;
 
-export function writingDirection({ author, continued, arrangement }: WritingIntent) {
+export function writingDirection({ author, continued, confirmed, arrangement }: WritingIntent) {
   return [
     ...(continued ?? []).map((text) => `先前作者要求：${text}`),
     author && `本轮作者要求（明确的新要求优先）：${author}`,
+    confirmed && `作者已确认的本次局部安排：${confirmed}`,
     arrangement && `本次创作安排（提议，不是授权或既有事实）：${arrangement}`,
   ]
     .filter(Boolean)

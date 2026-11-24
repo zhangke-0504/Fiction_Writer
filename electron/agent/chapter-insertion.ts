@@ -1,5 +1,6 @@
 import { parser } from '@lezer/markdown';
 import type { Manuscript } from '../../shared/contracts.js';
+import { digest } from '../documents.js';
 import { WritingContextFailure } from './writing-request.js';
 
 export type ChapterInsertion = {
@@ -7,9 +8,10 @@ export type ChapterInsertion = {
   quote: string;
   place: 'before' | 'after';
   outline?: { revision: string; addition: string };
+  targetId?: string;
 };
 
-export function insertionPoint(doc: Manuscript, insertion?: ChapterInsertion) {
+export function insertionAnchor(doc: Manuscript, insertion?: ChapterInsertion) {
   const ref = { type: 'chapter' as const, id: doc.id };
   const invalid = (message: string) =>
     new WritingContextFailure(
@@ -38,6 +40,7 @@ export function insertionPoint(doc: Manuscript, insertion?: ChapterInsertion) {
     throw invalid('插入原文找不到或不唯一，请提供该章内唯一的段落引用。');
   const to = from + insertion.quote.length;
   let boundary: number | undefined;
+  let paragraph = '';
   parser.parse(doc.body).iterate({
     enter(node) {
       if (
@@ -45,14 +48,22 @@ export function insertionPoint(doc: Manuscript, insertion?: ChapterInsertion) {
         node.node.parent?.name === 'Document' &&
         from >= node.from &&
         to <= node.to
-      )
+      ) {
         boundary = insertion.place === 'before' ? node.from : node.to;
+        paragraph = doc.body.slice(node.from, node.to).trimEnd();
+      }
     },
   });
   if (boundary === undefined)
     throw invalid('插入原文须位于一个正文段落内，不跨越标题、代码块或多个段落。');
   // Lezer can leave the CR of a CRLF separator inside the paragraph range. Do not split the pair.
-  return doc.body[boundary - 1] === '\r' && doc.body[boundary] === '\n' ? boundary - 1 : boundary;
+  const offset =
+    doc.body[boundary - 1] === '\r' && doc.body[boundary] === '\n' ? boundary - 1 : boundary;
+  return { offset, key: digest(JSON.stringify([doc.id, insertion.place, paragraph])) };
+}
+
+export function insertionPoint(doc: Manuscript, insertion?: ChapterInsertion) {
+  return insertionAnchor(doc, insertion).offset;
 }
 
 /** Preserve both surrounding byte slices; add only the separators this insert needs. */

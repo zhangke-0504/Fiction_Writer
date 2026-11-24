@@ -1,7 +1,7 @@
 import type { Manuscript } from '../../shared/contracts.js';
 
 const digits = '零一二三四五六七八九';
-function chapterOrder(target: string) {
+export function chapterOrder(target: string) {
   const found = target.match(/^第\s*([\d零一二三四五六七八九十两]+)\s*章$/u)?.[1];
   if (!found) return Number(/^chapter\s+(\d+)$/i.exec(target)?.[1]);
   if (/^\d+$/.test(found)) return Number(found);
@@ -76,15 +76,36 @@ export function wantsPassageAddition(prompt: string) {
   )
     return false;
   if (
-    /(?:只|仅)(?:需|要)?(?:做|改|补|写|生成|整理)?\s*(?:资料|大纲|设定|说明)|(?:不要|别|禁止|无需|不许|不得|不必|不)[^。；;，,\n]{0,16}(?:改(?:动|写)?(?:任何|任何一)?(?:章节|正文)|改任何一章|动(?:任何)?(?:章节|正文)|写(?:入)?正文|插入正文|登场)/u.test(
+    /(?:只|仅)(?:需|要)?(?:做|改|补|写|生成|整理)?\s*(?:资料|大纲|设定|说明)|(?:不要|别|禁止|无需|不许|不得|不必|不)[^。；;，,\n]{0,16}(?:改(?:动|写)?(?:任何|任何一)?(?:章节|正文)|改任何一章|动(?:任何)?(?:章节|正文)|写(?:入)?正文|插入正文|登场|出场|露面|现身)/u.test(
       text,
     )
   )
     return false;
   return (
     /新增|增加|加入|加上|加一个|添加|插入|补写|补一段|增补/u.test(text) &&
-    /登场|出场|插入|正文|场景|(?:第[^，。\n]{1,7}章|本章|当前章)[^，。\n]{0,12}(?:加入|一段)/u.test(text)
+    /登场|出场|露面|现身|插入|正文|场景|(?:第[^，。\n]{1,7}章|本章|当前章)[^，。\n]{0,12}(?:加入|一段)/u.test(
+      text,
+    )
   );
+}
+
+export function wantsStagedAntagonist(prompt: string) {
+  const source = prompt.normalize('NFKC');
+  return (
+    wantsPassageAddition(source) &&
+    /(?:新增|增加|加入|添加|加一个)[^，,。；;\n]{0,65}反派/u.test(source) &&
+    /(?:中期|中段)[^。；;\n]{0,50}(?:迹象|暗线|伏笔|线索)/u.test(source) &&
+    /(?:后期|后段)[^。；;\n]{0,40}(?:登场|出场|露面|现身)/u.test(source)
+  );
+}
+
+export function chapterStage(chapters: Manuscript[], target: string) {
+  const index = chapters
+    .slice()
+    .sort((a, b) => (a.fields.order ?? 0) - (b.fields.order ?? 0))
+    .findIndex(({ id }) => id === target);
+  if (index < Math.floor(chapters.length / 3)) return;
+  return index < Math.ceil((chapters.length * 2) / 3) ? 'setup' : 'reveal';
 }
 
 export function passageTargetAllowed(
@@ -104,24 +125,21 @@ export function passageTargetAllowed(
       chapters.some(({ id, fields }) => id === target && fields.order === direct[0])
     );
   if (/本章|当前章|这一章|选中章/u.test(source)) return target === selected;
-  if (/(?:故事|剧情|小说)?中期|中段|故事中间/u.test(source)) {
-    const index = chapters
-      .slice()
-      .sort((a, b) => (a.fields.order ?? 0) - (b.fields.order ?? 0))
-      .findIndex(({ id }) => id === target);
-    return index >= Math.floor(chapters.length / 3) && index < Math.ceil((chapters.length * 2) / 3);
-  }
   const named = chapters.filter(
     ({ fields }) =>
       fields.title && fields.title.length > 2 && source.includes(fields.title.normalize('NFKC')),
   );
-  return named.length === 1 && named[0].id === target;
+  if (named.length) return named.length === 1 && named[0].id === target;
+  const stage = chapterStage(chapters, target);
+  if (wantsStagedAntagonist(source)) return stage !== undefined;
+  if (/中期|中段|故事中间/u.test(source)) return stage === 'setup';
+  return false;
 }
 
 export function minimumExistingSubjects(prompt: string) {
   if (!wantsPassageAddition(prompt)) return 0;
   const count =
-    /(?:至少\s*)?([\d一二三四五六七八九十两]+)\s*(?:个|位|项)\s*(?:以上)?\s*(?:不同的?)?\s*(?:已有|既有|现有)\s*(?:主体|人物|角色)/u.exec(
+    /(?:至少\s*)?([\d一二三四五六七八九十两]+)\s*(?:个|位|项)\s*(?:以上)?\s*(?:不同的?)?\s*(?:已有|既有|现有|人物(?=主体))\s*(?:主体|人物|角色)/u.exec(
       prompt.normalize('NFKC'),
     )?.[1];
   return count ? chapterOrder(`第${count}章`) || 0 : 0;

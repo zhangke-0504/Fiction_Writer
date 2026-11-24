@@ -133,6 +133,20 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
           ...(mode !== 'single' && { subjectIds: [hero.id], clueIds: [clue.id] }),
         });
       const last = body.messages.at(-1)?.content.at(-1);
+      if (body.tools?.length === 1 && body.tools[0].name === 'submit_story_sync') {
+        const { asset, sources } = JSON.parse(last!.text!);
+        expect(sources).toHaveLength(1);
+        return use('submit_story_sync', `sync-${asset.id}`, {
+          evidence: [
+            {
+              source: 1,
+              status: asset.type === 'subject' ? 'appearance' : 'setup',
+              excerpt: 1,
+            },
+          ],
+          edits: [],
+        });
+      }
       if (body.tools?.length === 1 && body.tools[0].name === 'submit_story_descriptions') {
         expect(body.messages).toHaveLength(1);
         const input = last?.text ?? '';
@@ -297,6 +311,22 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
           outlineUpdated: true,
           chapterId: id(chapterForEntry),
         });
+        return use('book_generate_assets', 'entry-sync-actor', {
+          kind: 'subject',
+          action: 'update',
+          targets: [{ id: antagonist.id }],
+        });
+      }
+      if (marker === 'entry-sync-actor') {
+        expect(result.ok).toBe(true);
+        return use('book_generate_assets', 'entry-sync-clue', {
+          kind: 'clue',
+          action: 'update',
+          targets: [{ id: newClueId }],
+        });
+      }
+      if (marker === 'entry-sync-clue') {
+        expect(result.ok).toBe(true);
         return reply('已保存主体、伏笔、大纲和登场。');
       }
       if (marker === 'search') {

@@ -10,6 +10,7 @@ import {
   type UserMessage,
 } from '@earendil-works/pi-ai';
 import type { AssistantTurn, ModelProvider, ToolSpec, Turn } from './model.js';
+import { MalformedMessagesArguments } from './provider.js';
 import type { ReportMemoryDispatch } from './book-memory.js';
 import type { RunContext } from './runs.js';
 import type { ToolResult } from '../../shared/contracts.js';
@@ -322,26 +323,63 @@ export async function runAgent(
           previousCompaction = stats.removed + stats.reductions;
           report('context.compacted', { count: stats.removed, omittedCount: stats.reductions });
         }
-        const answer = await provider.turn({
-          ...wire,
-          tools,
-          maxTokens,
-          signal: ctx.signal,
-          onText: ctx.text,
-          diagnostic: report,
-          spanId,
-          onDispatch(nextSpanId) {
-            // The base system block is intact in the fitted wire projection.
-            reportAttachedMemory?.(diagnosticScope(report, { spanId: nextSpanId }));
-            for (const { candidate, result, tool } of outbound.splice(0)) {
-              candidate.report('tool.result_sent', { spanId: nextSpanId, nextTurn: number });
-              tool?.onResultSent?.(
-                result,
-                diagnosticScope(candidate.context, { spanId: nextSpanId, turn: number }),
-              );
-            }
-          },
-        });
+        let answeredSpanId = spanId;
+        const send = (attemptId: string, attempt: 1 | 2) => {
+          const requestTrace = diagnosticScope(report, {
+            spanId: attemptId,
+            attempt,
+            ...(attempt === 2 && { originalSpanId: spanId }),
+          });
+          return provider.turn({
+            ...wire,
+            tools,
+            maxTokens,
+            signal: ctx.signal,
+            onText: ctx.text,
+            diagnostic: requestTrace,
+            spanId: attemptId,
+            onDispatch(nextSpanId) {
+              // The base system block is intact in the fitted wire projection.
+              reportAttachedMemory?.(diagnosticScope(requestTrace, { spanId: nextSpanId }));
+              // Dispatch metadata and business receipts for already executed tools stay unique.
+              for (const { candidate, result, tool } of outbound.splice(0)) {
+                candidate.report('tool.result_sent', { spanId: nextSpanId, nextTurn: number });
+                tool?.onResultSent?.(
+                  result,
+                  diagnosticScope(candidate.context, { spanId: nextSpanId, turn: number }),
+                );
+              }
+            },
+          });
+        };
+        let answer: AssistantTurn;
+        try {
+          answer = await send(spanId, 1);
+        } catch (error) {
+          if (!(error instanceof MalformedMessagesArguments)) throw error;
+          // Up to this boundary no native reply or tool candidate from this round entered Pi.
+          ctx.resetText?.();
+          ctx.signal.throwIfAborted();
+          const retryId = randomUUID();
+          report('model.arguments_retry', {
+            spanId: retryId,
+            originalSpanId: spanId,
+            attempt: 2,
+            reason: 'invalid_json',
+          });
+          try {
+            answer = await send(retryId, 2);
+            answeredSpanId = retryId;
+          } catch (retryError) {
+            ctx.resetText?.();
+            ctx.signal.throwIfAborted();
+            throw new DiagnosticFailure(
+              classified(retryError, ctx.signal),
+              `Messages 工具参数无效，已重取一次当前轮，仍未完成：${safeText(retryError)}。本轮未执行工具；已保存内容保留，可在同一会话继续。`,
+              { cause: retryError },
+            );
+          }
+        }
         ctx.signal.throwIfAborted();
         const badBatch =
           answer.calls.length > 16 ||
@@ -354,7 +392,7 @@ export async function runAgent(
           });
         for (const call of badBatch ? answer.calls.slice(0, 32) : answer.calls) {
           const tool = registered.get(call.name);
-          const context = diagnosticScope(report, { callId: randomUUID() });
+          const context = diagnosticScope(report, { callId: randomUUID(), spanId: answeredSpanId });
           const candidate: Candidate = {
             context,
             report: (event, fields) => context(event, { tool: tool?.name ?? 'unknown', ...fields }),

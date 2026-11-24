@@ -19,6 +19,18 @@ import { classified, DiagnosticFailure, elapsed, safeReporter } from '../diagnos
 import { readNovelTask, type NovelContinuation, type NovelTaskState } from './novel-goal.js';
 import { readCheckpoint, type SessionCheckpoint, type SessionHistory } from './context-budget.js';
 import { readReceipt, recentReceiptLimit, type ToolReceipt } from './tool-receipts.js';
+import {
+  readEditPlan,
+  readEditBasis,
+  type EditBasis,
+  readEditProposal,
+  readEditCommit,
+  renderEditProposal,
+  type EditPlan,
+  type EditProposal,
+  type EditCommit,
+  type BookEdit,
+} from './edit-proposal.js';
 
 type StateEntry = {
   session: Session;
@@ -27,6 +39,8 @@ type StateEntry = {
   novelTask?: NovelTaskState | null;
   compaction?: SessionCheckpoint;
   toolReceipt?: ToolReceipt;
+  editProposal?: EditProposal;
+  editCommit?: { proposalId: string; commit: EditCommit };
 };
 export interface RunContext {
   id: string;
@@ -34,6 +48,7 @@ export interface RunContext {
   signal: AbortSignal;
   session: Session;
   text: (delta: string) => void;
+  resetText?: () => void;
   line: (line: ChatLine) => Promise<void>;
   uncertainStop?: (reason: string) => void;
   preview: (value?: ChapterPreview) => void;
@@ -42,6 +57,9 @@ export interface RunContext {
   history?: SessionHistory;
   recordTool?: (receipt: ToolReceipt) => Promise<void>;
   continuation?: NovelContinuation;
+  bookEdit?: BookEdit;
+  stageEditProposal?: (value: EditPlan, basis: EditBasis) => void;
+  recordEditCommit?: (proposalId: string, value: EditCommit) => Promise<void>;
   saveNovelTask: (value: NovelTaskState | null) => Promise<void>;
 }
 interface Active {
@@ -62,6 +80,7 @@ export class RunManager {
   private readonly checkpoints = new Map<string, SessionCheckpoint>();
   private readonly receipts = new Map<string, ToolReceipt[]>();
   private readonly novelTasks = new Map<string, NovelTaskState>();
+  private readonly bookEdits = new Map<string, BookEdit>();
   private readonly active = new Map<string, Active>();
   private readonly reserved = new Set<string>();
   private readonly deleting = new Set<string>();
@@ -98,6 +117,18 @@ export class RunManager {
             this.checkpoints.set(id, checkpoint);
           const receipt = readReceipt(entry.toolReceipt);
           if (receipt && receipt.runId === state.run?.id) this.rememberReceipt(id, receipt);
+          if (entry.editProposal && entry.run?.status === 'completed') {
+            const proposal = readEditProposal(entry.editProposal, state.session, state.messages);
+            if (proposal) this.bookEdits.set(id, { proposal, commits: [] });
+          }
+          if (entry.editCommit) {
+            const edit = this.bookEdits.get(id);
+            const commit =
+              edit &&
+              entry.editCommit.proposalId === edit.proposal.id &&
+              readEditCommit(entry.editCommit.commit, edit.proposal.plan);
+            if (commit) edit!.commits.push(commit);
+          }
           if (entry.novelTask === null) this.novelTasks.delete(id);
           else if (entry.novelTask && entry.session.bookId) {
             const task = readNovelTask(entry.novelTask, state.messages);
@@ -232,6 +263,8 @@ export class RunManager {
     const trace = diagnosticScope(this.sessionTrace(view.session, report), { runId: run.id });
     const started = performance.now();
     let reason = 'complete';
+    let stagedEdit: { plan: EditPlan; basis: EditBasis } | undefined;
+    let authorLine: number | undefined;
     const cancel = new AbortController();
     const pushLine = async (line: ChatLine) => {
       const firstTitle =
@@ -257,15 +290,36 @@ export class RunManager {
     active.settled = (async () => {
       try {
         await this.append(view, { run: { ...run } });
-        if (prompt) await pushLine({ role: 'user', text: prompt });
+        if (prompt) {
+          await pushLine({ role: 'user', text: prompt });
+          authorLine = view.messages.length - 1;
+        }
         cancel.signal.throwIfAborted();
         await operation({
           id: run.id,
           diagnostic: trace,
           signal: cancel.signal,
           session: structuredClone(view.session),
-          authorLine: prompt ? view.messages.length - 1 : undefined,
+          authorLine,
           continuation,
+          bookEdit: structuredClone(this.bookEdits.get(id)),
+          stageEditProposal: (value, proposedBasis) => {
+            cancel.signal.throwIfAborted();
+            const draft = readEditPlan(value);
+            const basis = draft && readEditBasis(proposedBasis, draft);
+            if (!draft || !basis || !view.session.bookId || authorLine === undefined)
+              throw new DiagnosticFailure('invalid_options', '无法记录不完整或未绑定作品的方案');
+            stagedEdit = structuredClone({ plan: draft, basis });
+          },
+          recordEditCommit: async (proposalId, value) => {
+            const edit = this.bookEdits.get(id);
+            const commit =
+              edit && proposalId === edit.proposal.id && readEditCommit(value, edit.proposal.plan);
+            if (!commit || !edit)
+              throw new DiagnosticFailure('io_failure', '无法保存此方案的实际提交回执');
+            await this.append(view, { editCommit: { proposalId, commit } });
+            edit.commits.push(commit);
+          },
           history: {
             lines: view.messages.slice(0, prompt ? -1 : undefined),
             checkpoint: this.checkpoints.get(id),
@@ -307,6 +361,10 @@ export class RunManager {
               this.changed(id);
             }
           },
+          resetText: () => {
+            view.streaming = '';
+            this.changed(id);
+          },
           preview: (value) => {
             if (!cancel.signal.aborted || !value) {
               run.preview = value;
@@ -339,7 +397,26 @@ export class RunManager {
         run.preview = undefined;
         view.streaming = '';
         try {
-          await this.append(view, { run: { ...run } });
+          if (
+            run.status === 'completed' &&
+            stagedEdit &&
+            view.session.bookId &&
+            authorLine !== undefined
+          ) {
+            const proposal: EditProposal = {
+              id: randomUUID(),
+              sessionId: id,
+              bookId: view.session.bookId,
+              authorLine,
+              proposalLine: view.messages.length,
+              ...stagedEdit,
+            };
+            const line = { role: 'assistant' as const, text: renderEditProposal(stagedEdit.plan) };
+            // The saved proposal is authoritative only together with its visible line and completed Run.
+            await this.append(view, { run: { ...run }, line, editProposal: proposal });
+            view.messages.push(line);
+            this.bookEdits.set(id, { proposal, commits: [] });
+          } else await this.append(view, { run: { ...run } });
         } catch {
           run.status = 'failed';
           run.error = '无法保存会话状态';
@@ -394,6 +471,7 @@ export class RunManager {
         });
         this.states.delete(id);
         this.novelTasks.delete(id);
+        this.bookEdits.delete(id);
         this.checkpoints.delete(id);
         this.receipts.delete(id);
         this.sessionTrace(state.session, report)('session.deleted');

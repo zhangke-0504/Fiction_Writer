@@ -457,6 +457,330 @@ test('Messages records other candidates as not executed when one block invalidat
   assert.doesNotMatch(JSON.stringify(trace.rows), /private-call-|private-malformed/);
 });
 
+function malformedMessagesBatch(res: ServerResponse, mixed: boolean, visible = '') {
+  sse(
+    res,
+    ...(visible
+      ? [
+          { type: 'content_block_start', index: 0, content_block: { type: 'text', text: visible } },
+          { type: 'content_block_stop', index: 0 },
+        ]
+      : []),
+    {
+      type: 'content_block_start',
+      index: 1,
+      content_block: { type: 'tool_use', id: 'bad-call-private', name: 'read_file', input: {} },
+    },
+    {
+      type: 'content_block_delta',
+      index: 1,
+      delta: { type: 'input_json_delta', partial_json: '{"path":' },
+    },
+    {
+      type: 'content_block_delta',
+      index: 1,
+      delta: { type: 'input_json_delta', partial_json: '"private-malformed' },
+    },
+    { type: 'content_block_stop', index: 1 },
+    ...(mixed
+      ? [
+          {
+            type: 'content_block_start',
+            index: 2,
+            content_block: { type: 'tool_use', id: 'valid-sibling', name: 'read_file', input: {} },
+          },
+          { type: 'content_block_stop', index: 2 },
+        ]
+      : []),
+    { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+    { type: 'message_stop' },
+  );
+}
+
+function harnessFixture(
+  trace: ReturnType<typeof collectDiagnostics>,
+  overrides: Partial<RunContext> = {},
+): RunContext {
+  return {
+    id: randomUUID(),
+    session: { id: randomUUID(), label: 'fixture', cwd: '.', updated: '' },
+    signal: AbortSignal.timeout(8000),
+    diagnostic: trace.report,
+    text() {},
+    async line() {},
+    preview() {},
+    progress() {},
+    async saveNovelTask() {},
+    ...overrides,
+  };
+}
+
+for (const mixed of [false, true]) {
+  test(`an ended Messages batch with invalid JSON never executes (${mixed ? 'mixed' : 'one block'})`, async (t) => {
+    const { profile, requests } = await fixture(t, 'messages', (_body, res) =>
+      malformedMessagesBatch(res, mixed),
+    );
+    const trace = collectDiagnostics();
+    let executions = 0;
+    await assert.rejects(
+      runAgent(harnessFixture(trace), createProvider(profile, key), '', [], 'fixture', [
+        {
+          name: 'read_file',
+          description: 'fixture',
+          schema: object({}, []),
+          async execute() {
+            executions++;
+            return 'executed';
+          },
+        },
+      ]),
+      /Messages 工具参数/,
+    );
+    assert.equal(requests.length, 2);
+    assert.equal(executions, 0);
+    const batch = mixed ? ['invalid_json', 'batch_invalid'] : ['invalid_json'];
+    assert.deepEqual(
+      trace.rows.filter((r) => r.event === 'tool.rejected').map((r) => r.fields.reason),
+      [...batch, ...batch],
+    );
+    assert.equal(trace.rows.filter((r) => r.event === 'loop.round.started').length, 1);
+    assert.equal(trace.rows.filter((r) => r.event === 'model.arguments_retry').length, 1);
+    assert.ok(
+      !trace.rows.some((r) => r.event === 'tool.started' || r.event === 'workspace.document.committed'),
+    );
+  });
+}
+
+function messagesCall(res: ServerResponse, id: string, name: string, input: object = {}) {
+  sse(
+    res,
+    { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id, name, input } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+    { type: 'message_stop' },
+  );
+}
+const messagesText = (res: ServerResponse, text: string) =>
+  sse(
+    res,
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+    { type: 'message_stop' },
+  );
+
+test('a Messages retry keeps the prior valid exchange and executes only its replacement, in the same round', async (t) => {
+  const trace = collectDiagnostics();
+  let n = 0;
+  const { profile, requests } = await fixture(t, 'messages', (_body, res) => {
+    switch (n++) {
+      case 0:
+        return messagesCall(res, 'old-call', 'write_file', { tag: 'old' });
+      case 1:
+        return malformedMessagesBatch(res, true, 'ABANDONED_TEMPORARY_TEXT');
+      case 2:
+        return messagesCall(res, 'good-call', 'write_file', { tag: 'new' });
+      default:
+        return messagesText(res, '只保存了两次。');
+    }
+  });
+  const receipts: ToolReceipt[] = [],
+    commits: string[] = [],
+    transcript: string[] = [];
+  let streaming = '';
+  const ctx = harnessFixture(trace, {
+    text: (delta) => {
+      streaming += delta;
+    },
+    resetText: () => {
+      streaming = '';
+    },
+    async line(line) {
+      if (line.role === 'assistant') transcript.push(line.text);
+    },
+    async recordTool(receipt) {
+      receipts.push(receipt);
+    },
+  });
+  await runAgent(ctx, createProvider(profile, key), '', [], 'AUTHOR_PRIVATE_FIXTURE', [
+    {
+      name: 'write_file',
+      description: 'fixture',
+      schema: object({ tag: { type: 'string' } }),
+      async execute({ tag }, context) {
+        commits.push(tag);
+        context.diagnostic?.('workspace.document.committed', {
+          documentRef: `chapter/${tag}`,
+          operation: 'write',
+          revision: 'a'.repeat(64),
+        });
+        return { saved: true };
+      },
+    },
+    {
+      name: 'read_file',
+      description: 'unused on rejection',
+      schema: object({}, []),
+      async execute() {
+        assert.fail('bad batch must not execute');
+      },
+    },
+  ]);
+  assert.deepEqual(commits, ['old', 'new']);
+  assert.equal(receipts.length, 2);
+  assert.ok(receipts.every((r) => r.commitCount === 1));
+  assert.deepEqual(requests[1].body, requests[2].body);
+  assert.doesNotMatch(
+    JSON.stringify(requests[3].body),
+    /ABANDONED_TEMPORARY_TEXT|bad-call-private|valid-sibling/,
+  );
+  assert.deepEqual(transcript, ['只保存了两次。']);
+  assert.doesNotMatch(streaming, /ABANDONED_TEMPORARY_TEXT/);
+  assert.deepEqual(trace.rejected, []);
+  const retry = trace.rows.find((r) => r.event === 'model.arguments_retry')!;
+  const invalid = trace.rows.find((r) => r.event === 'model.messages_arguments_invalid')!;
+  const block = trace.rows.find((r) => r.event === 'model.messages_argument_block')!;
+  assert.equal(invalid.fields.spanId, retry.fields.originalSpanId);
+  assert.notEqual(retry.fields.spanId, retry.fields.originalSpanId);
+  assert.equal(retry.fields.turn, 2);
+  assert.equal(retry.fields.attempt, 2);
+  assert.deepEqual(
+    [
+      invalid.fields.messageClosed,
+      invalid.fields.stopType,
+      invalid.fields.invalidCount,
+      invalid.fields.count,
+      invalid.fields.omitted,
+    ],
+    [true, 'tool_use', 1, 2, 0],
+  );
+  assert.deepEqual(
+    [block.fields.blockIndex, block.fields.fragmentCount, block.fields.bytes],
+    [1, 2, Buffer.byteLength('{"path":"private-malformed')],
+  );
+  assert.equal(
+    trace.rows.find((r) => r.event === 'tool.started' && r.fields.turn === 2)?.fields.spanId,
+    retry.fields.spanId,
+  );
+  assert.equal(trace.rows.filter((r) => r.event === 'loop.round.started').length, 3);
+  assert.doesNotMatch(
+    JSON.stringify(trace.rows),
+    /AUTHOR_PRIVATE_FIXTURE|private-malformed|ABANDONED_TEMPORARY_TEXT|synthetic-only-secret-fixture/,
+  );
+});
+
+test('cancelling the one Messages retry prevents the replacement from executing', async (t) => {
+  let requests = 0;
+  const cancel = new AbortController();
+  const { profile } = await fixture(t, 'messages', (_body, res) => {
+    if (++requests === 1) malformedMessagesBatch(res, false);
+    else {
+      cancel.abort();
+      messagesCall(res, 'too-late', 'read_file');
+    }
+  });
+  const trace = collectDiagnostics();
+  await assert.rejects(
+    runAgent(
+      harnessFixture(trace, { signal: cancel.signal }),
+      createProvider(profile, key),
+      '',
+      [],
+      'fixture',
+      [
+        {
+          name: 'read_file',
+          description: 'fixture',
+          schema: object({}, []),
+          async execute() {
+            assert.fail('aborted');
+          },
+        },
+      ],
+    ),
+    { name: 'AbortError' },
+  );
+  assert.equal(requests, 2);
+  assert.equal(trace.rows.filter((r) => r.event === 'model.arguments_retry').length, 1);
+  assert.ok(!trace.rows.some((r) => r.event === 'tool.started'));
+});
+
+for (const type of ['missing-end', 'max-tokens', 'auth', 'valid-schema-error'] as const) {
+  test(`Messages does not retry ${type} as malformed arguments`, async (t) => {
+    const trace = collectDiagnostics();
+    const { profile, requests } = await fixture(t, 'messages', (_body, res) => {
+      if (type === 'auth') {
+        res.writeHead(401);
+        res.end();
+        return;
+      }
+      if (type === 'missing-end') {
+        sse(res, { type: 'message_delta', delta: { stop_reason: 'tool_use' } });
+        return;
+      }
+      if (type === 'max-tokens') {
+        sse(
+          res,
+          { type: 'message_delta', delta: { stop_reason: 'max_tokens' } },
+          { type: 'message_stop' },
+        );
+        return;
+      }
+      if (_body.messages.at(-1)?.content?.[0]?.type === 'tool_result')
+        return messagesText(res, '参数需要修正');
+      messagesCall(res, 'bad-schema', 'read_file', { unknown: true });
+    });
+    const operation = runAgent(harnessFixture(trace), createProvider(profile, key), '', [], 'fixture', [
+      {
+        name: 'read_file',
+        description: 'fixture',
+        schema: object({}, []),
+        async execute() {
+          assert.fail('not executable');
+        },
+      },
+    ]);
+    if (type === 'valid-schema-error') await operation;
+    else await assert.rejects(operation);
+    assert.equal(requests.length, type === 'valid-schema-error' ? 2 : 1);
+    assert.ok(
+      !trace.rows.some((r) => r.event === 'model.arguments_retry' || r.event === 'tool.started'),
+    );
+  });
+}
+
+test('the Messages invalid-block diagnostics are bounded and report omissions', async (t) => {
+  const trace = collectDiagnostics();
+  const { profile } = await fixture(t, 'messages', (_body, res) =>
+    sse(
+      res,
+      ...Array.from({ length: 19 }, (_, index) => [
+        {
+          type: 'content_block_start',
+          index,
+          content_block: { type: 'tool_use', id: `bad-${index}`, name: 'read_file', input: {} },
+        },
+        {
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'input_json_delta', partial_json: '{"private-raw' },
+        },
+        { type: 'content_block_stop', index },
+      ]).flat(),
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+      { type: 'message_stop' },
+    ),
+  );
+  await assert.rejects(createProvider(profile, key).turn({ ...ctx(), diagnostic: trace.report }));
+  assert.equal(trace.rows.filter((r) => r.event === 'model.messages_argument_block').length, 16);
+  assert.equal(
+    trace.rows.find((r) => r.event === 'model.messages_arguments_invalid')?.fields.omitted,
+    3,
+  );
+  assert.doesNotMatch(JSON.stringify(trace.rows), /private-raw/);
+  assert.deepEqual(trace.rejected, []);
+});
+
 test('a larger tool output budget is only advertised for supported official DeepSeek profiles', () => {
   const profile: ModelProfile = {
     id: 'fixture',
@@ -478,7 +802,7 @@ test('a larger tool output budget is only advertised for supported official Deep
   assert.equal(createProvider({ ...profile, protocol: 'chat' }, key).extendedOutputTokens, undefined);
 });
 
-test('official DeepSeek direct prose changes only prose-only requests, not tool reasoning', async (t) => {
+test('official DeepSeek uses direct output only for eligible prose and bounded result requests', async (t) => {
   const requests: { thinking?: { type: string } }[] = [];
   t.mock.method(globalThis, 'fetch', async (_input: unknown, init: RequestInit) => {
     assert.equal(new URL(String(_input)).origin, 'https://api.deepseek.com');
@@ -506,9 +830,17 @@ test('official DeepSeek direct prose changes only prose-only requests, not tool 
   await provider.turn(ctx());
   await provider.turn({ ...ctx(), directProse: true });
   await provider.turn({ ...ctx(), directProse: true, tools: [] });
+  const one = ctx();
+  assert.equal(one.tools.length, 1);
+  await provider.turn({ ...one, directToolResult: true });
+  await provider.turn({
+    ...one,
+    tools: [...one.tools, { ...one.tools[0], name: 'another' }],
+    directToolResult: true,
+  });
   assert.deepEqual(
     requests.map((request) => request.thinking),
-    [undefined, undefined, { type: 'disabled' }],
+    [undefined, undefined, { type: 'disabled' }, { type: 'disabled' }, undefined],
   );
 });
 

@@ -71,7 +71,7 @@ function authorized(
   const source = normalize(prompt);
   const noun =
     scope.kind === 'subject'
-      ? /主体|人物|角色|设定卡|物品|道具|场景|subject|character|item|location/u
+      ? /主体|人物|角色|反派|设定卡|物品|道具|场景|subject|character|item|location/u
       : /伏笔|线索|foreshadow|clue/u;
   const verb =
     scope.action === 'create'
@@ -172,8 +172,12 @@ function targetsFor(input: AssetInput, documents: Manuscript[]) {
         kind === 'subject'
           ? ['name', 'kind']
           : ['title', 'subjectIds', 'setupChapterId', 'payoffChapterId'];
-      if (Object.keys(fields).some((key) => !allowed.includes(key)))
-        throw new ToolFailure('invalid_arguments', '新资产有不适用的字段；只使用注册的资料字段。');
+      const extra = Object.keys(fields).filter((key) => !allowed.includes(key));
+      if (extra.length)
+        throw new ToolFailure(
+          'invalid_arguments',
+          `新${kind === 'subject' ? '主体' : '伏笔'}的 fields 只接受 ${allowed.join('、')}，请移除其他字段。`,
+        );
       validateFields(kind, fields, '');
     }
     let relatedSubjects: Manuscript[] | undefined;
@@ -376,12 +380,14 @@ export async function generateStoryAssets(
   intent: WritingIntent,
   whole: boolean,
   onAuthorized?: (refs: DocRef[]) => Promise<void>,
+  confirmedScope = false,
 ) {
   const bookId = ctx.session.bookId;
   if (!bookId) throw new ToolFailure('invalid_options', '生成资料需要绑定小说。');
   const { documents } = await workspace.readAll(bookId);
   const targets = targetsFor(input, documents);
   if (
+    !confirmedScope &&
     !authorized(
       intent.author ?? '',
       input,

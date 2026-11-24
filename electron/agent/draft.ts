@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { diagnosticScope, noDiagnostic } from '../../shared/diagnostics.js';
 import { classified, DiagnosticFailure, elapsed, safeReporter } from '../diagnostics/trace.js';
 import { applySkill } from './skills.js';
+import type { InsertedScene } from './edit-proposal.js';
 import type { Change, Manuscript, WriteReport } from '../../shared/contracts.js';
-import { chapterPlacementFingerprint, docKey } from '../documents.js';
+import { chapterPlacementFingerprint, digest, docKey } from '../documents.js';
 import type { AssistantTurn, ModelProvider } from './model.js';
 import type { RunContext } from './runs.js';
 import type { WorkspaceService, Guard } from '../workspace.js';
@@ -34,7 +35,10 @@ import {
 } from './writing-request.js';
 
 export class DraftCommitFailure extends DiagnosticFailure {
-  constructor(readonly report: WriteReport) {
+  constructor(
+    readonly report: WriteReport,
+    readonly scene?: InsertedScene,
+  ) {
     super(report.reason ?? 'unknown', report.error ?? '写入未完整提交');
   }
 }
@@ -56,6 +60,7 @@ export async function draftChapter(
     expectedPlacement?: string;
     maxTokens?: number;
     directProse?: boolean;
+    captureInsertion?: (scene: InsertedScene) => void;
   } = {},
 ) {
   const bookId = ctx.session.bookId,
@@ -122,7 +127,7 @@ export async function draftChapter(
     const context = chapterContext(view.documents, doc, undefined, {
       plan: options.plan,
       mode,
-      direction: [intent.author, intent.arrangement].filter(Boolean).join('\n'),
+      direction: [intent.author, intent.confirmed, intent.arrangement].filter(Boolean).join('\n'),
       insertion:
         offset === undefined
           ? undefined
@@ -130,6 +135,7 @@ export async function draftChapter(
     });
     const scopedIntent = {
       ...intent,
+      confirmed: intent.confirmed && context.visible(intent.confirmed),
       arrangement: intent.arrangement && context.visible(intent.arrangement),
     };
     let reportAttachedMemory: ReportMemoryDispatch | undefined;
@@ -245,6 +251,16 @@ export async function draftChapter(
         '模型只复述了锚点旁的已有正文，没有可提交的新增段落。',
       );
     const body = compose(fragment);
+    const scene =
+      offset === undefined || !options.captureInsertion
+        ? undefined
+        : {
+            offset,
+            size: body.length - doc.body.length,
+            fragmentOffset: body.slice(offset, offset + body.length - doc.body.length).indexOf(fragment),
+            length: fragment.length,
+            digest: digest(fragment),
+          };
     const changes: Change[] = [
       { type: 'chapter', id: chapterId, expect: doc.revision, fields: doc.fields, body },
     ];
@@ -267,9 +283,10 @@ export async function draftChapter(
     );
     if (result.error) {
       partial = result.committed.length > 0;
-      throw new DraftCommitFailure(result);
+      throw new DraftCommitFailure(result, scene);
     }
     committed = await workspace.readDocument(bookId, { type: 'chapter', id: chapterId });
+    if (scene) options.captureInsertion?.(scene);
     return committed;
   } catch (error) {
     if (error instanceof WritingContextFailure) reportWritingBlock(trace, scope, error);

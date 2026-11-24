@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { api } from './bridge';
 import { ErrorText, Icon, errorDetails, norm } from './ui';
 import type { ActiveChapter } from './Workspace';
@@ -65,6 +65,9 @@ export function Harness({
     [busy, setBusy] = useState(false);
   const feed = useRef<HTMLDivElement>(null),
     sticky = useRef(true);
+  const submitting = useRef(false);
+  const composing = useRef(false);
+  const composerHint = useId();
   const sessions = view.sessions.filter((s) => s.session.bookId === bookId);
   const current = sessions.find((s) => s.session.id === selectedId);
   const rows = sessions
@@ -73,6 +76,14 @@ export function Harness({
   const running = current?.run?.status === 'running',
     profile = profiles.find((p) => p.id === profileId) ?? profiles[0];
   const hasChapter = !!chapter && chapter.bookId === bookId;
+  const canSend = !!(
+    current &&
+    profile &&
+    !current.session.missing &&
+    !busy &&
+    !running &&
+    prompt.trim()
+  );
   useEffect(() => {
     if (open && !list && sticky.current && feed.current)
       feed.current.scrollTop = feed.current.scrollHeight;
@@ -107,21 +118,26 @@ export function Harness({
   }
   async function send(e: FormEvent) {
     e.preventDefault();
-    if (!current || !profile || busy || running || !prompt.trim()) return;
-    await perform(async () => {
-      const args: StartRun = {
-        id: current.session.id,
-        profileId: profile.id,
-        prompt: prompt.trim(),
-        effort,
-        attachments: [...attachments],
-        chapterId: hasChapter ? chapter.chapterId : undefined,
-      };
-      await api.request('session.start', args);
-      setPrompt('');
-      setAttachments([]);
-      sticky.current = true;
-    });
+    if (!canSend || !current || !profile || submitting.current) return;
+    submitting.current = true;
+    try {
+      await perform(async () => {
+        const args: StartRun = {
+          id: current.session.id,
+          profileId: profile.id,
+          prompt: prompt.trim(),
+          effort,
+          attachments: [...attachments],
+          chapterId: hasChapter ? chapter.chapterId : undefined,
+        };
+        await api.request('session.start', args);
+        setPrompt('');
+        setAttachments([]);
+        sticky.current = true;
+      });
+    } finally {
+      submitting.current = false;
+    }
   }
   const remove = (id: string) =>
     perform(async () => {
@@ -312,11 +328,31 @@ export function Harness({
             )}
             <textarea
               aria-label="给 Agent 的消息"
+              aria-describedby={composerHint}
               rows={3}
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
+              onCompositionStart={() => {
+                composing.current = true;
+              }}
+              onCompositionEnd={() => {
+                composing.current = false;
+              }}
+              onBlur={() => {
+                composing.current = false;
+              }}
+              onKeyDown={(e) => {
+                if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
+                if (composing.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229)
+                  return;
+                e.preventDefault();
+                if (!e.repeat && canSend && !submitting.current) e.currentTarget.form?.requestSubmit();
+              }}
               placeholder="和 Agent 讨论当前作品…"
             />
+            <small id={composerHint} className="muted">
+              Enter 发送 · Shift+Enter 换行
+            </small>
             <div className="composer-options">
               <button
                 type="button"
@@ -367,12 +403,7 @@ export function Harness({
                   停止
                 </button>
               ) : (
-                <button
-                  className="primary send"
-                  type="submit"
-                  aria-label="发送"
-                  disabled={!profile || busy || !!current.session.missing || !prompt.trim()}
-                >
+                <button className="primary send" type="submit" aria-label="发送" disabled={!canSend}>
                   <Icon name="send" size={16} />
                   发送
                 </button>

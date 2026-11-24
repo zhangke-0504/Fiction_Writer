@@ -6,7 +6,7 @@ type Lane = 'agent' | 'asset' | 'draft' | 'readback';
 const laneOf = ({ tools }: ModelRequest): Lane =>
   !tools.length
     ? 'draft'
-    : tools.length === 1 && tools[0].name === 'submit_story_descriptions'
+    : tools.length === 1 && ['submit_story_descriptions', 'submit_story_sync'].includes(tools[0].name)
       ? 'asset'
       : tools.length === 1 && tools[0].name === 'book_read_chapter'
         ? 'readback'
