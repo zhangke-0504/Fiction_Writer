@@ -6,7 +6,13 @@ function excerpt(text: string, max: number) {
   const paragraphs = text.split(/\n\s*\n/).filter((p) => p.trim());
   return `[开头与结尾摘录；全文 ${text.length} 字符]\n${paragraphs[0]?.slice(0, Math.floor(max / 3)) ?? ''}\n[…]\n${text.slice(-Math.floor((max * 2) / 3))}`;
 }
-export function chapterContext(documents: Manuscript[], target: Manuscript, precedingBudget = 43_000) {
+export function chapterContext(
+  documents: Manuscript[],
+  target: Manuscript,
+  precedingBudget = 43_000,
+  assetScale = 1,
+) {
+  const scaled = (value: number) => Math.floor(value * assetScale);
   const chapters = documents.filter((d) => d.type === 'chapter');
   const index = chapters.findIndex((d) => d.id === target.id),
     chapterIds = new Map(chapters.map((d, i) => [d.id, i]));
@@ -54,15 +60,15 @@ export function chapterContext(documents: Manuscript[], target: Manuscript, prec
   const subjects = documents
     .filter((d) => d.type === 'subject')
     .sort((a, b) => Number(linked.has(b.id)) - Number(linked.has(a.id)));
-  let castBudget = 27_000;
+  let castBudget = scaled(27_000);
   const cast = [...clues, ...subjects].flatMap((d) => {
     if (castBudget < 200) return [];
-    const text = `[${d.type}/${d.id}] ${indexName(d)} ${JSON.stringify(d.fields)}\n${excerpt(d.body, Math.min(5500, castBudget))}`;
+    const text = `[${d.type}/${d.id}] ${indexName(d)} ${JSON.stringify(d.fields)}\n${excerpt(d.body, Math.min(scaled(5500), castBudget))}`;
     castBudget -= text.length;
     return [text];
   });
   const book = documents.find((d) => d.type === 'book');
-  const targetBody = excerpt(target.body, 25_000);
+  const targetBody = excerpt(target.body, scaled(25_000));
   const abridged = previous.filter((d) => !fullyIncluded.has(d.id));
   if (targetBody !== target.body) abridged.push(target);
   return {
@@ -71,10 +77,10 @@ export function chapterContext(documents: Manuscript[], target: Manuscript, prec
           title: book.fields.title,
           genre: book.fields.genre,
           style: book.fields.style,
-          summary: excerpt(book.body, 4000),
+          summary: excerpt(book.body, scaled(4000)),
         }
       : undefined,
-    outline: excerpt(outline?.body ?? '', 20_000),
+    outline: excerpt(outline?.body ?? '', scaled(20_000)),
     target: {
       id: target.id,
       title: target.fields.title,

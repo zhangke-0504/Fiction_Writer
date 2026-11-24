@@ -35,5 +35,9 @@ export interface ModelRequest {
 export interface ModelProvider {
   effort: Effort | 'default';
   extendedOutputTokens?: number;
+  /** Optional known input budget for a provider, otherwise use a conservative estimate. */
+  inputTokenBudget?: number;
+  /** Some thinking endpoints reject prior text-only assistant messages as native continuation. */
+  textHistoryInPrompt?: boolean;
   turn(input: ModelRequest): Promise<AssistantTurn>;
 }

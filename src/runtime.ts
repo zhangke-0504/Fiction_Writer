@@ -6,8 +6,9 @@ import { startReload } from './diagnostics';
 import { errorMessage } from './ui';
 
 /** Sequence gaps invalidate both the workspace projection and the run snapshot. */
-export function useRuntime() {
-  const [view, setView] = useState<RuntimeView>({ cursor: 0, sessions: [] });
+const emptyView: RuntimeView = { cursor: 0, sessions: [] };
+export function useRuntime(bookId: string | undefined) {
+  const [loaded, setLoaded] = useState<{ bookId: string | undefined; view: RuntimeView }>();
   const [refresh, setRefresh] = useState<UiRefreshContext>({ reason: 'load' }),
     [error, setError] = useState('');
   useEffect(() => {
@@ -36,7 +37,7 @@ export function useRuntime() {
       let reload = trigger && startReload('runtime', trigger, started);
       traceTrigger = undefined;
       try {
-        const snapshot = await api.request<RuntimeView>('runtime.snapshot');
+        const snapshot = await api.request<RuntimeView>('runtime.snapshot', { bookId: bookId ?? null });
         if (!disposed && current === epoch) {
           workerId = snapshot.workerId ?? workerId;
           if (snapshot.cursor >= seen) {
@@ -53,7 +54,7 @@ export function useRuntime() {
               reload ??= startReload('runtime', trigger, started);
               setRefresh(trigger);
             }
-            setView(snapshot);
+            setLoaded({ bookId, view: snapshot });
             reload?.finish('ok');
           } else {
             reload?.finish('superseded');
@@ -64,7 +65,7 @@ export function useRuntime() {
         } else reload?.finish('superseded');
       } catch (e) {
         reload?.finish(disposed || current !== epoch ? 'superseded' : 'failed');
-        if (!disposed) setError(errorMessage(e));
+        if (!disposed && current === epoch) setError(errorMessage(e));
       } finally {
         loading = false;
         if (needed) schedule();
@@ -126,6 +127,6 @@ export function useRuntime() {
       off();
       clearTimeout(timer);
     };
-  }, []);
-  return { view, refresh, error };
+  }, [bookId]);
+  return { view: loaded?.bookId === bookId ? (loaded?.view ?? emptyView) : emptyView, refresh, error };
 }

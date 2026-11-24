@@ -93,6 +93,10 @@ const reason = one(
   'batch_invalid',
   'invalid_call',
   'result_limit',
+  'context_limit',
+  'invalid_memory',
+  'memory_limit',
+  'memory_not_requested',
   'invalid_arguments',
   'tool_failed',
   'command_failed',
@@ -125,7 +129,7 @@ const reason = one(
   'user',
   'unknown',
 );
-const lane = one('agent', 'draft', 'readback', 'probe');
+const lane = one('agent', 'draft', 'readback', 'probe', 'compaction');
 const tool = one(
   'list_files',
   'search_text',
@@ -138,6 +142,9 @@ const tool = one(
   'book_apply_changes',
   'book_generate_chapter',
   'book_read_chapter',
+  'book_memory_recall',
+  'book_memory_remember',
+  'book_memory_forget',
   'skill_search',
   'skill_load',
   'fixture_value',
@@ -307,6 +314,8 @@ const diag = new Map<string, Definition>(
     'probe.finished': worker({ ...final, step: one('connection', 'tools') }),
     'model.http': worker({ httpStatus, elapsedMs: duration }),
     'model.first_event': worker({ elapsedMs: duration }),
+    'context.compacted': worker({ count, omittedCount: count }),
+    'context.checkpoint': worker({ count, source: one('model', 'excerpt') }),
     'model.finished': worker({ ...final, httpStatus, textLength: count, toolCount: count }),
     'loop.round.started': worker({}),
     'loop.round.finished': worker({ ...final, toolCount: count }),

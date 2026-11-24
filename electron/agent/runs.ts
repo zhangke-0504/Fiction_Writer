@@ -17,12 +17,16 @@ import { diagnosticScope, noDiagnostic, type ReportDiagnostic } from '../../shar
 import { classified, DiagnosticFailure, elapsed, safeReporter } from '../diagnostics/trace.js';
 
 import { readNovelTask, type NovelContinuation, type NovelTaskState } from './novel-goal.js';
+import { readCheckpoint, type SessionCheckpoint, type SessionHistory } from './context-budget.js';
+import { readReceipt, recentReceiptLimit, type ToolReceipt } from './tool-receipts.js';
 
 type StateEntry = {
   session: Session;
   line?: ChatLine;
   run?: RunInfo;
   novelTask?: NovelTaskState | null;
+  compaction?: SessionCheckpoint;
+  toolReceipt?: ToolReceipt;
 };
 export interface RunContext {
   id: string;
@@ -35,6 +39,8 @@ export interface RunContext {
   preview: (value?: ChapterPreview) => void;
   progress: (value: WorkProgress) => void;
   authorLine?: number;
+  history?: SessionHistory;
+  recordTool?: (receipt: ToolReceipt) => Promise<void>;
   continuation?: NovelContinuation;
   saveNovelTask: (value: NovelTaskState | null) => Promise<void>;
 }
@@ -47,8 +53,14 @@ export const directoryKey = (path: string) => {
   const key = normalize(path);
   return process.platform === 'win32' ? key.toLowerCase() : key;
 };
+function authorTitle(text: string) {
+  const chars = Array.from(text.replace(/\s+/gu, ' ').trim());
+  return chars.length > 44 ? `${chars.slice(0, 44).join('')}…` : chars.join('');
+}
 export class RunManager {
   private readonly states = new Map<string, SessionView>();
+  private readonly checkpoints = new Map<string, SessionCheckpoint>();
+  private readonly receipts = new Map<string, ToolReceipt[]>();
   private readonly novelTasks = new Map<string, NovelTaskState>();
   private readonly active = new Map<string, Active>();
   private readonly reserved = new Set<string>();
@@ -81,6 +93,11 @@ export class RunManager {
           state.session = entry.session;
           if (entry.line) state.messages.push(entry.line);
           if (entry.run) state.run = entry.run;
+          const checkpoint = readCheckpoint(entry.compaction, state.messages.length);
+          if (checkpoint && checkpoint.through >= (this.checkpoints.get(id)?.through ?? 0))
+            this.checkpoints.set(id, checkpoint);
+          const receipt = readReceipt(entry.toolReceipt);
+          if (receipt && receipt.runId === state.run?.id) this.rememberReceipt(id, receipt);
           if (entry.novelTask === null) this.novelTasks.delete(id);
           else if (entry.novelTask && entry.session.bookId) {
             const task = readNovelTask(entry.novelTask, state.messages);
@@ -91,6 +108,8 @@ export class RunManager {
         }
       }
       if (state) {
+        const first = state.messages.find((line) => line.role === 'user' && line.text.trim());
+        if (first) state.session.label = authorTitle(first.text);
         if (state.run?.status === 'running') {
           state.run = {
             ...state.run,
@@ -107,6 +126,12 @@ export class RunManager {
         this.states.set(id, state);
       }
     }
+  }
+  private rememberReceipt(id: string, receipt: ToolReceipt) {
+    const list = this.receipts.get(id) ?? [];
+    list.push(receipt);
+    if (list.length > recentReceiptLimit) list.shift();
+    this.receipts.set(id, list);
   }
   private historyPath(id: string) {
     return join(this.directory, `${id}.jsonl`);
@@ -166,10 +191,15 @@ export class RunManager {
       if (!creating.size) this.creating.delete(key);
     }
   }
-  snapshot(): RuntimeView {
+  snapshot(bookId?: string | null): RuntimeView {
     return {
       cursor: this.journal.cursor,
-      sessions: structuredClone([...this.states.values()]),
+      sessions: structuredClone(
+        [...this.states.values()].filter(
+          (view) =>
+            bookId === undefined || (typeof bookId === 'string' && view.session.bookId === bookId),
+        ),
+      ),
     };
   }
   get(id: string): SessionView {
@@ -204,7 +234,15 @@ export class RunManager {
     let reason = 'complete';
     const cancel = new AbortController();
     const pushLine = async (line: ChatLine) => {
-      await this.append(view, { line });
+      const firstTitle =
+        line.role === 'user' && !view.messages.some((m) => m.role === 'user' && m.text.trim())
+          ? authorTitle(line.text)
+          : '';
+      if (firstTitle) {
+        const session = { ...view.session, label: firstTitle };
+        await this.append({ ...view, session }, { line });
+        view.session = session;
+      } else await this.append(view, { line });
       view.messages.push(line);
       if (line.role === 'assistant') view.streaming = '';
       this.changed(id);
@@ -228,6 +266,27 @@ export class RunManager {
           session: structuredClone(view.session),
           authorLine: prompt ? view.messages.length - 1 : undefined,
           continuation,
+          history: {
+            lines: view.messages.slice(0, prompt ? -1 : undefined),
+            checkpoint: this.checkpoints.get(id),
+            receipts: [...(this.receipts.get(id) ?? [])],
+            save: async (value) => {
+              cancel.signal.throwIfAborted();
+              const old = this.checkpoints.get(id)?.through ?? 0;
+              const checkpoint = readCheckpoint(value, view.messages.length - Number(!!prompt));
+              if (!checkpoint || checkpoint.through <= old)
+                throw new DiagnosticFailure('context_limit', '无法保存会话压缩检查点');
+              await this.append(view, { compaction: checkpoint });
+              this.checkpoints.set(id, checkpoint);
+            },
+          },
+          recordTool: async (value) => {
+            const receipt = readReceipt(value);
+            if (!receipt || receipt.runId !== run.id)
+              throw new DiagnosticFailure('io_failure', '无法保存工具执行回执');
+            await this.append(view, { toolReceipt: receipt });
+            this.rememberReceipt(id, receipt);
+          },
           saveNovelTask: async (value) => {
             cancel.signal.throwIfAborted();
             const saved = value && readNovelTask(value, view.messages);
@@ -335,6 +394,8 @@ export class RunManager {
         });
         this.states.delete(id);
         this.novelTasks.delete(id);
+        this.checkpoints.delete(id);
+        this.receipts.delete(id);
         this.sessionTrace(state.session, report)('session.deleted');
         this.uncertain.delete(id);
         this.changed(id);

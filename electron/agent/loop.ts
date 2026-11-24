@@ -9,9 +9,19 @@ import {
   type JsonObject,
   type UserMessage,
 } from '@earendil-works/pi-ai';
-import type { ModelProvider, ToolSpec, Turn } from './model.js';
+import type { AssistantTurn, ModelProvider, ToolSpec, Turn } from './model.js';
 import type { RunContext } from './runs.js';
 import type { ToolResult } from '../../shared/contracts.js';
+import { ActiveContext } from './active-context.js';
+import { contextOverflow, inputBudget, inputEstimate, prepareSessionHistory } from './context-budget.js';
+import {
+  callRef,
+  commitReceiptLimit,
+  observedCommit,
+  receiptReason,
+  type ToolReceipt,
+} from './tool-receipts.js';
+
 export interface LocalTool extends ToolSpec {
   execute: (args: Record<string, any>, ctx: RunContext) => Promise<unknown>;
   onResultSent?: (result: ToolResult, report: ReportDiagnostic) => void;
@@ -76,6 +86,9 @@ interface Candidate {
   executed?: boolean;
 }
 interface Round {
+  number: number;
+  answer?: AssistantTurn;
+  receipts: ToolReceipt[];
   started: number;
   report: ReportDiagnostic;
   candidates: Map<string, Candidate>;
@@ -89,7 +102,11 @@ function reject(candidate: Candidate, reason: string) {
 function commandOutcome(value: unknown) {
   const result = value as { code: number | null; timeout: boolean; truncated: boolean };
   return {
-    outcome: result.timeout ? 'timeout' : result.code === 0 ? 'ok' : 'failed',
+    outcome: result.timeout
+      ? ('timeout' as const)
+      : result.code === 0
+        ? ('ok' as const)
+        : ('failed' as const),
     reason: result.timeout ? 'command_timeout' : result.code === 0 ? undefined : 'command_failed',
     exitCode: result.code ?? undefined,
     timedOut: result.timeout,
@@ -113,8 +130,31 @@ export async function runAgent(
   tools: LocalTool[],
   budget: number | AgentBudget = defaultRoundLimit,
 ) {
-  const history: Turn[] = [...previous, { role: 'user', text: prompt }];
   const trace = diagnosticScope(safeReporter(ctx.diagnostic ?? noDiagnostic), { lane: 'agent' });
+  const maxOutput = () => (typeof budget === 'number' ? undefined : budget.outputTokens());
+  const spare =
+    inputBudget(provider, maxOutput()) - inputEstimate(system, [{ role: 'user', text: prompt }], tools);
+  if (spare < 0) throw contextOverflow();
+  const session = await prepareSessionHistory(
+    ctx.history,
+    provider,
+    spare,
+    ctx.signal,
+    diagnosticScope(trace, { lane: 'compaction' }),
+  );
+  const context = new ActiveContext(
+    system,
+    session.prelude,
+    [...previous, ...session.turns],
+    prompt,
+    tools,
+    provider.textHistoryInPrompt,
+  );
+  let history: Turn[] = [];
+  let finalAnswer: AssistantTurn | undefined;
+  let receiptFailure = false;
+  let projectionFailure: DiagnosticFailure | undefined;
+  let previousCompaction = 0;
   const registered = new Map(tools.map((tool) => [tool.name, tool]));
   const outbound: { candidate: Candidate; result: ToolResult; tool?: LocalTool }[] = [];
   let rounds = 0;
@@ -138,8 +178,19 @@ export async function runAgent(
     replay: 'never',
     async execute(id, params) {
       ctx.signal.throwIfAborted();
-      const call = active?.candidates.get(id);
+      const round = active;
+      const call = round?.candidates.get(id);
       const started = performance.now();
+      const receipt: ToolReceipt = {
+        runId: ctx.id,
+        round: round?.number ?? rounds,
+        callRef: callRef(id),
+        tool: tool.name,
+        outcome: 'ok',
+        commits: [],
+        commitCount: 0,
+      };
+      const report = call?.context ?? ctx.diagnostic;
       if (call) {
         call.executed = true;
         call.report('tool.started');
@@ -147,10 +198,32 @@ export async function runAgent(
       try {
         const value = await tool.execute(params as Record<string, unknown>, {
           ...ctx,
-          diagnostic: call?.context ?? ctx.diagnostic,
+          progress(value) {
+            context.setProgress(value);
+            ctx.progress(value);
+          },
+          diagnostic(event, fields) {
+            if (event === 'workspace.document.committed') {
+              const commit = observedCommit(fields);
+              if (commit) {
+                receipt.commitCount++;
+                if (receipt.commits.length < commitReceiptLimit) receipt.commits.push(commit);
+              }
+            }
+            report?.(event, fields);
+          },
         });
+        if (tool.name === 'run_command') {
+          const command = commandOutcome(value);
+          receipt.outcome = command.outcome;
+          receipt.reason = command.reason;
+          receipt.exitCode = command.exitCode;
+        }
+        if (tool.name === 'book_memory_remember' || tool.name === 'book_memory_forget')
+          receipt.conventionId = (value as { id?: string } | undefined)?.id;
         const payload = JSON.stringify({ ok: true, value } satisfies ToolResult);
         const oversized = payload.length > 120_000;
+        if (oversized) receipt.resultOmitted = true;
         call?.report('tool.finished', {
           transportOk: !oversized,
           elapsedMs: elapsed(started),
@@ -175,6 +248,14 @@ export async function runAgent(
         };
       } catch (e) {
         const reason = classified(e, ctx.signal);
+        receipt.outcome = receipt.commitCount
+          ? 'partial'
+          : reason === 'cancelled'
+            ? 'cancelled'
+            : reason === 'timeout'
+              ? 'timeout'
+              : 'failed';
+        receipt.reason = receiptReason(reason);
         call?.report('tool.finished', {
           reason: reason === 'unknown' ? 'tool_failed' : reason,
           outcome: reason === 'cancelled' ? 'cancelled' : 'failed',
@@ -194,6 +275,14 @@ export async function runAgent(
           details: undefined,
           isError: true,
         };
+      } finally {
+        round?.receipts.push(receipt);
+        try {
+          await ctx.recordTool?.(receipt);
+        } catch {
+          // The original action may have committed; do not let the loop retry it.
+          receiptFailure = true;
+        }
       }
     },
   }));
@@ -201,7 +290,13 @@ export async function runAgent(
     const number = ++rounds,
       spanId = randomUUID();
     const report = diagnosticScope(trace, { turn: number, spanId });
-    const round: Round = { started: performance.now(), report, candidates: new Map() };
+    const round: Round = {
+      number,
+      started: performance.now(),
+      report,
+      candidates: new Map(),
+      receipts: [],
+    };
     active = round;
     report('loop.round.started');
     const feed = createAssistantMessageEventStream();
@@ -217,11 +312,18 @@ export async function runAgent(
     };
     void (async () => {
       try {
+        const maxTokens = maxOutput();
+        const wire = context.fit(inputBudget(provider, maxTokens));
+        history = wire.history;
+        const stats = context.stats;
+        if (stats.removed + stats.reductions !== previousCompaction) {
+          previousCompaction = stats.removed + stats.reductions;
+          report('context.compacted', { count: stats.removed, omittedCount: stats.reductions });
+        }
         const answer = await provider.turn({
-          system,
-          history,
+          ...wire,
           tools,
-          maxTokens: typeof budget === 'number' ? undefined : budget.outputTokens(),
+          maxTokens,
           signal: ctx.signal,
           onText: ctx.text,
           diagnostic: report,
@@ -277,7 +379,8 @@ export async function runAgent(
             base.content.push({ type: 'toolCall', id: call.id, name: call.name, arguments: args });
         }
         if (badBatch) throw new DiagnosticFailure('invalid_call', '工具调用 ID 重复或数量超限');
-        history.push(answer);
+        round.answer = answer;
+        finalAnswer = answer;
         if (answer.text) base.content.unshift({ type: 'text', text: answer.text });
         base.stopReason = answer.calls.length ? 'toolUse' : 'stop';
       } catch (e) {
@@ -301,12 +404,14 @@ export async function runAgent(
         toolExecution: 'sequential',
         convertToLlm: (messages) => messages,
         async beforeToolCall({ toolCall }) {
+          if (receiptFailure) return { block: true, reason: '回执未保存；本轮不再执行工具' };
           const candidate = active?.candidates.get(toolCall.id);
           if (candidate?.parseFailure) return { block: true, reason: '工具参数不是完整的 JSON 对象' };
           if (!ctx.signal.aborted)
             candidate?.report('tool.validated', { fieldCount: candidate.fieldCount });
         },
         finishTurn({ message, toolResults }) {
+          const results: Extract<Turn, { role: 'tool' }>[] = [];
           for (const tool of toolResults) {
             const text = tool.content.find((block) => block.type === 'text')?.text ?? '';
             let detail: ToolResult;
@@ -316,7 +421,7 @@ export async function runAgent(
             } catch {
               detail = { ok: !tool.isError, ...(tool.isError ? { error: text } : { value: text }) };
             }
-            history.push({ role: 'tool', id: tool.toolCallId, result: detail });
+            results.push({ role: 'tool', id: tool.toolCallId, result: detail });
             const candidate = active?.candidates.get(tool.toolCallId);
             if (candidate) {
               if (!candidate.executed)
@@ -331,10 +436,20 @@ export async function runAgent(
           } else if (message.stopReason === 'error') {
             failure = active?.failure ?? 'provider_error';
             finish('failed', failure);
+          } else if (receiptFailure) {
+            finish('failed', 'io_failure', toolResults.length);
+            return { action: 'end' };
           } else if (rounds >= roundLimit() && toolResults.length) {
             finish('failed', 'iteration_limit', toolResults.length);
             return { action: 'end' };
           } else {
+            try {
+              if (active?.answer) context.append(active.answer, results, active.receipts);
+            } catch (error) {
+              projectionFailure = error instanceof DiagnosticFailure ? error : contextOverflow();
+              finish('failed', projectionFailure.diagnosticReason, toolResults.length);
+              return { action: 'end' };
+            }
             finish('ok', toolResults.length ? 'continue_tools' : 'complete', toolResults.length);
           }
         },
@@ -369,10 +484,13 @@ export async function runAgent(
     throw error;
   }
   ctx.signal.throwIfAborted();
+  if (receiptFailure)
+    throw new DiagnosticFailure('io_failure', '工具可能已执行，但回执无法保存；请先核对已落盘的文件');
+  if (projectionFailure) throw projectionFailure;
   const last = [...result].reverse().find((message) => message.role === 'assistant');
   if (last?.stopReason === 'error')
     throw new DiagnosticFailure(failure ?? 'provider_error', last.errorMessage ?? '模型请求失败');
   if (last?.stopReason === 'toolUse' && rounds >= roundLimit())
     throw new DiagnosticFailure('iteration_limit', '已达到模型往返上限；已提交的文件仍保留');
-  return history;
+  return finalAnswer ? [...history, finalAnswer] : history;
 }

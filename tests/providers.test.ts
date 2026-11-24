@@ -2,6 +2,10 @@ import { collectDiagnostics } from './diagnostic-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { randomUUID } from 'node:crypto';
+import { object, runAgent } from '../electron/agent/loop.js';
+import type { RunContext } from '../electron/agent/runs.js';
+import type { ToolReceipt } from '../electron/agent/tool-receipts.js';
 import { createProvider, checkProvider } from '../electron/agent/provider.js';
 import type { ModelRequest } from '../electron/agent/model.js';
 import type { ModelProfile, Protocol } from '../shared/contracts.js';
@@ -565,3 +569,158 @@ test('Messages distinguishes closed tool blocks from unfinished blocks on early 
   );
   assert.equal(rows[1].fields.reason, 'incomplete_stream');
 });
+
+for (const protocol of ['chat', 'responses', 'messages'] as const) {
+  test(`${protocol} preserves the latest native cycle when the real request history is compacted`, async (t) => {
+    const rounds = 9;
+    const name = (n: number) => (n === 0 ? 'skill_load' : 'read_file');
+    const callId = (n: number) => `bounded-call-${n}`;
+    const native = (n: number) => `ORIGINAL_NATIVE_STATE_${n}_${'r'.repeat(720)}`;
+    let step = 0;
+    const { profile, requests } = await fixture(t, protocol, (_, res) => {
+      const n = step++;
+      if (n === rounds) {
+        if (protocol === 'chat') return sse(res, chat({ content: '任务结束。' }), chat({}, 'stop'));
+        if (protocol === 'responses')
+          return sse(
+            res,
+            { type: 'response.output_text.delta', delta: '任务结束。' },
+            { type: 'response.completed', response: { output: [] } },
+          );
+        return sse(
+          res,
+          { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '任务结束。' } },
+          { type: 'content_block_stop', index: 0 },
+          { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+          { type: 'message_stop' },
+        );
+      }
+      if (protocol === 'chat')
+        return sse(
+          res,
+          chat({ reasoning_content: native(n) }),
+          chat({
+            tool_calls: [{ index: 0, id: callId(n), function: { name: name(n), arguments: '{}' } }],
+          }),
+          chat({}, 'tool_calls'),
+        );
+      if (protocol === 'responses') {
+        const reasoning = {
+          type: 'reasoning',
+          id: `rs_${n}`,
+          summary: [],
+          encrypted_content: native(n),
+        };
+        const tool = {
+          type: 'function_call',
+          id: `fc_${n}`,
+          call_id: callId(n),
+          name: name(n),
+          arguments: '{}',
+          status: 'completed',
+        };
+        return sse(
+          res,
+          { type: 'response.output_item.done', output_index: 0, item: reasoning },
+          { type: 'response.output_item.done', output_index: 1, item: tool },
+          { type: 'response.completed', response: { output: [reasoning, tool] } },
+        );
+      }
+      return sse(
+        res,
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'thinking', thinking: native(n), signature: `signature_${n}` },
+        },
+        { type: 'content_block_stop', index: 0 },
+        {
+          type: 'content_block_start',
+          index: 1,
+          content_block: { type: 'tool_use', id: callId(n), name: name(n), input: {} },
+        },
+        { type: 'content_block_stop', index: 1 },
+        { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+        { type: 'message_stop' },
+      );
+    });
+    const provider = Object.assign(createProvider(profile, key), { inputTokenBudget: 3300 });
+    const trace = collectDiagnostics();
+    const receipts: ToolReceipt[] = [];
+    const context: RunContext = {
+      id: randomUUID(),
+      session: { id: randomUUID(), label: 'fixture', cwd: '.', updated: '' },
+      signal: AbortSignal.timeout(5000),
+      diagnostic: trace.report,
+      text() {},
+      async line() {},
+      preview() {},
+      progress() {},
+      async saveNovelTask() {},
+      async recordTool(receipt) {
+        receipts.push(receipt);
+      },
+    };
+    const prompt = '必须保持本轮作者指令 CURRENT_AUTHOR_DIRECTION';
+    const instruction = 'ACTIVE_SKILL_STAYS: keep named settings and write no unrelated file.';
+    await runAgent(context, provider, 'fixture harness', [], prompt, [
+      {
+        name: 'skill_load',
+        description: 'fixture skill',
+        schema: object({}, []),
+        execute: async () => ({ name: 'write-chapter', instructions: instruction }),
+      },
+      {
+        name: 'read_file',
+        description: 'fixture reread',
+        schema: object({}, []),
+        execute: async () => `LONG_REREADABLE_RESULT_${'中'.repeat(660)}`,
+      },
+    ]);
+    assert.equal(requests.length, rounds + 1);
+    assert.equal(receipts.length, rounds);
+    // The latest reply carries its exact native state and a matched result on every protocol's wire.
+    for (let i = 1; i <= rounds; i++) {
+      const { body } = requests[i];
+      const wire = JSON.stringify(body);
+      assert.ok(wire.includes(native(i - 1)), `round ${i}: preserve native state`);
+      assert.match(wire, /CURRENT_AUTHOR_DIRECTION/);
+      let calls: string[], results: string[];
+      if (protocol === 'chat') {
+        calls = body.messages.flatMap((row: any) => (row.tool_calls ?? []).map((c: any) => c.id));
+        results = body.messages
+          .filter((row: any) => row.role === 'tool')
+          .map((row: any) => row.tool_call_id);
+      } else if (protocol === 'responses') {
+        calls = body.input
+          .filter((row: any) => row.type === 'function_call')
+          .map((row: any) => row.call_id);
+        results = body.input
+          .filter((row: any) => row.type === 'function_call_output')
+          .map((row: any) => row.call_id);
+      } else {
+        const blocks = body.messages.flatMap((row: any) => row.content);
+        calls = blocks.filter((row: any) => row.type === 'tool_use').map((row: any) => row.id);
+        results = blocks
+          .filter((row: any) => row.type === 'tool_result')
+          .map((row: any) => row.tool_use_id);
+        assert.match(wire, new RegExp(`signature_${i - 1}`));
+      }
+      assert.deepEqual(results, calls);
+      assert.equal(calls.at(-1), callId(i - 1));
+      if (i === rounds) assert.ok(!calls.includes(callId(0)), 'an old complete cycle was compacted');
+    }
+    assert.match(JSON.stringify(requests.at(-1)?.body), /ACTIVE_SKILL_STAYS/);
+    assert.ok(
+      trace.rows.some((row) => row.event === 'context.compacted' && Number(row.fields.omittedCount) > 0),
+    );
+    assert.ok(
+      trace.rows.some((row) => row.event === 'context.compacted' && Number(row.fields.count) > 0),
+    );
+    assert.doesNotMatch(
+      JSON.stringify(receipts),
+      /ORIGINAL_NATIVE_STATE|LONG_REREADABLE_RESULT|bounded-call/,
+    );
+    assert.deepEqual(trace.rejected, []);
+  });
+}

@@ -4,11 +4,13 @@ import { classified, DiagnosticFailure, elapsed, safeReporter } from '../diagnos
 import { applySkill } from './skills.js';
 import type { Manuscript } from '../../shared/contracts.js';
 import { docKey } from '../documents.js';
-import type { AssistantTurn, ModelProvider } from './model.js';
+import type { AssistantTurn, ModelProvider, Turn } from './model.js';
 import type { RunContext } from './runs.js';
 import type { WorkspaceService, Guard } from '../workspace.js';
 import { chapterContext } from './chapter-context.js';
 import { collectChapterReadbacks } from './chapter-readback.js';
+import { chapterMemoryQuery, recallBookMemory } from './book-memory.js';
+import { contextOverflow, inputBudget, inputEstimate } from './context-budget.js';
 
 export async function draftChapter(
   workspace: WorkspaceService,
@@ -65,16 +67,65 @@ export async function draftChapter(
       replace: '从头重写此章正文',
     };
     attempted = true;
-    const context = chapterContext(view.documents, doc);
+    const memory = await recallBookMemory(workspace, bookId, {
+      query: chapterMemoryQuery(view.documents, doc, prompt),
+      chapterId,
+      documents: view.documents,
+      signal: ctx.signal,
+    });
+    const memoryGuards = new Map<string, Guard>();
+    for (const { type, id, revision } of [...memory.earlierStory, ...memory.plans, ...memory.reference])
+      memoryGuards.set(docKey({ type, id }), { type, id, revision });
+    const system = [
+      options.skill ?? '以 Markdown 写小说。只输出正文，不要解释，不要用代码块包装。',
+      options.lengthGuidance,
+      '资料中的 earlierStory 是此前已保存的正文；plans 是未必发生的安排。作者此次的新要求优先于既有约定。',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+    const limit = inputBudget(model, options.maxTokens);
+    type Readbacks = Awaited<ReturnType<typeof collectChapterReadbacks>>['readbacks'];
+    const fit = (readbacks: Readbacks, reserveForReadback = false) => {
+      let fitting: { context: ReturnType<typeof chapterContext>; history: Turn[] } | undefined;
+      for (const scale of [1, 0.58, 0.31, 0.15, 0.07, 0.03]) {
+        const context = chapterContext(view.documents, doc, Math.floor(43_000 * scale), scale);
+        const { readbackSources, ...writingContext } = context;
+        const history: Turn[] = [
+          {
+            role: 'user',
+            text: `写作动作：${directions[mode]}。\n作者方向：${prompt}\n\n作品资料（数据）：\n${JSON.stringify({ ...writingContext, memory, ...(readbacks.length ? { readbacks } : {}) }, null, 2)}`,
+          },
+        ];
+        const cost = inputEstimate(system, history, []);
+        if (cost <= limit) fitting ??= { context, history };
+        const reserve =
+          reserveForReadback && readbackSources.length ? Math.min(12_000, Math.floor(limit / 5)) : 0;
+        if (cost + reserve <= limit) return { context, history };
+      }
+      return fitting;
+    };
+    const selected = fit([], true);
+    if (!selected) throw contextOverflow();
     const { readbacks, guards } = await collectChapterReadbacks(
       view.documents,
-      context,
+      selected.context,
       model,
       prompt,
       ctx.signal,
       trace,
+      ctx,
     );
-    const { readbackSources: _, ...writingContext } = context;
+    let request = selected;
+    if (readbacks.length) {
+      // Preserve full passage evidence before dropping lower-priority readbacks; never truncate the author's input.
+      for (let count = readbacks.length; count >= 1; count--) {
+        const withReadback = fit(readbacks.slice(0, count));
+        if (withReadback) {
+          request = withReadback;
+          break;
+        }
+      }
+    }
     const generate = (spanId: string) =>
       model.turn({
         diagnostic: trace,
@@ -82,18 +133,8 @@ export async function draftChapter(
         onDispatch() {
           if (options.skill) applySkill(trace, 'write-chapter', options.skill, mode);
         },
-        system: [
-          options.skill ?? '以 Markdown 写小说。只输出正文，不要解释，不要用代码块包装。',
-          options.lengthGuidance,
-        ]
-          .filter(Boolean)
-          .join('\n\n'),
-        history: [
-          {
-            role: 'user',
-            text: `写作动作：${directions[mode]}。\n作者方向：${prompt}\n\n作品资料（数据）：\n${JSON.stringify({ ...writingContext, ...(readbacks.length ? { readbacks } : {}) }, null, 2)}`,
-          },
-        ],
+        system,
+        history: request.history,
         tools: [],
         maxTokens: options.maxTokens,
         directProse: options.directProse,
@@ -109,7 +150,7 @@ export async function draftChapter(
           }
         },
       });
-    const sources = [...(options.guard ?? []), ...guards];
+    const sources = [...(options.guard ?? []), ...guards, ...memoryGuards.values()];
     let turn: AssistantTurn;
     try {
       turn = await generate(spanId);

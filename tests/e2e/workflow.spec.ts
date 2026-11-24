@@ -315,9 +315,7 @@ async function openComposer(page: Page, resume = false) {
   await button(page, 'Harness').click();
   if (resume)
     await panel(page)
-      .getByRole('button', { name: /奥德赛/ })
-      .filter({ hasText: '奥德赛' })
-      .first()
+      .getByRole('button', { name: new RegExp(`^${faultPrompt.slice(0, 20)}`) })
       .click();
   else await panel(page).getByRole('button', { name: '当前小说会话', exact: true }).click();
   await expect(panel(page).getByLabel('写作动作')).toHaveCount(0);

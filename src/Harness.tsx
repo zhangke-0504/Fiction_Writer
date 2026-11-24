@@ -47,7 +47,7 @@ export function Harness({
   open: boolean;
   close: () => void;
   view: RuntimeView;
-  bookId?: string;
+  bookId: string;
   chapter?: ActiveChapter;
   profiles: ModelProfile[];
   settings: () => void;
@@ -65,14 +65,14 @@ export function Harness({
     [busy, setBusy] = useState(false);
   const feed = useRef<HTMLDivElement>(null),
     sticky = useRef(true);
-  const current = view.sessions.find((s) => s.session.id === selectedId);
-  const rows = [...view.sessions]
+  const sessions = view.sessions.filter((s) => s.session.bookId === bookId);
+  const current = sessions.find((s) => s.session.id === selectedId);
+  const rows = sessions
     .sort((a, b) => b.session.updated.localeCompare(a.session.updated))
     .filter((s) => norm(`${s.session.label} ${s.session.cwd}`).includes(norm(query)));
   const running = current?.run?.status === 'running',
     profile = profiles.find((p) => p.id === profileId) ?? profiles[0];
-  const hasBook = !!current?.session.bookId,
-    hasChapter = !!chapter && chapter.bookId === current?.session.bookId;
+  const hasChapter = !!chapter && chapter.bookId === bookId;
   useEffect(() => {
     if (open && !list && sticky.current && feed.current)
       feed.current.scrollTop = feed.current.scrollHeight;
@@ -99,12 +99,9 @@ export function Harness({
     setAttachments([]);
     sticky.current = true;
   }
-  async function create(chooseDirectory: boolean) {
+  async function create() {
     await perform(async () => {
-      const useBook = !chooseDirectory && !!bookId;
-      const cwd = useBook ? undefined : (await api.request<string[]>('picker.directory'))[0];
-      if (!useBook && !cwd) return;
-      const created = await api.request<Session>('session.create', useBook ? { bookId } : { cwd });
+      const created = await api.request<Session>('session.create', { bookId });
       selectSession(created.id);
     });
   }
@@ -161,7 +158,7 @@ export function Harness({
             className="icon-button"
             title="新建会话"
             aria-label="新建会话"
-            onClick={() => void create(false)}
+            onClick={() => void create()}
             disabled={busy}
           >
             <Icon name="plus" />
@@ -184,16 +181,10 @@ export function Harness({
             />
           </label>
           <div className="session-actions">
-            <button className="primary" onClick={() => void create(false)} disabled={busy}>
+            <button className="primary" onClick={() => void create()} disabled={busy}>
               <Icon name="plus" size={15} />
-              {bookId ? '当前小说会话' : '新建目录会话'}
+              当前小说会话
             </button>
-            {bookId && (
-              <button onClick={() => void create(true)} disabled={busy}>
-                <Icon name="folder" size={15} />
-                选择目录
-              </button>
-            )}
           </div>
           {rows.map(({ session, run }) => (
             <div className="session-row" key={session.id}>
@@ -214,9 +205,7 @@ export function Harness({
             </div>
           ))}
           {!rows.length && (
-            <div className="empty-mini">
-              {query ? '没有匹配的会话' : '还没有会话。为小说或本地目录新建一个会话。'}
-            </div>
+            <div className="empty-mini">{query ? '没有匹配的会话' : '这本小说还没有会话。'}</div>
           )}
           <ErrorText text={error || backendError} />
           <DiagnosticId id={failureId} />
@@ -266,12 +255,8 @@ export function Harness({
                 <span className="book-mark">
                   <Icon name="spark" size={21} />
                 </span>
-                <h3>{hasBook ? '和作品一起思考' : '在本地目录开始工作'}</h3>
-                <p>
-                  {hasBook
-                    ? '直接说你想做什么：讨论故事、维护资料、写一章或写整本。'
-                    : 'Agent 可以读取或编辑工作目录中的文件，并运行本地开发命令。'}
-                </p>
+                <h3>和作品一起思考</h3>
+                <p>直接说你想做什么：讨论故事、维护资料、写一章或写整本。</p>
               </div>
             )}
             {progress && (
@@ -330,7 +315,7 @@ export function Harness({
               rows={3}
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              placeholder={hasBook ? '和 Agent 讨论当前作品…' : '说明要在此目录完成的任务…'}
+              placeholder="和 Agent 讨论当前作品…"
             />
             <div className="composer-options">
               <button

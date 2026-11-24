@@ -411,6 +411,7 @@ export function createProvider(
   return {
     effort: configuration.used,
     extendedOutputTokens,
+    textHistoryInPrompt: profile.protocol === 'chat' && /^deepseek-v4-/i.test(profile.model),
     async turn(request) {
       const spanId = request.spanId ?? randomUUID();
       const report = diagnosticScope(safeReporter(request.diagnostic ?? noDiagnostic), {

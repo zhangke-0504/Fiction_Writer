@@ -285,6 +285,42 @@ export class WorkspaceService {
       this.changed(bookId, [ref], operation);
     });
   }
+  /** The one book-local memory sidecar shares the book's write/delete queue. */
+  updateBookMemory<T>(
+    bookId: string,
+    edit: (source?: string) => { value: T; replacement?: string },
+    options: { signal?: AbortSignal; bestEffort?: boolean } = {},
+  ): Promise<T> {
+    return this.enqueue(bookId, async () => {
+      options.signal?.throwIfAborted();
+      const root = await this.checkedRoot(bookId);
+      const path = join(root, '.fiction-writer', 'memory.json');
+      const limit = 2_000_000;
+      let source: string | undefined;
+      try {
+        await this.checkFileParent(root, path);
+        const file = await fs.lstat(path);
+        if (!file.isFile() || file.isSymbolicLink() || file.size > limit)
+          throw new WorkspaceError('作品记忆文件不可用');
+        source = await fs.readFile(path, { encoding: 'utf8', signal: options.signal });
+        if (Buffer.byteLength(source) > limit) throw new WorkspaceError('作品记忆超过限制');
+      } catch (error) {
+        if (!absent(error)) throw error;
+      }
+      const { value, replacement } = edit(source);
+      if (replacement !== undefined && replacement !== source) {
+        try {
+          if (Buffer.byteLength(replacement) > limit) throw new WorkspaceError('作品记忆超过限制');
+          await this.checkFileParent(root, path, true);
+          await this.replace(path, replacement, options.signal);
+        } catch (error) {
+          options.signal?.throwIfAborted();
+          if (!options.bestEffort) throw error;
+        }
+      }
+      return value;
+    });
+  }
   private async revision(root: string, bookId: string, ref: DocRef) {
     try {
       return digest(await this.readBytes(root, docPath(root, bookId, ref)));
@@ -601,7 +637,8 @@ export class WorkspaceService {
     try {
       watcher = watch(this.canonicalRoot, { recursive: true, persistent: false }, (_type, name) => {
         if (name?.endsWith('.tmp') || name?.startsWith('.pending-')) return;
-        const id = name?.split(/[\\/]/)[0];
+        const [id, folder] = name?.split(/[\\/]/) ?? [];
+        if (folder === '.fiction-writer') return;
         if (id && !isId(id)) return;
         books.add(id || '');
         clearTimeout(debounce);

@@ -50,12 +50,14 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
   await mkdir(dir, { recursive: true });
   const text = join(dir, 'info.md');
   await writeFile(text, '最初版本', 'utf8');
-  const app = await electron.launch({
-    args: ['.'],
-    env: { ...process.env, FW_E2E: '1', FW_TEST_ROOT: root },
-  });
+  const launch = () =>
+    electron.launch({
+      args: ['.'],
+      env: { ...process.env, FW_E2E: '1', FW_TEST_ROOT: root },
+    });
+  let app = await launch();
   try {
-    const page = await app.firstWindow();
+    let page = await app.firstWindow();
     const request = <T>(method: string, args?: unknown) =>
       page.evaluate(([m, a]) => window.fw.request<T>(m, a), [method, args] as const);
     await page.getByRole('button', { name: '设置', exact: true }).click();
@@ -83,17 +85,26 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
     await page.reload();
     profiles = await request('profiles.list');
     expect(profiles).toHaveLength(2);
-    await app.evaluate(({ dialog }, file) => {
-      dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [file] });
-    }, dir);
-    await page.getByRole('button', { name: 'Harness', exact: true }).click();
-    const panel = page.getByRole('complementary', { name: 'Harness 面板' });
-    await panel.getByRole('button', { name: '新建目录会话' }).click();
+    const first = await request<{ id: string }>('book.create', {
+      title: '配置信息 A',
+      summary: '书 A',
+    });
+    const second = await request<{ id: string }>('book.create', {
+      title: '配置信息 B',
+      summary: '书 B',
+    });
+    const unrelated = await request<Session>('session.create', { cwd: dir });
+    const enter = async (title: string) => {
+      await page.getByRole('button', { name: `编辑 ${title}`, exact: true }).click();
+      await page.getByRole('button', { name: 'Harness', exact: true }).click();
+      return page.getByRole('complementary', { name: 'Harness 面板' });
+    };
+    const panel = await enter('配置信息 A');
+    await panel.getByRole('button', { name: '当前小说会话' }).click();
     await expect(panel.getByLabel('模型')).toBeVisible();
-    const id = (await request<RuntimeView>('runtime.snapshot')).sessions.find(
-      (s) => s.session.cwd === dir,
-    )?.session.id;
-    expect(id).toBeDefined();
+    const id = (await request<RuntimeView>('runtime.snapshot', { bookId: first.id })).sessions[0].session
+      .id;
+    expect(id).not.toBe(unrelated.id);
     await expect(
       request('session.start', {
         id,
@@ -122,9 +133,7 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
     expect(
       requests[0].body.tools.map((tool: { function: { name: string } }) => tool.function.name),
     ).toContain('read_file');
-    expect(JSON.stringify(requests[0].body.tools)).not.toMatch(
-      /skill_search|skill_load|book_get_context/,
-    );
+    expect(JSON.stringify(requests[0].body.tools)).toMatch(/skill_search|skill_load|book_get_context/);
     await expect(panel.getByLabel('写作动作')).toHaveCount(0);
     expect(JSON.stringify(requests[0].body)).toContain('最初版本');
     expect(requests[0].body.reasoning_effort).toBeUndefined();
@@ -140,6 +149,44 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
     const disk = await readFile(join(root, 'state', 'sessions', `${id}.jsonl`), 'utf8');
     expect(disk).not.toContain('native state');
     expect(disk).not.toContain(key);
+    const expectComplete = (bookId: string, count: number) =>
+      expect
+        .poll(async () => {
+          const session = (await request<RuntimeView>('runtime.snapshot', { bookId })).sessions[0];
+          return (
+            session && [session.run?.status, session.messages.filter((m) => m.role === 'user').length]
+          );
+        })
+        .toEqual(['completed', count]);
+    await expectComplete(first.id, 2);
+    await page.getByRole('button', { name: '返回书库' }).click();
+    const secondPanel = await enter('配置信息 B');
+    await expect(secondPanel.getByText('使用我的参考文件', { exact: true })).toHaveCount(0);
+    await expect(secondPanel.getByText(unrelated.label, { exact: true })).toHaveCount(0);
+    await secondPanel.getByRole('button', { name: '当前小说会话' }).click();
+    await secondPanel.getByLabel('模型').selectOption(a.id);
+    await secondPanel.getByLabel('给 Agent 的消息').fill('用同一配置处理另一本书');
+    await secondPanel.getByRole('button', { name: '发送' }).click();
+    await expectComplete(second.id, 1);
+    expect(requests[2].url).toBe('/one/v1/chat/completions');
+    expect(JSON.stringify(requests[2].body)).not.toContain('最初版本');
+    expect(JSON.stringify(requests[2].body)).not.toContain('使用我的参考文件');
+
+    await app.close();
+    app = await launch();
+    page = await app.firstWindow();
+    const reopened = await enter('配置信息 A');
+    await reopened.getByRole('button', { name: /^使用我的参考文件/ }).click();
+    await expect(reopened.getByRole('button', { name: '删除会话 使用我的参考文件' })).toBeVisible();
+    await reopened.getByLabel('模型').selectOption(a.id);
+    await reopened.getByLabel('给 Agent 的消息').fill('重启后仍使用同一个密钥');
+    await reopened.getByRole('button', { name: '发送' }).click();
+    await expectComplete(first.id, 3);
+    expect(requests[3].url).toBe('/one/v1/chat/completions');
+    for (const book of [first, second]) {
+      const memory = join(root, 'library', book.id, '.fiction-writer', 'memory.json');
+      expect(await readFile(memory, 'utf8')).not.toContain(key);
+    }
   } finally {
     release();
     await app.close();

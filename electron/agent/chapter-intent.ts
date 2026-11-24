@@ -44,3 +44,22 @@ export function rewriteTarget(prompt: string, chapters: Manuscript[], selected?:
   );
   return matches.length === 1 ? matches[0].id : undefined;
 }
+
+/** Use the earliest referenced chapter if ambiguous, so recall cannot add later prose. */
+export function memoryChapterTarget(prompt: string, chapters: Manuscript[], selected?: string) {
+  const text = prompt.normalize('NFKC');
+  const orders = new Set(
+    [...text.matchAll(/第\s*[\d零一二三四五六七八九十两]+\s*章|\bchapter\s+\d+\b/giu)].map(([value]) =>
+      chapterOrder(value),
+    ),
+  );
+  return (
+    chapters.find(
+      (chapter) =>
+        orders.has(chapter.fields.order ?? -1) ||
+        (chapter.fields.title &&
+          chapter.fields.title.length >= 3 &&
+          text.includes(chapter.fields.title.normalize('NFKC'))),
+    )?.id ?? selected
+  );
+}

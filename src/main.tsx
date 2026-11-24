@@ -15,7 +15,8 @@ function App() {
     [settings, setSettings] = useState(false);
   const [chapter, setChapter] = useState<ActiveChapter>(),
     [profiles, setProfiles] = useState<ModelProfile[]>([]);
-  const { view, refresh, error } = useRuntime();
+  const editorBook = settings ? undefined : bookId;
+  const { view, refresh, error } = useRuntime(editorBook);
   const drafts = useRef<Drafts>(new Map());
   useEffect(() => {
     api.diagnostic('ui.ready', {});
@@ -35,9 +36,9 @@ function App() {
     });
   }, [settings, bookId]);
   useEffect(() => {
-    if (open)
-      api.diagnostic('ui.section', { section: 'harness', workspaceRef: settings ? undefined : bookId });
-  }, [open, settings, bookId]);
+    if (open && editorBook)
+      api.diagnostic('ui.section', { section: 'harness', workspaceRef: editorBook });
+  }, [open, editorBook]);
   const preview = view.sessions.find((s) => s.run?.preview?.bookId === bookId)?.run?.preview;
   const loadProfiles = () => {
     void api.request<ModelProfile[]>('profiles.list').then(setProfiles, () => {});
@@ -49,10 +50,16 @@ function App() {
     });
   }, []);
   const back = () => {
+    setOpen(false);
     setBook(undefined);
     setSettings(false);
   };
+  const showSettings = () => {
+    setOpen(false);
+    setSettings(true);
+  };
   useEffect(() => {
+    if (!editorBook) return;
     const toggle = (event: KeyboardEvent) => {
       if (event.ctrlKey && event.altKey && (event.code === 'KeyI' || event.key.toLowerCase() === 'i')) {
         event.preventDefault();
@@ -61,7 +68,7 @@ function App() {
     };
     window.addEventListener('keydown', toggle);
     return () => window.removeEventListener('keydown', toggle);
-  }, []);
+  }, [editorBook]);
   return (
     <div className="app">
       <header className="topbar">
@@ -76,24 +83,26 @@ function App() {
             <Icon name="book" />
             书库
           </button>
-          <button className={settings ? 'active' : ''} onClick={() => setSettings(true)}>
+          <button className={settings ? 'active' : ''} onClick={showSettings}>
             <Icon name="sliders" />
             设置
           </button>
         </nav>
         <div className="topbar-end">
-          <button
-            className={open ? 'pressed' : ''}
-            title="Ctrl+Alt+I"
-            aria-pressed={open}
-            onClick={() => setOpen((value) => !value)}
-          >
-            <Icon name="chat" />
-            Harness
-          </button>
+          {editorBook && (
+            <button
+              className={open ? 'pressed' : ''}
+              title="Ctrl+Alt+I"
+              aria-pressed={open}
+              onClick={() => setOpen((value) => !value)}
+            >
+              <Icon name="chat" />
+              Harness
+            </button>
+          )}
         </div>
       </header>
-      <div className={`desktop-grid ${open ? 'with-harness' : ''}`}>
+      <div className={`desktop-grid ${open && editorBook ? 'with-harness' : ''}`}>
         <main>
           {settings ? (
             <Settings profiles={profiles} refresh={loadProfiles} />
@@ -108,19 +117,28 @@ function App() {
               onChapter={setChapter}
             />
           ) : (
-            <Library refresh={refresh} open={setBook} />
+            <Library
+              refresh={refresh}
+              open={(id) => {
+                setOpen(false);
+                setBook(id);
+              }}
+            />
           )}
         </main>
-        <Harness
-          open={open}
-          close={() => setOpen(false)}
-          view={view}
-          bookId={settings ? undefined : bookId}
-          chapter={chapter}
-          profiles={profiles}
-          settings={() => setSettings(true)}
-          backendError={error}
-        />
+        {editorBook && (
+          <Harness
+            key={editorBook}
+            open={open}
+            close={() => setOpen(false)}
+            view={view}
+            bookId={editorBook}
+            chapter={chapter}
+            profiles={profiles}
+            settings={showSettings}
+            backendError={error}
+          />
+        )}
       </div>
     </div>
   );

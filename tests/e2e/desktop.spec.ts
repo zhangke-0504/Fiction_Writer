@@ -157,31 +157,40 @@ test('the same run stays live across books and a page reload; buffers stay separ
     await app.close();
   }
 });
-test('the keyboard opens the docked Harness and history stays with the session', async ({}, testInfo) => {
+test('only the editor opens Harness, and navigating resets its panel selection', async ({}, testInfo) => {
   const app = await electron.launch({
     args: ['.'],
     env: { ...process.env, FW_E2E: '1', FW_TEST_ROOT: testInfo.outputPath('app') },
   });
   try {
     const page = await app.firstWindow();
+    const toggle = page.getByRole('button', { name: 'Harness', exact: true });
+    const panel = page.getByRole('complementary', { name: 'Harness 面板' });
+    const outsideEditor = async () => {
+      await page.keyboard.press('Control+Alt+i');
+      await expect(toggle).toHaveCount(0);
+      await expect(panel).toHaveCount(0);
+    };
+    await outsideEditor();
     await createNovel(page, '会话作品');
     await page.getByRole('button', { name: '编辑 会话作品' }).click();
-    const panel = page.getByRole('complementary', { name: 'Harness 面板' });
     await page.keyboard.press('Control+Alt+i');
     await expect(panel).toBeVisible();
     await panel.getByRole('button', { name: '当前小说会话' }).click();
     await expect(panel.getByRole('textbox', { name: '给 Agent 的消息' })).toBeVisible();
     await expect(panel.getByLabel('思考等级')).toHaveValue('high');
-    await panel.getByRole('button', { name: '关闭 Harness' }).click();
+    await page.getByRole('button', { name: '设置', exact: true }).click();
+    await outsideEditor();
+    await page.getByRole('button', { name: '书库', exact: true }).click();
+    await outsideEditor();
+    await page.getByRole('button', { name: '编辑 会话作品' }).click();
     await expect(panel).toBeHidden();
-    await page.getByRole('button', { name: '返回书库' }).click();
-    await page.getByRole('button', { name: 'Harness', exact: true }).click();
-    await expect(panel.getByRole('textbox', { name: '给 Agent 的消息' })).toBeVisible();
-    await panel.getByRole('button', { name: 'Session 历史' }).click();
-    await panel.getByLabel('查找会话').fill('会话作品');
-    await expect(panel.getByRole('button', { name: '删除会话 会话作品' })).toBeVisible();
-    await panel.getByRole('button', { name: '删除会话 会话作品' }).click();
-    await expect(panel.getByRole('button', { name: '删除会话 会话作品' })).toHaveCount(0);
+    await toggle.click();
+    await panel.getByLabel('查找会话').fill('新会话');
+    const remove = panel.getByRole('button', { name: '删除会话 新会话', exact: true });
+    await expect(remove).toBeVisible();
+    await remove.click();
+    await expect(remove).toHaveCount(0);
   } finally {
     await app.close();
   }
