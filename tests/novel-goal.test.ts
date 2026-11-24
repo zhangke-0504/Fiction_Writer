@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { NovelTools } from '../electron/agent/novel-tools.js';
-import { runAgent } from '../electron/agent/loop.js';
+import { defaultRoundLimit, runAgent } from '../electron/agent/loop.js';
 import { RunManager } from '../electron/agent/runs.js';
 import { ScriptedProvider, type Script } from '../electron/agent/scripted.js';
 import { SkillCatalog } from '../electron/agent/skills.js';
@@ -265,17 +265,132 @@ test('resuming cannot silently recreate a chapter that disappeared from the save
   await assert.rejects(f.workspace.readDocument(f.id, { type: 'chapter', id: 'three' }));
 });
 
-test('chapter numbers extend but do not remove the model round limit', async (t) => {
+test('a registered chapter goal uses the same model round limit', async (t) => {
   const f = await fixture(t, 2);
-  const repeat = (i: number) => () => tool(`repeat-${i}`, 'book_get_context', { index: 'chapters' });
+  let repeatedRounds = 0;
+  const repeat = (i: number) => () => {
+    repeatedRounds++;
+    return tool(`repeat-${i}`, 'book_get_context', { index: 'chapters' });
+  };
   const result = await run(f, '写3章完整小说', [
     activate,
     () => goal('register', chapterIds),
-    ...Array.from({ length: 25 }, (_, i) => repeat(i)),
+    ...Array.from({ length: defaultRoundLimit - 2 }, (_, i) => repeat(i)),
     () => {
-      throw new Error('must not reach round 28');
+      throw new Error('must not exceed the shared round limit');
     },
   ]);
+  assert.equal(repeatedRounds + 2, defaultRoundLimit);
   assert.equal(result.status, 'failed');
   assert.match(result.error ?? '', /往返上限/);
+});
+
+test('the same whole-book Run can fill a required note and retry the blocked chapter without a stage machine', async (t) => {
+  const f = await fixture(t, 2);
+  const subject = { type: 'subject' as const, id: 'navigator' };
+  assert.equal(
+    (
+      await f.workspace.writeChanges(f.id, [
+        { ...subject, expect: null, fields: { name: '领航员', kind: 'character' }, body: '待补' },
+      ])
+    ).error,
+    undefined,
+  );
+  const draft = (id: string) =>
+    tool(id, 'book_generate_chapter', { mode: 'draft', chapterId: 'three', subjectIds: [subject.id] });
+  const result = await run(f, '写3章完整小说，保留旧稿并补领航员的说明', [
+    activate,
+    () => goal('register', chapterIds),
+    () => draft('missing-note'),
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /context_required.*navigator/s);
+      return tool('fill-note', 'book_generate_assets', {
+        kind: 'subject',
+        action: 'fill',
+        targets: [{ id: subject.id }],
+      });
+    },
+    () =>
+      tool('candidate', 'submit_story_descriptions', {
+        items: [{ id: subject.id, body: '## 稳定设定\n潮差超过两尺时不离港。CONTINUITY_FIXTURE' }],
+      }),
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"ok":true/);
+      assert.doesNotMatch(JSON.stringify(history.at(-1)), /CONTINUITY_FIXTURE/);
+      return draft('after-fill');
+    },
+    ({ history, tools }) => {
+      assert.deepEqual(tools, []);
+      assert.match(JSON.stringify(history), /CONTINUITY_FIXTURE/);
+      return text('等潮水平缓下来，他们才驶出海湾。');
+    },
+    () => goal('check'),
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"complete":true/);
+      return text('完成。');
+    },
+  ]);
+  assert.equal(result.status, 'completed', result.error);
+  assert.equal(
+    (await f.workspace.readDocument(f.id, { type: 'chapter', id: 'one' })).body,
+    '作者原稿 1',
+  );
+});
+
+test('an interrupted goal resumes from the saved opening cards without rewriting them', async (t) => {
+  let f = await fixture(t, 0);
+  const letter = await f.workspace.readDocument(f.id, { type: 'subject', id: 'letter' });
+  const clue = await f.workspace.readDocument(f.id, { type: 'clue', id: 'return' });
+  const premise = '只有掌灯者能辨认旧信上的刻痕';
+  const secret = '真正的信使是藏在船舱里的王子';
+  const changes = await f.workspace.writeChanges(f.id, [
+    { ...letter, expect: letter.revision, body: `## 稳定设定\n掌灯者需要人证。${premise}。` },
+    {
+      ...clue,
+      expect: clue.revision,
+      body: `## 可见线索\n来信由人证交给掌灯者。\n\n## 回收真相\n回收时再问「人证」。${premise}。\n揭示事实：${secret}。`,
+    },
+  ]);
+  assert.equal(changes.error, undefined);
+  const initial = (await f.workspace.readAll(f.id)).documents.filter(
+    (d) => d.type === 'clue' || d.type === 'subject',
+  );
+  const previous = await run(f, '写3章完整小说', [
+    activate,
+    () => goal('register', chapterIds),
+    () => text('首章准备不通过，已停止。'),
+  ]);
+  assert.equal(previous.status, 'failed');
+  assert.equal(previous.progress?.done, 0);
+  f = await reboot(f);
+  const gen = (chapterId: string) =>
+    tool('draft-' + chapterId, 'book_generate_chapter', { mode: 'draft', chapterId });
+  const actual = await run(f, '继续', [
+    activate,
+    () => resume(),
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"done":0/);
+      return gen('one');
+    },
+    ({ history, tools }) => {
+      assert.deepEqual(tools, []);
+      assert.match(JSON.stringify(history), new RegExp(premise));
+      assert.doesNotMatch(JSON.stringify(history), new RegExp(secret));
+      return text('掌灯者接过来信。');
+    },
+    () => gen('two'),
+    () => text('船绕过雨幕。'),
+    () => gen('three'),
+    ({ history }) => {
+      assert.match(JSON.stringify(history), new RegExp(secret));
+      return text('王子以真名接过来信。');
+    },
+    () => goal('check'),
+    () => text('已写完三章。'),
+  ]);
+  assert.equal(actual.status, 'completed', actual.error);
+  assert.deepEqual(
+    (await f.workspace.readAll(f.id)).documents.filter((d) => d.type === 'clue' || d.type === 'subject'),
+    initial,
+  );
 });

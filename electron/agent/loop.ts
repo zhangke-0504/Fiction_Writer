@@ -116,7 +116,7 @@ function commandOutcome(value: unknown) {
   };
 }
 
-export const defaultRoundLimit = 24;
+export const defaultRoundLimit = 200;
 interface AgentBudget {
   roundLimit: () => number;
   outputTokens: () => number | undefined;

@@ -8,6 +8,7 @@ import type { RunContext } from '../electron/agent/runs.js';
 import type { ToolReceipt } from '../electron/agent/tool-receipts.js';
 import { createProvider, checkProvider } from '../electron/agent/provider.js';
 import type { ModelRequest } from '../electron/agent/model.js';
+import { buildWritingRequest } from '../electron/agent/writing-request.js';
 import type { ModelProfile, Protocol } from '../shared/contracts.js';
 const key = 'synthetic-only-secret-fixture';
 async function fixture(
@@ -724,3 +725,70 @@ for (const protocol of ['chat', 'responses', 'messages'] as const) {
     assert.deepEqual(trace.rejected, []);
   });
 }
+
+for (const protocol of ['chat', 'responses', 'messages'] as const)
+  test(`isolated asset candidates use the existing ${protocol} tool result protocol`, async (t) => {
+    const items = [{ id: 'bell', body: '## 稳定设定\n裂开的铜铃。' }];
+    const args = JSON.stringify({ items });
+    const fn = 'submit_story_descriptions';
+    const { profile, requests } = await fixture(t, protocol, (_body, res) => {
+      if (protocol === 'chat')
+        sse(
+          res,
+          chat({
+            tool_calls: [{ index: 0, id: 'call_asset', function: { name: fn, arguments: args } }],
+          }),
+          chat({}, 'tool_calls'),
+        );
+      else if (protocol === 'responses') {
+        const item = {
+          type: 'function_call',
+          id: 'fc_asset',
+          call_id: 'call_asset',
+          name: fn,
+          arguments: args,
+          status: 'completed',
+        };
+        sse(
+          res,
+          { type: 'response.output_item.done', output_index: 0, item },
+          { type: 'response.completed', response: { output: [item] } },
+        );
+      } else
+        sse(
+          res,
+          {
+            type: 'content_block_start',
+            index: 0,
+            content_block: { type: 'tool_use', id: 'call_asset', name: fn, input: {} },
+          },
+          {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'input_json_delta', partial_json: args },
+          },
+          { type: 'content_block_stop', index: 0 },
+          { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+          { type: 'message_stop' },
+        );
+    });
+    const provider = createProvider(profile, key);
+    const compiled = buildWritingRequest(
+      provider,
+      { kind: 'subject', action: 'fill' },
+      { author: '补铜铃的说明' },
+      [],
+    );
+    const reply = await provider.turn({
+      ...compiled.request,
+      signal: AbortSignal.timeout(3000),
+      onText() {},
+    });
+    assert.deepEqual(reply.calls, [{ id: 'call_asset', name: fn, args }]);
+    const body = requests[0].body;
+    assert.equal(body.tools.length, 1);
+    assert.equal(body.tools[0].name ?? body.tools[0].function.name, fn);
+    assert.match(body.system ?? body.instructions ?? body.messages[0].content, /生成主体说明/);
+    assert.match(JSON.stringify(body.input ?? body.messages), /补铜铃的说明/);
+    assert.doesNotMatch(JSON.stringify(body), /book_apply_changes|book_get_context/);
+  });

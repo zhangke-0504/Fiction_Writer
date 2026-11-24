@@ -82,6 +82,7 @@ const reason = one(
   'incomplete_stream',
   'output_limit',
   'rewrite_not_authorized',
+  'insert_not_authorized',
   'invalid_skill',
   'unbound_foreshadowing',
   'novel_goal_required',
@@ -118,6 +119,7 @@ const reason = one(
   'draft',
   'append',
   'replace',
+  'insert',
   'readback',
   'managed',
   'watcher',
@@ -129,7 +131,7 @@ const reason = one(
   'user',
   'unknown',
 );
-const lane = one('agent', 'draft', 'readback', 'probe', 'compaction');
+const lane = one('agent', 'asset', 'draft', 'readback', 'probe', 'compaction');
 const tool = one(
   'list_files',
   'search_text',
@@ -141,6 +143,7 @@ const tool = one(
   'book_get_context',
   'book_apply_changes',
   'book_generate_chapter',
+  'book_generate_assets',
   'book_read_chapter',
   'book_memory_recall',
   'book_memory_remember',
@@ -169,8 +172,63 @@ const applied = {
   journalSeq: count,
   workerId: uuid,
 };
-const action = one('draft', 'append', 'replace');
+const action = one('draft', 'append', 'replace', 'insert');
 const docType = one('book', 'outline', 'subject', 'clue', 'chapter');
+const writingTask = {
+  writingTask: one('chapter', 'subject', 'clue'),
+  writingAction: one('draft', 'append', 'replace', 'insert', 'create', 'fill', 'update'),
+};
+const writingTemplate = {
+  ...writingTask,
+  template: one('write-chapter', 'write-subject', 'write-clue'),
+  fingerprint: revision,
+};
+const writingCounts = { includedRequired: count, includedOptional: count, omittedOptional: count };
+const writingStage = one('selection', 'input_budget', 'anchors', 'candidate', 'output_budget');
+const writingIssueKind = one(
+  'missing_asset',
+  'empty_description',
+  'missing_section',
+  'no_visible_evidence',
+  'invalid_anchor',
+  'continuity_conflict',
+  'budget_limit',
+);
+const writingFailureRequired = [
+  'runId',
+  'spanId',
+  'workspaceRef',
+  'writingTask',
+  'writingAction',
+  'writingStage',
+] as const;
+const writingGroup = one(
+  'target',
+  'book',
+  'outline',
+  'subject',
+  'clue',
+  'previous',
+  'memory',
+  'readback',
+  'boundary',
+  'reference',
+);
+const writingRequired = [
+  'runId',
+  'spanId',
+  'workspaceRef',
+  'writingTask',
+  'writingAction',
+  'template',
+  'fingerprint',
+] as const;
+const writingCountsRequired = [
+  ...writingRequired,
+  'includedRequired',
+  'includedOptional',
+  'omittedOptional',
+] as const;
 const memoryRecall = { recallId: uuid, trigger: one('agent', 'draft', 'tool') };
 const memoryDispatch = { recallId: uuid, trigger: one('agent', 'draft') };
 const memoryCounts = {
@@ -235,6 +293,12 @@ const ui = (fields: Schema, required: readonly string[], level?: Definition['lev
   ui: true,
   required,
 });
+const writingFailure = worker(
+  { ...writingTask, writingStage, outcome, reason, blockedSources: count },
+  'warn',
+  [...writingFailureRequired, 'outcome', 'reason', 'blockedSources'],
+);
+
 const diag = new Map<string, Definition>(
   Object.entries({
     'app.started': main({ version, pid: count }),
@@ -412,6 +476,40 @@ const diag = new Map<string, Definition>(
     'skill.loaded': worker({ skill, fingerprint: revision }),
     'skill.failed': worker({ skill, reason }, 'warn'),
     'skill.applied': worker({ skill, fingerprint: revision, reason }),
+    'writing.context.blocked': writingFailure,
+    'writing.context.rejected_result': writingFailure,
+    'writing.context.issue': worker(
+      {
+        ...writingTask,
+        writingStage,
+        issueKind: writingIssueKind,
+        docType,
+        revision,
+        part: one('stable', 'visible', 'reveal'),
+      },
+      'info',
+      [...writingFailureRequired, 'issueKind'],
+    ),
+    'writing.context.prepared': worker(
+      { ...writingTemplate, ...writingCounts },
+      'info',
+      writingCountsRequired,
+    ),
+    'writing.context.dispatched': worker(
+      { ...writingTemplate, ...writingCounts },
+      'info',
+      writingCountsRequired,
+    ),
+    'writing.context.group': worker(
+      { ...writingTemplate, ...writingCounts, group: writingGroup },
+      'info',
+      [...writingCountsRequired, 'group'],
+    ),
+    'writing.context.source': worker(
+      { ...writingTemplate, group: writingGroup, required: bool, docType, revision },
+      'info',
+      [...writingRequired, 'group', 'required', 'docType', 'documentRef', 'revision'],
+    ),
     'chapter.generation.started': worker({ action }),
     'chapter.generation.finished': worker({ ...final, action, revision }),
     'novel.goal': worker({

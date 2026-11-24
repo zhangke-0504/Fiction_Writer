@@ -145,7 +145,7 @@ export function chapterMemoryQuery(documents: Manuscript[], target: Manuscript, 
   ].join('\n');
 }
 
-export type ReportMemoryDispatch = (report: ReportDiagnostic) => void;
+export type ReportMemoryDispatch = (report: ReportDiagnostic, included?: BookRecall) => void;
 
 type RecallOptions = {
   query: string;
@@ -225,7 +225,11 @@ export async function recallBookMemory(
     trace('memory.recall.finished', { ...counts, outcome: 'ok', elapsedMs: elapsed(started) });
     if (diag.trigger !== 'tool' && diag.captureDispatch && Object.values(counts).some(Boolean)) {
       try {
-        diag.captureDispatch(memoryDispatchResult(result, link, counts));
+        diag.captureDispatch((report, included = result) => {
+          const dispatched = memoryCounts(included);
+          if (Object.values(dispatched).some(Boolean))
+            memoryDispatchResult(included, link, dispatched)(report);
+        });
       } catch {
         // An observer may not alter the recall result.
       }

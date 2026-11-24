@@ -17,6 +17,7 @@ import type {
   WriteReport,
 } from '../shared/contracts.js';
 import {
+  chapterPlacementFingerprint,
   digest,
   docKey,
   isId,
@@ -350,9 +351,10 @@ export class WorkspaceService {
     guards: Guard[] = [],
     diagnostic = noDiagnostic,
     bindNewClues = false,
+    expectedChapterPlacement?: string,
   ): Promise<WriteReport> {
     return this.enqueue(bookId, () =>
-      this.commit(bookId, changes, signal, guards, diagnostic, bindNewClues),
+      this.commit(bookId, changes, signal, guards, diagnostic, bindNewClues, expectedChapterPlacement),
     );
   }
   private async commit(
@@ -362,6 +364,7 @@ export class WorkspaceService {
     guards: Guard[],
     diagnostic: ReportDiagnostic,
     bindNewClues: boolean,
+    expectedChapterPlacement?: string,
   ): Promise<WriteReport> {
     let pending = changes.map(refOf);
     let invalidReferences: InvalidReference[] | undefined;
@@ -406,6 +409,19 @@ export class WorkspaceService {
         if (!(await matchesRevision(root, guard, guard.revision, 'guard')))
           throw new WorkspaceError(`${docKey(guard)} 已变化，请重新读取`, 'conflict');
       const { documents } = await this.load(root, bookId);
+      if (expectedChapterPlacement !== undefined) {
+        const actualRevision = chapterPlacementFingerprint(documents);
+        if (actualRevision !== expectedChapterPlacement) {
+          operation.trace('workspace.conflict', {
+            ...traceDocument(refOf(changes[0])),
+            step: 'guard',
+            reason: 'conflict',
+            expectedRevision: expectedChapterPlacement,
+            actualRevision,
+          });
+          throw new WorkspaceError('章节顺序或前后已写状态已变化，请重新核对衔接。', 'conflict');
+        }
+      }
       const original = new Map(documents.map((doc) => [docKey(doc), doc])),
         projected = new Map(original);
       const planned = new Map<string, { ref: DocRef; expect: string | null; text?: string }>();

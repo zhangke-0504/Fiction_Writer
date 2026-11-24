@@ -63,3 +63,66 @@ export function memoryChapterTarget(prompt: string, chapters: Manuscript[], sele
     )?.id ?? selected
   );
 }
+
+/** A request for actual entry into an existing story can authorize an addition, never a replacement. */
+export function wantsPassageAddition(prompt: string) {
+  const text = prompt.normalize('NFKC').trim();
+  if (/(?:新增|另加|插入|添加|增设|补写)\s*(?:一|1)?\s*(?:个)?章(?:节)?|插章/u.test(text)) return false;
+  if (
+    /^(?:(?:请|帮我|麻烦)\s*)?(?:先|只|仅)?(?:讨论|分析|聊聊|设想|假设|想想|考虑|给我建议)/u.test(
+      text,
+    ) ||
+    /[?？]\s*$/u.test(text)
+  )
+    return false;
+  if (
+    /(?:只|仅)(?:需|要)?(?:做|改|补|写|生成|整理)?\s*(?:资料|大纲|设定|说明)|(?:不要|别|禁止|无需|不许|不得|不必|不)[^。；;，,\n]{0,16}(?:改(?:动|写)?(?:任何|任何一)?(?:章节|正文)|改任何一章|动(?:任何)?(?:章节|正文)|写(?:入)?正文|插入正文|登场)/u.test(
+      text,
+    )
+  )
+    return false;
+  return (
+    /新增|增加|加入|加上|加一个|添加|插入|补写|补一段|增补/u.test(text) &&
+    /登场|出场|插入|正文|场景|(?:第[^，。\n]{1,7}章|本章|当前章)[^，。\n]{0,12}(?:加入|一段)/u.test(text)
+  );
+}
+
+export function passageTargetAllowed(
+  prompt: string,
+  chapters: Manuscript[],
+  target: string,
+  selected?: string,
+) {
+  if (!wantsPassageAddition(prompt)) return false;
+  const source = prompt.normalize('NFKC');
+  const direct = [
+    ...source.matchAll(/第\s*[\d零一二三四五六七八九十两]+\s*章|\bchapter\s+\d+\b/giu),
+  ].map(([text]) => chapterOrder(text));
+  if (direct.length)
+    return (
+      new Set(direct).size === 1 &&
+      chapters.some(({ id, fields }) => id === target && fields.order === direct[0])
+    );
+  if (/本章|当前章|这一章|选中章/u.test(source)) return target === selected;
+  if (/(?:故事|剧情|小说)?中期|中段|故事中间/u.test(source)) {
+    const index = chapters
+      .slice()
+      .sort((a, b) => (a.fields.order ?? 0) - (b.fields.order ?? 0))
+      .findIndex(({ id }) => id === target);
+    return index >= Math.floor(chapters.length / 3) && index < Math.ceil((chapters.length * 2) / 3);
+  }
+  const named = chapters.filter(
+    ({ fields }) =>
+      fields.title && fields.title.length > 2 && source.includes(fields.title.normalize('NFKC')),
+  );
+  return named.length === 1 && named[0].id === target;
+}
+
+export function minimumExistingSubjects(prompt: string) {
+  if (!wantsPassageAddition(prompt)) return 0;
+  const count =
+    /(?:至少\s*)?([\d一二三四五六七八九十两]+)\s*(?:个|位|项)\s*(?:以上)?\s*(?:不同的?)?\s*(?:已有|既有|现有)\s*(?:主体|人物|角色)/u.exec(
+      prompt.normalize('NFKC'),
+    )?.[1];
+  return count ? chapterOrder(`第${count}章`) || 0 : 0;
+}

@@ -9,9 +9,30 @@ import { createServer, type ServerResponse } from 'node:http';
 import { diagnosticText, readDiagnostics } from './diagnostic-files';
 import type { BookView, Manuscript, RuntimeView, WriteReport } from '../../shared/contracts';
 
-const odyssey = '将希腊神话故事奥德赛写成小说，大概写10章左右。记得生成主体，伏笔和大纲和章节正文';
+const odyssey = '基于神话故事奥德赛来写10章内容';
+const antagonistRequest = '增加一个跟2个以上已有主体有关联的反派及他的伏笔，在故事中期登场';
+const antagonist = { id: 'gray-keeper', fields: { name: '灰冠守夜人', kind: 'character' } };
+const newClueId = 'gray-triple-cut';
+const insertionProse = '灰冠守夜人夺走古弓，以为掌柜不敢作人证，却在船沿留下三道灰痕。';
+const newOutlineBeat =
+  '灰冠守夜人盗弓并埋下三道灰痕。 [灰冠守夜人](subjects/gray-keeper.md) [三道灰痕](foreshadowing/gray-triple-cut.md)';
+const publicRule = '归乡者只用星位确认航向';
 const discussion = '先聊聊怎么把《奥德赛》改编成十章小说，别写文件';
 const faultPrompt = '写4章完整小说，包括大纲、主体、伏笔和正文。保留第一人称航海日记的形式。';
+const subjectDescription = `## 稳定设定\n${publicRule}。他需要人证。SUBJECT_NAVIGATION_RULE`;
+const retainedSubjects = [
+  {
+    target: { id: 'landlord', fields: { name: '掌柜', kind: 'character' } },
+    body: '## 稳定设定\n掌柜能帮水手辨认港口的船。KEEPER_RULE',
+  },
+  {
+    target: { id: 'old-bow', fields: { name: '古弓', kind: 'item' } },
+    body: '## 稳定设定\n古弓背面刻有北斗。BOW_RULE',
+  },
+];
+const clueSurface = '## 可见线索\n人证在船沿留下灰烬印记。VISIBLE_ASH_MARK';
+const clueReveal = `## 回收真相\n回收时归乡者问起「人证」。${publicRule}。\n揭示事实：印记会指出北方的归路 SECRET_NORTH_PASSAGE。`;
+const repairPrompt = '写完10章作品，保留已写章节，务必补齐索引员的主体说明。';
 const apiKey = 'synthetic-writing-key-only';
 const searchQuery = '整本小说 伏笔 SEARCH_QUERY_FIXTURE';
 const unfinished = '未完成流，内容仅用于预览，不能进入磁盘正文 UNFINISHED_PROSE_FIXTURE。';
@@ -37,8 +58,8 @@ function terminal(send: ReturnType<typeof startStream>, res: ServerResponse, rea
   send({ type: 'message_stop' });
   res.end();
 }
-async function fixture(mode: 'full' | 'single' | Fault) {
-  const count = mode === 'full' ? 10 : mode === 'single' ? 3 : 4;
+async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
+  const count = mode === 'full' || mode === 'repair' ? 10 : mode === 'single' ? 3 : 4;
   const chapterIds = Array.from({ length: count }, (_, i) => id(i + 1));
   const calls: string[] = [],
     drafts: number[] = [],
@@ -50,8 +71,6 @@ async function fixture(mode: 'full' | 'single' | Fault) {
     unblock = resolve;
   });
   const clue = {
-    type: 'clue',
-    action: 'create',
     id: 'hint-troy-embers',
     fields: {
       title: '航途暗号',
@@ -59,7 +78,19 @@ async function fixture(mode: 'full' | 'single' | Fault) {
       setupChapterId: id(1),
       payoffChapterId: id(count),
     },
-    body: '用灰烬留下暗号，最终辨认出回家的航道。',
+  };
+  const hero = { id: 'hero-fixture', fields: { name: '归乡者', kind: 'character' } };
+  const repairId = 'indexer';
+  const allSubjects = mode === 'full' ? [hero, ...retainedSubjects.map(({ target }) => target)] : [hero];
+  const chapterForEntry = 5;
+  const extraClue = {
+    id: newClueId,
+    fields: {
+      title: '三道灰痕',
+      subjectIds: [antagonist.id, hero.id],
+      setupChapterId: id(chapterForEntry),
+      payoffChapterId: id(8),
+    },
   };
   const server = createServer(async (req, res) => {
     try {
@@ -99,14 +130,79 @@ async function fixture(mode: 'full' | 'single' | Fault) {
           chapterId: id(order),
           mode: 'draft',
           direction: `完成航程 ${order}。`,
+          ...(mode !== 'single' && { subjectIds: [hero.id], clueIds: [clue.id] }),
         });
       const last = body.messages.at(-1)?.content.at(-1);
+      if (body.tools?.length === 1 && body.tools[0].name === 'submit_story_descriptions') {
+        expect(body.messages).toHaveLength(1);
+        const input = last?.text ?? '';
+        expect(body.system).not.toContain('skill_search');
+        if (input.includes(antagonistRequest) && body.system.includes('生成伏笔说明')) {
+          expect(input).toContain('灰冠守夜人');
+          return use('submit_story_descriptions', 'entry-clue-result', {
+            items: [
+              {
+                id: newClueId,
+                body: '## 可见线索\n陌生人在船沿留下三道灰痕。\n\n## 回收真相\n揭示事实：灰帽是内应的密徽 FUTURE_GRAY_SIGIL。',
+              },
+            ],
+          });
+        }
+        if (input.includes(antagonistRequest)) {
+          for (const marker of ['SUBJECT_NAVIGATION_RULE', 'KEEPER_RULE', 'BOW_RULE'])
+            expect(input).toContain(marker);
+          return use('submit_story_descriptions', 'entry-subject-result', {
+            items: [
+              {
+                id: antagonist.id,
+                body: '## 稳定设定\n灰冠守夜人要夺取归乡者的古弓，打算让掌柜不敢作证。',
+              },
+            ],
+          });
+        }
+        if (body.system.includes('生成伏笔说明')) {
+          expect(input).toContain('SUBJECT_NAVIGATION_RULE');
+          return use('submit_story_descriptions', 'clue-result', {
+            items: [{ id: clue.id, body: clueSurface + '\n\n' + clueReveal }],
+          });
+        }
+        expect(body.system).toContain('生成主体说明');
+        return use('submit_story_descriptions', 'subject-result', {
+          items: [
+            { id: mode === 'repair' ? repairId : hero.id, body: subjectDescription },
+            ...(mode === 'full'
+              ? retainedSubjects.map(({ target, body }) => ({ id: target.id, body }))
+              : []),
+          ],
+        });
+      }
       if (!body.tools?.length) {
         const order = Number(
           /"target":\s*\{\s*"id":\s*"odyssey-fixture-(\d+)"/.exec(last?.text ?? '')?.[1],
         );
         expect(order).toBeGreaterThan(0);
         expect(body.system).toContain('中文 Markdown 正文');
+        if (body.system.includes('指定锚点')) {
+          expect(order).toBe(chapterForEntry);
+          expect(last?.text).toContain(antagonistRequest);
+          expect(last?.text).toContain(chapterBody(order));
+          for (const datum of [
+            '灰冠守夜人',
+            '三道灰痕',
+            'SUBJECT_NAVIGATION_RULE',
+            'KEEPER_RULE',
+            'BOW_RULE',
+          ])
+            expect(last?.text).toContain(datum);
+          expect(last?.text).not.toContain('FUTURE_GRAY_SIGIL');
+          return reply(insertionProse);
+        }
+        if (mode !== 'single') {
+          expect(body.system).toContain('1200');
+          expect(last?.text).toContain('SUBJECT_NAVIGATION_RULE');
+          if (order < count) expect(last?.text).not.toContain('SECRET_NORTH_PASSAGE');
+          else expect(last?.text).toContain('SECRET_NORTH_PASSAGE');
+        } else expect(body.system).not.toContain('1200');
         drafts.push(order);
         if (resumed && mode !== 'single') expect(last?.text).toContain(faultPrompt);
         if (order === 3 && !resumed && mode !== 'full') {
@@ -127,17 +223,82 @@ async function fixture(mode: 'full' | 'single' | Fault) {
       }
       if (last?.type !== 'tool_result') {
         if (last?.text === discussion) return reply('先构思归乡与身份的冲突，不写文件。');
+        if (last?.text === antagonistRequest) return use('book_get_context', 'entry-context', {});
         if (mode === 'single') {
           expect(last?.text).toBe('只写第三章');
           return generate(3);
         }
-        expect(last?.text).toBe(resumed ? '接着写完' : mode === 'full' ? odyssey : faultPrompt);
+        expect(last?.text).toBe(
+          resumed
+            ? '接着写完'
+            : mode === 'full'
+              ? odyssey
+              : mode === 'repair'
+                ? repairPrompt
+                : faultPrompt,
+        );
         expect(body.system).toContain('skill_search');
         if (resumed) expect(body.system).toContain('有可供作者明确续接的整书记录');
         return use('skill_search', 'search', { query: searchQuery });
       }
       const result = JSON.parse(last.content!);
       const marker = last.tool_use_id!;
+      if (marker === 'entry-context') {
+        expect(result.ok).toBe(true);
+        expect(result.value.documents.filter((d: Manuscript) => d.type === 'subject')).toHaveLength(3);
+        return use('book_generate_assets', 'entry-subject', {
+          kind: 'subject',
+          action: 'create',
+          targets: [{ ...antagonist, relatedSubjectIds: allSubjects.map(({ id }) => id) }],
+        });
+      }
+      if (marker === 'entry-subject') {
+        expect(result.value.assets).toMatchObject([{ type: 'subject', id: antagonist.id }]);
+        return use('book_generate_assets', 'entry-unbound', {
+          kind: 'clue',
+          action: 'create',
+          targets: [{ ...extraClue, fields: { ...extraClue.fields, payoffChapterId: undefined } }],
+        });
+      }
+      if (marker === 'entry-unbound') {
+        expect(result).toMatchObject({
+          ok: false,
+          reason: 'invalid_arguments',
+          value: { actorId: antagonist.id },
+        });
+        return use('book_generate_assets', 'entry-clue', {
+          kind: 'clue',
+          action: 'create',
+          targets: [extraClue],
+        });
+      }
+      if (marker === 'entry-clue') {
+        expect(result.value.assets).toMatchObject([{ type: 'clue', id: newClueId }]);
+        const ready = result.value.entryReady;
+        expect(ready.chapters.map((chapter: { chapterId: string }) => chapter.chapterId)).toEqual([
+          id(chapterForEntry),
+        ]);
+        expect(ready.chapters[0].insertion[0].quote.length).toBeGreaterThan(5);
+        return use('book_generate_chapter', 'entry-insert', {
+          chapterId: ready.chapters[0].chapterId,
+          mode: 'insert',
+          insertion: {
+            ...ready.chapters[0].insertion[0],
+            outline: { revision: ready.outlineRevision, addition: newOutlineBeat },
+          },
+          subjectIds: ready.subjectIds,
+          clueIds: ready.clueIds,
+          direction: '让灰冠守夜人在中期出场，以灰痕埋设线索，不揭晓内情。',
+        });
+      }
+      if (marker === 'entry-insert') {
+        expect(result.value).toMatchObject({
+          inserted: true,
+          outlineUpdated: true,
+          chapterId: id(chapterForEntry),
+        });
+        return reply('已保存主体、伏笔、大纲和登场。');
+      }
       if (marker === 'search') {
         expect(result.value.candidates[0].name).toBe('generate-novel');
         expect(result.value.candidates[0].instructions).toBeUndefined();
@@ -147,10 +308,40 @@ async function fixture(mode: 'full' | 'single' | Fault) {
         expect(result.value.instructions).toContain('交付目标');
         return resumed
           ? use('book_get_context', 'resume', { novelGoal: { action: 'resume' } })
-          : use('book_get_context', 'initial-read', {});
+          : mode === 'repair'
+            ? use('book_get_context', 'repair-register', {
+                novelGoal: {
+                  action: 'register',
+                  chapterIds,
+                  assetRefs: [{ type: 'subject', id: repairId }],
+                },
+              })
+            : use('book_get_context', 'initial-read', {});
+      }
+      if (marker === 'repair-register') {
+        expect(result.value).toMatchObject({
+          done: 10,
+          total: 10,
+          complete: false,
+          missingAssetRefs: [{ type: 'subject', id: repairId }],
+        });
+        return reply('模型错误地声称都完成了。');
       }
       if (marker === 'resume') {
         expect(result.ok).toBe(true);
+        if (mode === 'repair') {
+          expect(result.value).toMatchObject({
+            done: 10,
+            total: 10,
+            complete: false,
+            missingAssetRefs: [{ type: 'subject', id: repairId }],
+          });
+          return use('book_generate_assets', 'repair-fill', {
+            kind: 'subject',
+            action: 'fill',
+            targets: [{ id: repairId }],
+          });
+        }
         expect(result.value).toMatchObject({
           originalDirection: faultPrompt,
           done: 2,
@@ -175,13 +366,6 @@ async function fixture(mode: 'full' | 'single' | Fault) {
               id: 'outline',
               body: '归乡者用暗号辨认航道。\n\n<!-- beat:actual-departure -->',
             },
-            {
-              type: 'subject',
-              action: 'create',
-              id: 'hero-fixture',
-              fields: { name: '归乡者', kind: 'character' },
-              body: '从远方返乡。',
-            },
             ...chapterIds.map((id, i) => ({
               type: 'chapter',
               action: 'create',
@@ -193,35 +377,48 @@ async function fixture(mode: 'full' | 'single' | Fault) {
       }
       if (marker === 'foundation') {
         expect(result.ok).toBe(true);
-        return use('book_get_context', 'read-foundation', {});
-      }
-      if (marker === 'read-foundation') {
-        expect(result.value.documents.filter((doc: Manuscript) => doc.type === 'chapter')).toHaveLength(
-          count,
-        );
-        if (mode !== 'full') return use('book_apply_changes', 'clue', { operations: [clue] });
-        return use('book_apply_changes', 'invalid-beat', {
-          operations: [
-            {
-              ...clue,
-              fields: {
-                ...clue.fields,
-                setupChapterId: null,
-                setupBeatId: 'beat-departure',
-              },
-            },
-          ],
+        if (mode === 'full')
+          return use('book_apply_changes', 'blank-card-bypass', {
+            operations: [{ ...hero, type: 'subject', action: 'create' }],
+          });
+        return use('book_generate_assets', 'subject', {
+          kind: 'subject',
+          action: 'create',
+          targets: allSubjects,
         });
       }
-      if (marker === 'invalid-beat') {
+      if (marker === 'blank-card-bypass') {
+        expect(result).toMatchObject({ ok: false, reason: 'invalid_options' });
+        return use('book_generate_assets', 'subject', {
+          kind: 'subject',
+          action: 'create',
+          targets: allSubjects,
+        });
+      }
+      if (marker === 'subject') {
+        expect(result.value.assets).toMatchObject(
+          allSubjects.map(({ id }) => ({ type: 'subject', id })),
+        );
+        expect(last.content).not.toContain('SUBJECT_NAVIGATION_RULE');
+        if (mode !== 'full')
+          return use('book_generate_assets', 'clue', {
+            kind: 'clue',
+            action: 'create',
+            targets: [clue],
+          });
+        return use('book_generate_assets', 'invalid-anchor', {
+          kind: 'clue',
+          action: 'create',
+          targets: [{ ...clue, fields: { ...clue.fields, setupChapterId: 'missing-departure' } }],
+        });
+      }
+      if (marker === 'invalid-anchor') {
         expect(result).toMatchObject({
           ok: false,
           reason: 'invalid_references',
           value: {
-            committed: [],
-            pending: [{ type: 'clue', id: 'hint-troy-embers' }],
             invalidReferences: [
-              { field: 'setupBeatId', target: { type: 'beat', id: 'beat-departure' } },
+              { field: 'setupChapterId', target: { type: 'chapter', id: 'missing-departure' } },
             ],
           },
         });
@@ -229,11 +426,15 @@ async function fixture(mode: 'full' | 'single' | Fault) {
       }
       if (marker === 'chapter-ids') {
         expect(result.value.rows.map((row: { id: string }) => row.id)).toEqual(chapterIds);
-        return use('book_apply_changes', 'clue', { operations: [clue] });
+        return use('book_generate_assets', 'clue', { kind: 'clue', action: 'create', targets: [clue] });
       }
       if (marker === 'clue') {
-        expect(result.ok).toBe(true);
+        expect(result.value.assets).toMatchObject([{ type: 'clue', id: clue.id }]);
         return generate(1);
+      }
+      if (marker === 'repair-fill') {
+        expect(result.value.assets).toMatchObject([{ type: 'subject', id: repairId }]);
+        return use('book_get_context', 'check', { novelGoal: { action: 'check' } });
       }
       if (marker === 'cannot-skip') {
         expect(result).toMatchObject({ ok: false, reason: 'novel_goal_conflict' });
@@ -311,11 +512,13 @@ async function setup(page: Page, baseUrl: string) {
 async function openBook(page: Page) {
   await button(page, '编辑 奥德赛').click();
 }
-async function openComposer(page: Page, resume = false) {
+async function openComposer(page: Page, resume: boolean | string = false) {
   await button(page, 'Harness').click();
   if (resume)
     await panel(page)
-      .getByRole('button', { name: new RegExp(`^${faultPrompt.slice(0, 20)}`) })
+      .getByRole('button', {
+        name: new RegExp(`^${(typeof resume === 'string' ? resume : faultPrompt).slice(0, 20)}`),
+      })
       .click();
   else await panel(page).getByRole('button', { name: '当前小说会话', exact: true }).click();
   await expect(panel(page).getByLabel('写作动作')).toHaveCount(0);
@@ -341,7 +544,9 @@ async function safeDiaries(root: string) {
       searchQuery,
       unfinished,
       'hint-troy-embers',
-      'beat-departure',
+      'missing-departure',
+      'SUBJECT_NAVIGATION_RULE',
+      'SECRET_NORTH_PASSAGE',
       id(3),
       chapterBody(1),
     ])
@@ -350,7 +555,7 @@ async function safeDiaries(root: string) {
 }
 const originalPromptMarker = '第一人称航海日记';
 
-test('one natural-language send finds the whole novel skill and saves the Odyssey in ten chapters', async ({}, info) => {
+test('two natural-language sends complete the Odyssey and insert a related antagonist in its middle', async ({}, info) => {
   const root = info.outputPath('app');
   const mock = await fixture('full');
   let app: ElectronApplication | undefined;
@@ -371,9 +576,10 @@ test('one natural-language send finds the whole novel skill and saves the Odysse
       mock.chapterIds,
     );
     expect(view.documents.some((doc) => doc.type === 'subject')).toBe(true);
-    const readDoc = (type: 'outline' | 'clue', id: string) =>
+    const readDoc = (type: 'outline' | 'clue' | 'subject', id: string) =>
       rpc<Manuscript>(page, 'book.doc.read', { bookId, doc: { type, id } });
     expect((await readDoc('outline', 'outline')).body.trim()).toContain('归乡者');
+    expect((await readDoc('subject', 'hero-fixture')).body.trim()).toBe(subjectDescription);
     expect((await readDoc('clue', 'hint-troy-embers')).fields).toMatchObject({
       setupChapterId: id(1),
       payoffChapterId: id(10),
@@ -382,8 +588,44 @@ test('one natural-language send finds the whole novel skill and saves the Odysse
       expect((await read(page, bookId, chapterId)).body).toBe(chapterBody(index + 1));
     expect(mock.calls.slice(0, 2)).toEqual(['skill_search:search', 'skill_load:load']);
     expect(mock.drafts).toEqual(Array.from({ length: 10 }, (_, index) => index + 1));
-    const calls = [...mock.calls];
     const prior = (await status(page, bookId))!.id;
+    const originalOutline = await readDoc('outline', 'outline');
+    await send(page, antagonistRequest);
+    await expect
+      .poll(async () => {
+        const r = await status(page, bookId);
+        return r?.id !== prior && r?.status;
+      })
+      .toBe('completed');
+    const entryId = (await status(page, bookId))!.id;
+    const connected = await files(page, bookId);
+    expect(connected.diagnostics).toEqual([]);
+    expect(connected.documents.filter((d) => d.type === 'chapter').map(({ id }) => id)).toEqual(
+      mock.chapterIds,
+    );
+    for (const old of view.documents.filter((d) => d.type === 'subject' || d.type === 'clue'))
+      expect(connected.documents.find((d) => d.type === old.type && d.id === old.id)?.revision).toBe(
+        old.revision,
+      );
+    const actor = await readDoc('subject', antagonist.id);
+    for (const ref of ['hero-fixture', 'landlord', 'old-bow'])
+      expect(actor.body).toContain(`subjects/${ref}.md`);
+    expect((await readDoc('clue', newClueId)).fields).toMatchObject({
+      setupChapterId: id(5),
+      payoffChapterId: id(8),
+      subjectIds: [antagonist.id, 'hero-fixture'],
+    });
+    const newOutline = await readDoc('outline', 'outline');
+    expect(newOutline.body).toContain('<!-- chapter:odyssey-fixture-5 -->');
+    expect(newOutline.body).toContain(newOutlineBeat);
+    expect(newOutline.body.startsWith(originalOutline.body)).toBe(true);
+    for (const [index, chapterId] of mock.chapterIds.entries()) {
+      const order = index + 1;
+      expect((await read(page, bookId, chapterId)).body).toBe(
+        order === 5 ? insertionProse + '\n\n' + chapterBody(order) : chapterBody(order),
+      );
+    }
+    const calls = [...mock.calls];
     await send(page, discussion);
     await expect(
       panel(page).getByText('先构思归乡与身份的冲突，不写文件。', { exact: true }),
@@ -391,10 +633,10 @@ test('one natural-language send finds the whole novel skill and saves the Odysse
     await expect
       .poll(async () => {
         const run = await status(page, bookId);
-        return run?.id !== prior && run?.status;
+        return run?.id !== entryId && run?.status;
       })
       .toBe('completed');
-    expect(await files(page, bookId)).toEqual(view);
+    expect(await files(page, bookId)).toEqual(connected);
     expect(mock.calls).toEqual(calls);
     expect(mock.errors).toEqual([]);
     await expect
@@ -402,7 +644,7 @@ test('one natural-language send finds the whole novel skill and saves the Odysse
         async () =>
           (await readDiagnostics(root, 'backend')).filter((e) => e.event === 'run.finished').length,
       )
-      .toBe(2);
+      .toBe(3);
     const events = (await readDiagnostics(root, 'backend')).filter((e) => e.fields.runId === prior);
     expect(events.some((e) => e.event === 'skill.search' && e.fields.candidates > 0)).toBe(true);
     expect(
@@ -414,6 +656,26 @@ test('one natural-language send finds the whole novel skill and saves the Odysse
     expect(
       events.filter((e) => e.event === 'chapter.generation.finished' && e.fields.outcome === 'ok'),
     ).toHaveLength(10);
+    const requests = events.filter(({ event }) => event === 'writing.context.dispatched');
+    expect(requests.filter(({ fields }) => fields.template === 'write-chapter')).toHaveLength(10);
+    expect(
+      requests
+        .filter(({ fields }) => fields.template !== 'write-chapter')
+        .map(({ fields }) => fields.template),
+    ).toEqual(['write-subject', 'write-clue']);
+    expect(requests.every(({ fields }) => fields.includedRequired > 0)).toBe(true);
+    expect(events.some((e) => e.event === 'writing.context.blocked')).toBe(false);
+    const entryEvents = (await readDiagnostics(root, 'backend')).filter(
+      (e) => e.fields.runId === entryId,
+    );
+    expect(
+      entryEvents.filter(
+        (e) => e.event === 'writing.context.dispatched' && e.fields.writingAction === 'insert',
+      ),
+    ).toHaveLength(1);
+    expect(
+      entryEvents.some((e) => e.event === 'writing.context.blocked' || e.event === 'novel.goal'),
+    ).toBe(false);
     await safeDiaries(root);
   } finally {
     await app?.close().catch(() => {});
@@ -549,6 +811,104 @@ test('single-chapter request uses the same composer, can be stopped, and never s
     ]);
     expect(mock.calls).toEqual(['book_generate_chapter:draft-3', 'book_generate_chapter:draft-3']);
     expect(mock.drafts).toEqual([3, 3]);
+    expect(mock.errors).toEqual([]);
+  } finally {
+    await app?.close().catch(() => {});
+    await mock.close();
+  }
+});
+
+test('a saved ten-chapter catalog cannot hide a missing required description, and resumes without redrafting', async ({}, info) => {
+  const root = info.outputPath('app');
+  const mock = await fixture('repair');
+  let app: ElectronApplication | undefined;
+  try {
+    app = await launch(root);
+    let page = await app.firstWindow();
+    const bookId = await setup(page, mock.baseUrl);
+    const outline = await rpc<Manuscript>(page, 'book.doc.read', {
+      bookId,
+      doc: { type: 'outline', id: 'outline' },
+    });
+    const write = await rpc<WriteReport>(page, 'book.changes.write', {
+      bookId,
+      changes: [
+        { ...outline, expect: outline.revision, body: '归乡大纲。' },
+        {
+          type: 'subject',
+          id: 'hero-fixture',
+          expect: null,
+          fields: { name: '归乡者', kind: 'character' },
+          body: subjectDescription,
+        },
+        {
+          type: 'subject',
+          id: 'indexer',
+          expect: null,
+          fields: { name: '索引员', kind: 'character' },
+          body: '',
+        },
+        {
+          type: 'subject',
+          id: 'unrelated',
+          expect: null,
+          fields: { name: '与任务无关的占位', kind: 'scene' },
+          body: '',
+        },
+        {
+          type: 'clue',
+          id: 'hint-troy-embers',
+          expect: null,
+          fields: {
+            title: '航途暗号',
+            subjectIds: ['hero-fixture'],
+            setupChapterId: id(1),
+            payoffChapterId: id(10),
+          },
+          body: clueSurface + '\n\n' + clueReveal,
+        },
+        ...mock.chapterIds.map((chapterId, i) => ({
+          type: 'chapter',
+          id: chapterId,
+          expect: null,
+          fields: { title: title(i + 1), order: i + 1 },
+          body: chapterBody(i + 1),
+        })),
+      ],
+    });
+    expect(write.error).toBeUndefined();
+    const revisions = await Promise.all(
+      mock.chapterIds.map(async (chapterId) => (await read(page, bookId, chapterId)).revision),
+    );
+    await openBook(page);
+    await openComposer(page);
+    await send(page, repairPrompt);
+    await expect.poll(async () => (await status(page, bookId))?.status).toBe('failed');
+    expect(await status(page, bookId)).toMatchObject({
+      progress: { done: 10, total: 10, complete: false },
+      error: expect.stringContaining('subject/indexer'),
+    });
+    await app.close();
+    mock.resume();
+    app = await launch(root);
+    page = await app.firstWindow();
+    await openBook(page);
+    await openComposer(page, repairPrompt);
+    await send(page, '接着写完');
+    await expect.poll(async () => (await status(page, bookId))?.status).toBe('completed');
+    expect(await status(page, bookId)).toMatchObject({
+      progress: { done: 10, total: 10, complete: true },
+    });
+    expect(
+      await Promise.all(
+        mock.chapterIds.map(async (chapterId) => (await read(page, bookId, chapterId)).revision),
+      ),
+    ).toEqual(revisions);
+    const subject = (id: string) =>
+      rpc<Manuscript>(page, 'book.doc.read', { bookId, doc: { type: 'subject', id } });
+    expect((await subject('indexer')).body.trim()).toBe(subjectDescription);
+    expect((await subject('unrelated')).body).toBe('');
+    expect(mock.drafts).toEqual([]);
     expect(mock.errors).toEqual([]);
   } finally {
     await app?.close().catch(() => {});

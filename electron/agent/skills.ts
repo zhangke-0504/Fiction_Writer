@@ -12,7 +12,7 @@ export function applySkill(
   report: ReportDiagnostic,
   skill: SkillName,
   text: string,
-  reason: 'agent' | 'draft' | 'append' | 'replace',
+  reason: 'agent' | 'draft' | 'append' | 'replace' | 'insert',
 ) {
   safeReporter(report)('skill.applied', { skill, fingerprint: fingerprint(text), reason });
 }

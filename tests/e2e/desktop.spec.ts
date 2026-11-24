@@ -15,6 +15,9 @@ test('renderer reload keeps the same backend', async ({}, testInfo) => {
     await page.reload();
     await expect(page.getByRole('heading', { name: '书库', exact: true })).toBeVisible();
     expect(await getPid()).toBe(pid);
+    expect(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isVisible())).toBe(
+      process.env.FW_E2E_SHOW_WINDOW === '1',
+    );
   } finally {
     await app.close();
   }

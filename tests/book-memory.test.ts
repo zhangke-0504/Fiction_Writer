@@ -14,7 +14,12 @@ import { runAgent } from '../electron/agent/loop.js';
 import type { AssistantTurn } from '../electron/agent/model.js';
 
 const clue = '秘密是黄铜月轮以退潮后的三声钟响为暗号。';
-const later = '黄铜月轮之所以熔化，是冬祭夜船长用冰盐点燃了它。';
+const opening = '舱门紧锁，罗盘还在桌面。';
+const later = opening + '\n\n黄铜月轮之所以熔化，是冬祭夜船长用冰盐点燃了它。';
+const nextBoundary = {
+  chapterId: 'chapter-26',
+  conditions: [{ quote: opening, condition: '必须让舱门保持锁定，仍能在桌面找到罗盘。' }],
+};
 const rule = '全书一律用第三人称有限视角';
 const answer = (text: string): AssistantTurn => ({ role: 'assistant', text, calls: [] });
 const chapter = (id: string) => ({ type: 'chapter' as const, id });
@@ -157,7 +162,9 @@ test('a new session writes chapter 25 using a middle passage from chapter 2, nev
   ]);
   const prompt = '续写黄铜月轮与三声钟响的暗号。';
   runs.start(second.id, prompt, async (ctx) => {
-    await draftChapter(workspace, ctx, provider, 'chapter-25', 'draft', prompt);
+    await draftChapter(workspace, ctx, provider, 'chapter-25', 'draft', prompt, {
+      plan: { nextBoundary },
+    });
   });
   await runs.wait(second.id);
   assert.equal(runs.get(second.id).run?.status, 'completed', runs.get(second.id).run?.error);
@@ -219,7 +226,9 @@ test('unsaved previews are never recalled, and a recalled source edited during d
     return answer(marker);
   });
   runs.start(session.id, prompt, async (ctx) => {
-    await draftChapter(workspace, ctx, provider, 'chapter-25', 'draft', prompt);
+    await draftChapter(workspace, ctx, provider, 'chapter-25', 'draft', prompt, {
+      plan: { nextBoundary },
+    });
   });
   await previewed.wait(AbortSignal.timeout(5000));
   assert.equal(runs.get(session.id).run?.preview?.content, marker);
@@ -236,7 +245,9 @@ test('unsaved previews are never recalled, and a recalled source edited during d
     return answer('基于旧版本的正文');
   });
   runs.start(session.id, prompt, async (ctx) => {
-    await draftChapter(workspace, ctx, racing, 'chapter-25', 'draft', prompt);
+    await draftChapter(workspace, ctx, racing, 'chapter-25', 'draft', prompt, {
+      plan: { nextBoundary },
+    });
   });
   await runs.wait(session.id);
   assert.equal(runs.get(session.id).run?.status, 'failed');

@@ -13,6 +13,17 @@ export const isId = (value: unknown): value is string =>
 export const docKey = (doc: DocRef) => `${doc.type}/${doc.id}`;
 export const digest = (data: string | Uint8Array) => createHash('sha256').update(data).digest('hex');
 
+/** Chapter order and the current authored/pending distinction affect narrative scope. */
+export function chapterPlacementFingerprint(documents: Manuscript[]) {
+  return digest(
+    JSON.stringify(
+      documents
+        .filter((doc) => doc.type === 'chapter')
+        .map(({ id, fields, body }) => [id, fields.order, fields.beatIds ?? [], !!body.trim()]),
+    ),
+  );
+}
+
 export class WorkspaceError extends Error {
   constructor(
     message: string,

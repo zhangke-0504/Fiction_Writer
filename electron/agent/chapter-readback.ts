@@ -4,13 +4,13 @@ import { classified, elapsed, safeReporter } from '../diagnostics/trace.js';
 import { docKey } from '../documents.js';
 import type { Manuscript } from '../../shared/contracts.js';
 import type { Guard } from '../workspace.js';
-import type { chapterContext } from './chapter-context.js';
+import type { ChapterReadbackContext as Context } from './chapter-context.js';
 import type { ModelProvider, ToolSpec, Turn } from './model.js';
 import { inputBudget, inputEstimate } from './context-budget.js';
 import { callRef } from './tool-receipts.js';
 import type { RunContext } from './runs.js';
+import { noteExcerpt, type NoteExcerpt } from './story-notes.js';
 
-type Context = ReturnType<typeof chapterContext>;
 type Readback = {
   chapterId: string;
   title: string;
@@ -46,6 +46,12 @@ export async function collectChapterReadbacks(
   signal: AbortSignal,
   diagnostic = noDiagnostic,
   run?: Pick<RunContext, 'id' | 'recordTool'>,
+  selectExcerpt: (
+    doc: Manuscript,
+    start: number,
+    end: number,
+    focus?: [number, number],
+  ) => NoteExcerpt | undefined = (doc, start, end) => noteExcerpt(doc.body, start, end),
 ) {
   const readbacks: Readback[] = [];
   const guards = new Map<string, Guard>();
@@ -175,17 +181,29 @@ export async function collectChapterReadbacks(
         typeof query === 'string'
           ? Math.max(offset, match - Math.floor((length - query.length) / 2))
           : offset;
+      const part = selectExcerpt(
+        doc,
+        start,
+        start + length,
+        typeof query === 'string' ? [match, match + query.length] : undefined,
+      );
+      if (!part) {
+        missing++;
+        item('chapter.readback.item', { documentRef, outcome: 'missing', reason: 'no_source' });
+        await receipt(call.id, 'no_match');
+        continue;
+      }
       hits++;
       item('chapter.readback.item', {
         documentRef,
         outcome: 'ok',
-        textLength: Math.min(length, doc.body.length - start),
+        textLength: part.text.length,
       });
       readbacks.push({
         chapterId,
         title: source.title,
-        offset: start,
-        text: doc.body.slice(start, start + length),
+        offset: part.range[0],
+        text: part.text,
       });
       await receipt(call.id);
     }

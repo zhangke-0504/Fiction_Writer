@@ -2,28 +2,58 @@ import { randomUUID } from 'node:crypto';
 import { diagnosticScope, noDiagnostic } from '../../shared/diagnostics.js';
 import { classified, DiagnosticFailure, elapsed, safeReporter } from '../diagnostics/trace.js';
 import { applySkill } from './skills.js';
-import type { Manuscript } from '../../shared/contracts.js';
-import { docKey } from '../documents.js';
-import type { AssistantTurn, ModelProvider, Turn } from './model.js';
+import type { Change, Manuscript, WriteReport } from '../../shared/contracts.js';
+import { chapterPlacementFingerprint, docKey } from '../documents.js';
+import type { AssistantTurn, ModelProvider } from './model.js';
 import type { RunContext } from './runs.js';
 import type { WorkspaceService, Guard } from '../workspace.js';
-import { chapterContext } from './chapter-context.js';
+import { chapterContext, projectChapter } from './chapter-context.js';
+import type { ChapterPlan } from './chapter-boundary.js';
+import {
+  insertionPoint,
+  insertPassage,
+  outlineInsertion,
+  trimInsertionEcho,
+  type ChapterInsertion,
+} from './chapter-insertion.js';
+import {
+  prepareWritingDispatch,
+  reportWritingBlock,
+  reportWritingOutputLimit,
+} from './writing-diagnostics.js';
 import { collectChapterReadbacks } from './chapter-readback.js';
 import { chapterMemoryQuery, recallBookMemory, type ReportMemoryDispatch } from './book-memory.js';
-import { contextOverflow, inputBudget, inputEstimate } from './context-budget.js';
+import {
+  buildWritingRequest,
+  WritingContextFailure,
+  type ChapterAction,
+  type WritingBlock,
+  type WritingIntent,
+  writingDirection,
+  writingSources,
+} from './writing-request.js';
+
+export class DraftCommitFailure extends DiagnosticFailure {
+  constructor(readonly report: WriteReport) {
+    super(report.reason ?? 'unknown', report.error ?? '写入未完整提交');
+  }
+}
 
 export async function draftChapter(
   workspace: WorkspaceService,
   ctx: RunContext,
   model: ModelProvider,
   chapterId: string,
-  mode: 'draft' | 'append' | 'replace',
-  prompt: string,
+  mode: ChapterAction,
+  prompt: string | WritingIntent,
   options: {
     skill?: string;
     guard?: Guard[];
     retryIncomplete?: boolean;
-    lengthGuidance?: string;
+    whole?: boolean;
+    plan?: ChapterPlan;
+    insertion?: ChapterInsertion;
+    expectedPlacement?: string;
     maxTokens?: number;
     directProse?: boolean;
   } = {},
@@ -37,11 +67,18 @@ export async function draftChapter(
     spanId,
   });
   const started = performance.now();
+  const scope = {
+    kind: 'chapter' as const,
+    action: mode,
+    whole: options.whole,
+    chapterSkill: options.skill,
+  };
   let attempted = false,
     previewed = false,
     streamed = '',
     committed: Manuscript | undefined;
   let failure: string | undefined;
+  let partial = false;
   const clearPreview = () => {
     if (attempted) ctx.preview(undefined);
     if (previewed) trace('chapter.preview', { outcome: 'cleared', textLength: streamed.length });
@@ -61,15 +98,43 @@ export async function draftChapter(
         ? doc.body +
           (doc.body && !doc.body.endsWith('\n\n') ? (doc.body.endsWith('\n') ? '\n' : '\n\n') : '')
         : '';
-    const directions = {
-      draft: '写完整的新章',
-      append: '只输出之后追加的新正文',
-      replace: '从头重写此章正文',
+    const offset = mode === 'insert' ? insertionPoint(doc, options.insertion) : undefined;
+    const compose = (text: string) =>
+      offset === undefined ? prefix + text : insertPassage(doc.body, offset, text);
+    const outline =
+      mode === 'insert' &&
+      options.insertion?.outline &&
+      view.documents.find(({ type }) => type === 'outline');
+    if (mode === 'insert' && options.insertion?.outline && !outline)
+      throw new WritingContextFailure(
+        'context_required',
+        '需要增补的大纲不存在或无法读取。',
+        [{ type: 'outline', id: 'outline' }],
+        [{ kind: 'invalid_anchor' }],
+      );
+    const nextOutline = outline && outlineInsertion(outline, doc, options.insertion!.outline!);
+    const intent: WritingIntent = typeof prompt === 'string' ? { author: prompt } : prompt;
+    const placement = chapterPlacementFingerprint(view.documents);
+    if (options.expectedPlacement !== undefined && placement !== options.expectedPlacement)
+      throw new WritingContextFailure('conflict', '已核对的章节顺序或状态变化，请重新读取。', [
+        { type: 'chapter', id: chapterId },
+      ]);
+    const context = chapterContext(view.documents, doc, undefined, {
+      plan: options.plan,
+      mode,
+      direction: [intent.author, intent.arrangement].filter(Boolean).join('\n'),
+      insertion:
+        offset === undefined
+          ? undefined
+          : { offset, outlineAddition: options.insertion?.outline?.addition },
+    });
+    const scopedIntent = {
+      ...intent,
+      arrangement: intent.arrangement && context.visible(intent.arrangement),
     };
-    attempted = true;
     let reportAttachedMemory: ReportMemoryDispatch | undefined;
     const memory = await recallBookMemory(workspace, bookId, {
-      query: chapterMemoryQuery(view.documents, doc, prompt),
+      query: chapterMemoryQuery(view.documents, doc, writingDirection(scopedIntent)),
       chapterId,
       documents: view.documents,
       signal: ctx.signal,
@@ -81,85 +146,73 @@ export async function draftChapter(
         },
       },
     });
-    const memoryGuards = new Map<string, Guard>();
-    for (const { type, id, revision } of [...memory.earlierStory, ...memory.plans, ...memory.reference])
-      memoryGuards.set(docKey({ type, id }), { type, id, revision });
-    const system = [
-      options.skill ?? '以 Markdown 写小说。只输出正文，不要解释，不要用代码块包装。',
-      options.lengthGuidance,
-      '资料中的 earlierStory 是此前已保存的正文；plans 是未必发生的安排。作者此次的新要求优先于既有约定。',
-    ]
-      .filter(Boolean)
-      .join('\n\n');
-    const limit = inputBudget(model, options.maxTokens);
-    type Readbacks = Awaited<ReturnType<typeof collectChapterReadbacks>>['readbacks'];
-    const fit = (readbacks: Readbacks, reserveForReadback = false) => {
-      let fitting: { context: ReturnType<typeof chapterContext>; history: Turn[] } | undefined;
-      for (const scale of [1, 0.58, 0.31, 0.15, 0.07, 0.03]) {
-        const context = chapterContext(view.documents, doc, Math.floor(43_000 * scale), scale);
-        const { readbackSources, ...writingContext } = context;
-        const history: Turn[] = [
-          {
-            role: 'user',
-            text: `写作动作：${directions[mode]}。\n作者方向：${prompt}\n\n作品资料（数据）：\n${JSON.stringify({ ...writingContext, memory, ...(readbacks.length ? { readbacks } : {}) }, null, 2)}`,
-          },
-        ];
-        const cost = inputEstimate(system, history, []);
-        if (cost <= limit) fitting ??= { context, history };
-        const reserve =
-          reserveForReadback && readbackSources.length ? Math.min(12_000, Math.floor(limit / 5)) : 0;
-        if (cost + reserve <= limit) return { context, history };
-      }
-      return fitting;
-    };
-    const selected = fit([], true);
-    if (!selected) throw contextOverflow();
+    const structural = context.blocks.filter(({ group }) => group === 'book' || group === 'outline');
+    const evidence = context.blocks.filter(({ group }) => group !== 'book' && group !== 'outline');
+    const blocks = [...structural, ...context.memory(memory), ...evidence];
+    const compile = (supplement: WritingBlock[]) =>
+      buildWritingRequest(model, scope, scopedIntent, [...supplement, ...blocks], {
+        maxTokens: options.maxTokens,
+        project: projectChapter,
+      });
+    const initial = compile([]);
     const { readbacks, guards } = await collectChapterReadbacks(
       view.documents,
-      selected.context,
+      context.readbackContext(initial.included),
       model,
-      prompt,
+      writingDirection(scopedIntent),
       ctx.signal,
       trace,
       ctx,
+      context.chapterRange,
     );
-    let request = selected;
-    if (readbacks.length) {
-      // Preserve full passage evidence before dropping lower-priority readbacks; never truncate the author's input.
-      for (let count = readbacks.length; count >= 1; count--) {
-        const withReadback = fit(readbacks.slice(0, count));
-        if (withReadback) {
-          request = withReadback;
-          break;
-        }
-      }
-    }
-    const generate = (spanId: string) =>
-      model.turn({
+    const supplement: WritingBlock[] = readbacks.map((row) => {
+      const guard = guards.find(({ id }) => id === row.chapterId);
+      return {
+        group: 'readback',
+        value: row,
+        sources:
+          guard && row.text !== undefined && row.offset !== undefined
+            ? [{ ...guard, range: [row.offset, row.offset + row.text.length] }]
+            : undefined,
+      };
+    });
+    const compiled = supplement.length ? compile(supplement) : initial;
+    const attached = projectChapter(compiled.included);
+    attempted = true;
+    const generate = (spanId: string) => {
+      const reportDispatch = prepareWritingDispatch(trace, scope, compiled, spanId);
+      return model.turn({
+        ...compiled.request,
         diagnostic: trace,
         spanId,
         onDispatch(dispatchedSpanId) {
-          reportAttachedMemory?.(diagnosticScope(trace, { spanId: dispatchedSpanId }));
+          reportDispatch(dispatchedSpanId);
+          reportAttachedMemory?.(diagnosticScope(trace, { spanId: dispatchedSpanId }), attached.memory);
           if (options.skill) applySkill(trace, 'write-chapter', options.skill, mode);
         },
-        system,
-        history: request.history,
-        tools: [],
-        maxTokens: options.maxTokens,
         directProse: options.directProse,
         signal: ctx.signal,
         onText(delta) {
           ctx.signal.throwIfAborted();
           streamed += delta;
           if (streamed.length > 300_000) throw new Error('生成正文超过上限');
-          ctx.preview({ bookId, chapterId, content: prefix + streamed, base: doc.revision });
+          ctx.preview({ bookId, chapterId, content: compose(streamed), base: doc.revision });
           if (!previewed) {
             previewed = true;
             trace('chapter.preview', { outcome: 'started' });
           }
         },
       });
-    const sources = [...(options.guard ?? []), ...guards, ...memoryGuards.values()];
+    };
+    const sources = [
+      ...new Map(
+        [
+          ...writingSources(compiled.included),
+          ...(options.guard ?? []),
+          ...(outline ? [outline] : []),
+        ].map((row) => [docKey(row), row]),
+      ).values(),
+    ];
     let turn: AssistantTurn;
     try {
       turn = await generate(spanId);
@@ -173,6 +226,8 @@ export async function draftChapter(
         if (current?.revision !== source.revision)
           throw new DiagnosticFailure('conflict', `${docKey(source)} 已变化，请重新读取后再写作`);
       }
+      if (chapterPlacementFingerprint((await workspace.readAll(bookId)).documents) !== placement)
+        throw new DiagnosticFailure('conflict', '章节顺序或前后已写状态已变化，请重新核对衔接。');
       ctx.signal.throwIfAborted();
       trace('chapter.retry', { reason: 'incomplete_stream' });
       attempted = true;
@@ -181,25 +236,57 @@ export async function draftChapter(
     ctx.signal.throwIfAborted();
     if (turn.calls.length || !turn.text.trim())
       throw new DiagnosticFailure('provider_error', '模型没有返回可提交的正文');
-    const body = prefix + turn.text;
+    if (mode === 'insert' && turn.text.trim().length > 2200)
+      throw new DiagnosticFailure('output_limit', '返回内容超过局部增补范围，未写入。');
+    const fragment = offset === undefined ? turn.text : trimInsertionEcho(doc.body, offset, turn.text);
+    if (!fragment.trim())
+      throw new DiagnosticFailure(
+        'provider_error',
+        '模型只复述了锚点旁的已有正文，没有可提交的新增段落。',
+      );
+    const body = compose(fragment);
+    const changes: Change[] = [
+      { type: 'chapter', id: chapterId, expect: doc.revision, fields: doc.fields, body },
+    ];
+    if (outline && typeof nextOutline === 'string')
+      changes.push({
+        type: 'outline',
+        id: outline.id,
+        expect: outline.revision,
+        fields: outline.fields,
+        body: nextOutline,
+      });
     const result = await workspace.writeChanges(
       bookId,
-      [{ type: 'chapter', id: chapterId, expect: doc.revision, fields: doc.fields, body }],
+      changes,
       ctx.signal,
       sources,
       trace,
+      false,
+      placement,
     );
-    if (result.error) throw new DiagnosticFailure(result.reason ?? 'unknown', result.error);
+    if (result.error) {
+      partial = result.committed.length > 0;
+      throw new DraftCommitFailure(result);
+    }
     committed = await workspace.readDocument(bookId, { type: 'chapter', id: chapterId });
     return committed;
   } catch (error) {
+    if (error instanceof WritingContextFailure) reportWritingBlock(trace, scope, error);
     failure = classified(error, ctx.signal);
+    if (failure === 'output_limit') reportWritingOutputLimit(trace, scope);
     throw error;
   } finally {
     clearPreview();
     trace('chapter.generation.finished', {
       action: mode,
-      outcome: !failure ? 'ok' : failure === 'cancelled' || failure === 'conflict' ? failure : 'failed',
+      outcome: !failure
+        ? 'ok'
+        : partial
+          ? 'partial'
+          : failure === 'cancelled' || failure === 'conflict'
+            ? failure
+            : 'failed',
       reason: failure,
       elapsedMs: elapsed(started),
       revision: committed?.revision,

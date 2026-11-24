@@ -16,6 +16,7 @@ import { DiagnosticFailure, classified, elapsed, responseDiagnostic } from './di
 const here = dirname(fileURLToPath(import.meta.url));
 const isTest = !app.isPackaged && process.env.FW_E2E === '1';
 const testRoot = isTest ? process.env.FW_TEST_ROOT : undefined;
+const hiddenTestWindow = !!testRoot && process.env.FW_E2E_SHOW_WINDOW !== '1';
 if (testRoot) {
   const chromiumState = join(testRoot, 'electron-user-data');
   mkdirSync(chromiumState, { recursive: true });
@@ -179,13 +180,15 @@ function createWindow() {
     height: 900,
     minWidth: 760,
     minHeight: 540,
-    show: true,
+    show: !hiddenTestWindow,
     autoHideMenuBar: true,
     backgroundColor: '#f7f6f3',
     webPreferences: {
       preload: join(here, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Playwright still drives the actual renderer while the test window is hidden.
+      backgroundThrottling: !hiddenTestWindow,
     },
   });
   rendererId = undefined;
@@ -274,7 +277,7 @@ async function invoke(method: string, args: unknown, requestId?: string) {
 if (!testRoot && !app.requestSingleInstanceLock()) app.quit();
 else {
   app.on('second-instance', () => {
-    if (window) {
+    if (window && !hiddenTestWindow) {
       if (window.isMinimized()) window.restore();
       window.focus();
     }
