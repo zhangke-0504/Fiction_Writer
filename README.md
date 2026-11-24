@@ -78,6 +78,20 @@ $rows | Where-Object { $_.fields.runId -eq $id -or $requestIds -contains $_.fiel
 
 日志不会保存 API Key、提示词、正文、附件、原始工具参数或输出、命令、隐藏推理和异常原文，也不替代作品备份或 Session 历史。排障优先提供诊断编号及核对过的必要事件，不要提交日志文件或粘贴密钥配置。
 
+### 排查作品记忆
+
+用上面命令读取 `$rows`，把 `$id` 设为本次 `runId`。成功运行未显示诊断编号时，可以在后台日志按时间找到对应的 `run.started`，取 `fields.runId`。只看本次记忆和模型响应：
+
+```powershell
+$rows | Where-Object { $_.fields.runId -eq $id -and
+  ($_.event -like 'memory.*' -or $_.event -eq 'model.http') } |
+  Sort-Object time, logSeq | Format-List time, bootId, event, fields
+```
+
+- **是否召回：** `memory.recall.finished` 的 `trigger` 区分 `agent`、`draft`、`tool`。`outcome: ok` 且 `storyCount`、`planCount`、`referenceCount`、`conventionCount` 都为零是正常空结果，不是失败。显式 `book_memory_recall` 还可以用 `callId` 对照工具执行事件。
+- **索引是否刷新：** 用 `recallId` 找 `memory.index.finished`。`cacheAction` 为 `created`、`updated` 才表示实际写入；`unchanged` 表示未写，`degraded` 表示本次根据现稿在内存中处理，`cacheIssue` 可区分读失败、格式无效和写失败。降级仍可能正确召回。
+- **哪个请求带了证据：** 用 `recallId` 跟到 `memory.context.dispatched`，再用 `spanId` 对照 `memory.context.source` 和 `model.http`。正文重试使用新的 `spanId`。可以看证据类别、来源章序和文档／修订指纹；每次派发最多记录 8 个来源。同一 `bootId`、`workspaceRef` 下可以和文件提交事件比较指纹。派发只表示交给传输层，不代表上游收到或模型采纳；无对应的派发行也可能是本地日志缺失，不要把它当成模型没有收到的证明。
+
 ## V1 边界
 
 - 书籍、资料、章节和 Session 的删除是硬删除，无撤销、归档或确认弹窗。删除运行中的 Session 或作品时先停止对应的后台任务；此前已经写成的其他内容不会回滚。

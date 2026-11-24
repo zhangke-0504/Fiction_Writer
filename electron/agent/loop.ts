@@ -10,6 +10,7 @@ import {
   type UserMessage,
 } from '@earendil-works/pi-ai';
 import type { AssistantTurn, ModelProvider, ToolSpec, Turn } from './model.js';
+import type { ReportMemoryDispatch } from './book-memory.js';
 import type { RunContext } from './runs.js';
 import type { ToolResult } from '../../shared/contracts.js';
 import { ActiveContext } from './active-context.js';
@@ -129,6 +130,7 @@ export async function runAgent(
   prompt: string,
   tools: LocalTool[],
   budget: number | AgentBudget = defaultRoundLimit,
+  reportAttachedMemory?: ReportMemoryDispatch,
 ) {
   const trace = diagnosticScope(safeReporter(ctx.diagnostic ?? noDiagnostic), { lane: 'agent' });
   const maxOutput = () => (typeof budget === 'number' ? undefined : budget.outputTokens());
@@ -329,6 +331,8 @@ export async function runAgent(
           diagnostic: report,
           spanId,
           onDispatch(nextSpanId) {
+            // The base system block is intact in the fitted wire projection.
+            reportAttachedMemory?.(diagnosticScope(report, { spanId: nextSpanId }));
             for (const { candidate, result, tool } of outbound.splice(0)) {
               candidate.report('tool.result_sent', { spanId: nextSpanId, nextTurn: number });
               tool?.onResultSent?.(

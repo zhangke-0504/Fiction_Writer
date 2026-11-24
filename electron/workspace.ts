@@ -290,7 +290,7 @@ export class WorkspaceService {
     bookId: string,
     edit: (source?: string) => { value: T; replacement?: string },
     options: { signal?: AbortSignal; bestEffort?: boolean } = {},
-  ): Promise<T> {
+  ): Promise<{ value: T; storage: 'unchanged' | 'created' | 'updated' | 'write_failed' }> {
     return this.enqueue(bookId, async () => {
       options.signal?.throwIfAborted();
       const root = await this.checkedRoot(bookId);
@@ -313,12 +313,14 @@ export class WorkspaceService {
           if (Buffer.byteLength(replacement) > limit) throw new WorkspaceError('作品记忆超过限制');
           await this.checkFileParent(root, path, true);
           await this.replace(path, replacement, options.signal);
+          return { value, storage: source === undefined ? 'created' : 'updated' };
         } catch (error) {
           options.signal?.throwIfAborted();
           if (!options.bestEffort) throw error;
+          return { value, storage: 'write_failed' };
         }
       }
-      return value;
+      return { value, storage: 'unchanged' };
     });
   }
   private async revision(root: string, bookId: string, ref: DocRef) {

@@ -9,7 +9,7 @@ import type { RunContext } from './runs.js';
 import type { WorkspaceService, Guard } from '../workspace.js';
 import { chapterContext } from './chapter-context.js';
 import { collectChapterReadbacks } from './chapter-readback.js';
-import { chapterMemoryQuery, recallBookMemory } from './book-memory.js';
+import { chapterMemoryQuery, recallBookMemory, type ReportMemoryDispatch } from './book-memory.js';
 import { contextOverflow, inputBudget, inputEstimate } from './context-budget.js';
 
 export async function draftChapter(
@@ -67,11 +67,19 @@ export async function draftChapter(
       replace: '从头重写此章正文',
     };
     attempted = true;
+    let reportAttachedMemory: ReportMemoryDispatch | undefined;
     const memory = await recallBookMemory(workspace, bookId, {
       query: chapterMemoryQuery(view.documents, doc, prompt),
       chapterId,
       documents: view.documents,
       signal: ctx.signal,
+      diagnostic: {
+        trigger: 'draft',
+        report: trace,
+        captureDispatch(report) {
+          reportAttachedMemory = report;
+        },
+      },
     });
     const memoryGuards = new Map<string, Guard>();
     for (const { type, id, revision } of [...memory.earlierStory, ...memory.plans, ...memory.reference])
@@ -130,7 +138,8 @@ export async function draftChapter(
       model.turn({
         diagnostic: trace,
         spanId,
-        onDispatch() {
+        onDispatch(dispatchedSpanId) {
+          reportAttachedMemory?.(diagnosticScope(trace, { spanId: dispatchedSpanId }));
           if (options.skill) applySkill(trace, 'write-chapter', options.skill, mode);
         },
         system,

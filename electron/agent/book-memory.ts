@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import type { DocRef, Manuscript } from '../../shared/contracts.js';
 import { docKey, isId } from '../documents.js';
-import { DiagnosticFailure } from '../diagnostics/trace.js';
+import {
+  diagnosticScope,
+  noDiagnostic,
+  type DiagnosticFields,
+  type ReportDiagnostic,
+} from '../../shared/diagnostics.js';
+import { classified, DiagnosticFailure, elapsed, safeReporter } from '../diagnostics/trace.js';
 import type { WorkspaceService } from '../workspace.js';
 import { object, str, type LocalTool } from './loop.js';
 
@@ -139,16 +145,108 @@ export function chapterMemoryQuery(documents: Manuscript[], target: Manuscript, 
   ].join('\n');
 }
 
+export type ReportMemoryDispatch = (report: ReportDiagnostic) => void;
+
+type RecallOptions = {
+  query: string;
+  chapterId?: string;
+  documents?: Manuscript[];
+  signal?: AbortSignal;
+  limit?: number;
+  diagnostic?: {
+    trigger: 'agent' | 'draft' | 'tool';
+    report?: ReportDiagnostic;
+    captureDispatch?: (dispatch: ReportMemoryDispatch) => void;
+  };
+};
+
+const memoryCounts = (result: BookRecall) => ({
+  storyCount: result.earlierStory.length,
+  planCount: result.plans.length,
+  referenceCount: result.reference.length,
+  conventionCount: result.conventions.length,
+});
+
+/** Keep only bounded metadata about the memory block that goes into an automatic request. */
+function memoryDispatchResult(
+  result: BookRecall,
+  link: DiagnosticFields,
+  counts: ReturnType<typeof memoryCounts>,
+): ReportMemoryDispatch {
+  const groups = [
+    ['story', result.earlierStory],
+    ['plan', result.plans],
+    ['reference', result.reference],
+  ] as const;
+  const seen = new Set<string>();
+  const sources: DiagnosticFields[] = [];
+  for (const [sourceType, rows] of groups) {
+    for (const { type, id, revision, chapterOrder } of rows) {
+      const documentRef = docKey({ type, id });
+      const key = `${documentRef}\0${revision}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (sources.length < 8)
+        sources.push({
+          sourceType,
+          documentRef,
+          revision,
+          docType: type,
+          sourceChapterOrder: chapterOrder,
+        });
+    }
+  }
+  const summary = { ...counts, sourceCount: seen.size, omittedSources: seen.size - sources.length };
+  return (report) => {
+    const trace = diagnosticScope(safeReporter(report), link);
+    trace('memory.context.dispatched', summary);
+    for (const source of sources) trace('memory.context.source', source);
+  };
+}
+
 export async function recallBookMemory(
   workspace: WorkspaceService,
   bookId: string,
-  options: {
-    query: string;
-    chapterId?: string;
-    documents?: Manuscript[];
-    signal?: AbortSignal;
-    limit?: number;
-  },
+  options: RecallOptions,
+): Promise<BookRecall> {
+  const diag = options.diagnostic;
+  if (!diag) return recall(workspace, bookId, options);
+  const link = {
+    workspaceRef: bookId,
+    recallId: randomUUID(),
+    trigger: diag.trigger,
+    ...(isId(options.chapterId) && { documentRef: docKey({ type: 'chapter', id: options.chapterId }) }),
+  };
+  const trace = diagnosticScope(safeReporter(diag.report ?? noDiagnostic), link);
+  const started = performance.now();
+  try {
+    const result = await recall(workspace, bookId, options, trace);
+    const counts = memoryCounts(result);
+    trace('memory.recall.finished', { ...counts, outcome: 'ok', elapsedMs: elapsed(started) });
+    if (diag.trigger !== 'tool' && diag.captureDispatch && Object.values(counts).some(Boolean)) {
+      try {
+        diag.captureDispatch(memoryDispatchResult(result, link, counts));
+      } catch {
+        // An observer may not alter the recall result.
+      }
+    }
+    return result;
+  } catch (error) {
+    const reason = classified(error, options.signal);
+    trace('memory.recall.finished', {
+      outcome: options.signal?.aborted || reason === 'cancelled' ? 'cancelled' : 'failed',
+      reason,
+      elapsedMs: elapsed(started),
+    });
+    throw error;
+  }
+}
+
+async function recall(
+  workspace: WorkspaceService,
+  bookId: string,
+  options: RecallOptions,
+  report?: ReportDiagnostic,
 ): Promise<BookRecall> {
   const { signal, chapterId } = options;
   signal?.throwIfAborted();
@@ -160,13 +258,23 @@ export async function recallBookMemory(
   const allowed = new Set(chapters.slice(0, target).map((doc) => doc.id));
   const indexed = (file: MemoryFile) => {
     const sources: MemoryFile['sources'] = {};
+    const remaining = report && new Set(Object.keys(file.sources));
     let count = 0,
-      sourceCount = 0;
+      sourceCount = 0,
+      reusedCount = 0,
+      rebuiltCount = 0,
+      staleCount = 0;
     const rows = documents
       .filter((doc) => doc.body.trim())
       .map((doc) => {
         const key = docKey(doc);
-        const ranges = cached(file.sources[key], doc) ?? passages(doc.body);
+        const old = file.sources[key];
+        const reused = cached(old, doc);
+        const ranges = reused ?? passages(doc.body);
+        if (reused) reusedCount++;
+        else rebuiltCount++;
+        if (remaining?.delete(key) && typeof old?.revision === 'string' && old.revision !== doc.revision)
+          staleCount++;
         if (count + ranges.length <= cacheLimit && sourceCount < 1200) {
           sources[key] = { revision: doc.revision, passages: ranges };
           count += ranges.length;
@@ -174,21 +282,52 @@ export async function recallBookMemory(
         }
         return { doc, ranges };
       });
-    return { rows, next: { ...file, sources } };
+    for (const key of remaining ?? []) if (typeof file.sources[key]?.revision === 'string') staleCount++;
+    return { rows, next: { ...file, sources }, stats: { reusedCount, rebuiltCount, staleCount } };
   };
+  const started = performance.now();
+  let failedStage: 'read_failed' | 'invalid_format' | 'processing_failed' = 'read_failed';
+  const indexFinished = (fields: DiagnosticFields) =>
+    report?.('memory.index.finished', { ...fields, elapsedMs: elapsed(started) });
   const { rows, next } = await workspace
     .updateBookMemory(
       bookId,
       (source) => {
-        const value = indexed(load(source, bookId));
+        failedStage = 'invalid_format';
+        const file = load(source, bookId);
+        failedStage = 'processing_failed';
+        const value = indexed(file);
         return { value, replacement: JSON.stringify(value.next) };
       },
       { signal, bestEffort: true },
     )
-    .catch(() => {
-      signal?.throwIfAborted();
-      return indexed(empty(bookId));
-    });
+    .then(
+      ({ value, storage }) => {
+        const degraded = storage === 'write_failed';
+        indexFinished({
+          ...value.stats,
+          cacheAction: degraded ? 'degraded' : storage,
+          cacheIssue: degraded ? 'write_failed' : undefined,
+          outcome: degraded ? 'partial' : 'ok',
+        });
+        return value;
+      },
+      () => {
+        if (signal?.aborted) {
+          indexFinished({ cacheAction: 'cancelled', outcome: 'cancelled' });
+          signal.throwIfAborted();
+        }
+        const value = indexed(empty(bookId));
+        indexFinished({
+          ...value.stats,
+          staleCount: undefined,
+          cacheAction: 'degraded',
+          cacheIssue: failedStage,
+          outcome: 'partial',
+        });
+        return value;
+      },
+    );
   signal?.throwIfAborted();
 
   const query = terms(options.query.slice(0, 1400));
@@ -296,30 +435,32 @@ export function bookMemoryTools(
         (!text.trim() || text.length > ruleSize || !plain(prompt).includes(plain(text))))
     )
       throw new DiagnosticFailure('memory_not_requested', '只保存本轮作者明确要求记住的原文约定');
-    return workspace.updateBookMemory(
-      bookId,
-      (source) => {
-        const file = load(source, bookId);
-        const pos = id ? file.conventions.findIndex((rule) => rule.id === id) : -1;
-        if (id && pos < 0) throw new DiagnosticFailure('missing', '这条作者约定不存在');
-        if (text === undefined) {
-          file.conventions.splice(pos, 1);
-          return { value: { id, removed: true }, replacement: JSON.stringify(file) };
-        }
-        const existing = file.conventions.find((rule) => rule.text === text.trim());
-        if (!id && existing) return { value: { id: existing.id, removed: false } };
-        const row = { id: id ?? randomUUID(), text: text.trim() };
-        if (pos >= 0) file.conventions[pos] = row;
-        else file.conventions.push(row);
-        if (
-          file.conventions.length > ruleCount ||
-          file.conventions.reduce((sum, item) => sum + item.text.length, 0) > rulesBudget
-        )
-          throw new DiagnosticFailure('memory_limit', '作品约定已满，请更正或移除已有约定');
-        return { value: { id: row.id, removed: false }, replacement: JSON.stringify(file) };
-      },
-      { signal },
-    );
+    return workspace
+      .updateBookMemory(
+        bookId,
+        (source) => {
+          const file = load(source, bookId);
+          const pos = id ? file.conventions.findIndex((rule) => rule.id === id) : -1;
+          if (id && pos < 0) throw new DiagnosticFailure('missing', '这条作者约定不存在');
+          if (text === undefined) {
+            file.conventions.splice(pos, 1);
+            return { value: { id, removed: true }, replacement: JSON.stringify(file) };
+          }
+          const existing = file.conventions.find((rule) => rule.text === text.trim());
+          if (!id && existing) return { value: { id: existing.id, removed: false } };
+          const row = { id: id ?? randomUUID(), text: text.trim() };
+          if (pos >= 0) file.conventions[pos] = row;
+          else file.conventions.push(row);
+          if (
+            file.conventions.length > ruleCount ||
+            file.conventions.reduce((sum, item) => sum + item.text.length, 0) > rulesBudget
+          )
+            throw new DiagnosticFailure('memory_limit', '作品约定已满，请更正或移除已有约定');
+          return { value: { id: row.id, removed: false }, replacement: JSON.stringify(file) };
+        },
+        { signal },
+      )
+      .then(({ value }) => value);
   };
   return [
     {
@@ -338,6 +479,7 @@ export function bookMemoryTools(
           query: typeof args.query === 'string' ? args.query : '',
           chapterId: typeof args.chapterId === 'string' ? args.chapterId : selectedChapterId,
           signal: ctx.signal,
+          diagnostic: { trigger: 'tool', report: ctx.diagnostic },
         }),
     },
     {

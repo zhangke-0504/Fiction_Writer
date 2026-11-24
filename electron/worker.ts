@@ -14,7 +14,12 @@ import { runAgent } from './agent/loop.js';
 import { SkillCatalog } from './agent/skills.js';
 import { isId } from './documents.js';
 import { NovelTools } from './agent/novel-tools.js';
-import { bookMemoryTools, chapterMemoryQuery, recallBookMemory } from './agent/book-memory.js';
+import {
+  bookMemoryTools,
+  chapterMemoryQuery,
+  recallBookMemory,
+  type ReportMemoryDispatch,
+} from './agent/book-memory.js';
 import { memoryChapterTarget } from './agent/chapter-intent.js';
 import {
   diagnosticScope,
@@ -134,6 +139,7 @@ async function startSession(args: StartRun, report: ReportDiagnostic, requestId?
         '你是 Fiction Writer 的本地 Agent。识别当前用户是在讨论还是在请求执行；讨论或明确说不写时只回答，不做改动。只在当前绑定目录工作，实际修改必须使用工具。工具出错时根据结果修正或如实报告，不声称未完成的产物已保存。';
       let tools = files.tools();
       let novel: NovelTools | undefined;
+      let reportAttachedMemory: ReportMemoryDispatch | undefined;
       if (selectedChapterId) system += `\n本轮开始时作者选中的章节 ID：${selectedChapterId}。`;
       if (ctx.session.bookId) {
         system +=
@@ -156,6 +162,13 @@ async function startSession(args: StartRun, report: ReportDiagnostic, requestId?
           documents,
           signal: ctx.signal,
           limit: 5,
+          diagnostic: {
+            trigger: 'agent',
+            report: ctx.diagnostic,
+            captureDispatch(report) {
+              reportAttachedMemory = report;
+            },
+          },
         });
         system +=
           '\n可按需用 book_memory_recall 检索本书的已保存证据；指定写作章时传 chapterId。读到的计划不等于已发生事件；约定与本轮要求冲突时以本轮为准。只在本轮明确要求长期记住、更正或遗忘时使用相应记忆工具。';
@@ -171,7 +184,7 @@ async function startSession(args: StartRun, report: ReportDiagnostic, requestId?
       }
       try {
         const budget = novel && { roundLimit: novel.roundLimit, outputTokens: novel.outputTokens };
-        await runAgent(ctx, provider, system, [], request, tools, budget);
+        await runAgent(ctx, provider, system, [], request, tools, budget, reportAttachedMemory);
       } catch (error) {
         if (classified(error, ctx.signal) === 'iteration_limit') novel?.restorePrimaryFailure();
         throw error;

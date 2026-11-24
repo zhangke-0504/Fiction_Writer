@@ -171,6 +171,16 @@ const applied = {
 };
 const action = one('draft', 'append', 'replace');
 const docType = one('book', 'outline', 'subject', 'clue', 'chapter');
+const memoryRecall = { recallId: uuid, trigger: one('agent', 'draft', 'tool') };
+const memoryDispatch = { recallId: uuid, trigger: one('agent', 'draft') };
+const memoryCounts = {
+  storyCount: count,
+  planCount: count,
+  referenceCount: count,
+  conventionCount: count,
+};
+const memoryRequired = ['runId', 'workspaceRef', 'recallId', 'trigger'] as const;
+const memoryDispatchRequired = [...memoryRequired, 'spanId'] as const;
 const core: Schema = {
   requestId: uuid,
   runId: uuid,
@@ -208,10 +218,15 @@ const main = (fields: Schema, level?: Definition['level']): Definition => ({
   fields,
   level,
 });
-const worker = (fields: Schema, level?: Definition['level']): Definition => ({
+const worker = (
+  fields: Schema,
+  level?: Definition['level'],
+  required?: readonly string[],
+): Definition => ({
   sources: ['worker'],
   fields,
   level,
+  required,
 });
 const ui = (fields: Schema, required: readonly string[], level?: Definition['level']): Definition => ({
   sources: ['renderer'],
@@ -316,6 +331,47 @@ const diag = new Map<string, Definition>(
     'model.first_event': worker({ elapsedMs: duration }),
     'context.compacted': worker({ count, omittedCount: count }),
     'context.checkpoint': worker({ count, source: one('model', 'excerpt') }),
+    'memory.recall.finished': worker(
+      {
+        ...memoryRecall,
+        ...memoryCounts,
+        outcome: one('ok', 'failed', 'cancelled'),
+        reason,
+        elapsedMs: duration,
+      },
+      undefined,
+      [...memoryRequired, 'outcome', 'elapsedMs'],
+    ),
+    'memory.index.finished': worker(
+      {
+        ...memoryRecall,
+        cacheAction: one('unchanged', 'created', 'updated', 'degraded', 'cancelled'),
+        cacheIssue: one('read_failed', 'invalid_format', 'write_failed', 'processing_failed'),
+        outcome: one('ok', 'partial', 'cancelled'),
+        reusedCount: count,
+        rebuiltCount: count,
+        staleCount: count,
+        elapsedMs: duration,
+      },
+      undefined,
+      [...memoryRequired, 'cacheAction', 'outcome', 'elapsedMs'],
+    ),
+    'memory.context.dispatched': worker(
+      { ...memoryDispatch, ...memoryCounts, sourceCount: count, omittedSources: count },
+      undefined,
+      [...memoryDispatchRequired, ...Object.keys(memoryCounts), 'sourceCount', 'omittedSources'],
+    ),
+    'memory.context.source': worker(
+      {
+        ...memoryDispatch,
+        docType,
+        revision,
+        sourceType: one('story', 'plan', 'reference'),
+        sourceChapterOrder: sequence,
+      },
+      undefined,
+      [...memoryDispatchRequired, 'documentRef', 'docType', 'revision', 'sourceType'],
+    ),
     'model.finished': worker({ ...final, httpStatus, textLength: count, toolCount: count }),
     'loop.round.started': worker({}),
     'loop.round.finished': worker({ ...final, toolCount: count }),
