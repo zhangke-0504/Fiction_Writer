@@ -106,6 +106,224 @@ export function trimInsertionEcho(original: string, offset: number, fragment: st
     .trim();
 }
 
+export type InsertionQualityIssue =
+  'echo_only' | 'neighbor_echo' | 'boundary_echo' | 'repeated_passage' | 'work_note' | 'obvious_typo';
+
+// These keys are for comparison only. Neither the saved text nor the insertion offset is normalized.
+const sentenceKey = (value: string) =>
+  value
+    .normalize('NFKC')
+    .replace(/[\s\p{P}]/gu, '')
+    .toLowerCase();
+const sentences = (value: string) =>
+  value
+    .split(/(?:[。！？!?；;.]+|\n[ \t]*\r?\n+)/u)
+    .map(sentenceKey)
+    .filter(Boolean);
+const minEcho = 14;
+const workNote =
+  /(?:^|\n)\s*(?:#{1,6}\s*|[-*>]\s*)?(?:【|\*\*)?(?:写作备注|写作说明|创作说明|工作说明|插入说明|本段说明)(?:】|\*\*)?\s*[:：]|(?:把|将)第[零一二三四五六七八九十百两\d]+章(?:里|中|的)?(?:那|这)(?:笔|段|份|张|件|条|场|个)|(?:读者|作者)(?:在|到)第[零一二三四五六七八九十百两\d]+章(?:已经|将会|会|才)(?:看到|知道|得知)/u;
+
+type Edge = 'head' | 'tail';
+type Span = { from: number; to: number };
+const clauseBreak = /[。！？!?；;，,、.：:]|\n[ \t]*\r?\n/u;
+const edgeWindow = 1000;
+
+function paragraphs(text: string) {
+  const found: Span[] = [];
+  parser.parse(text).iterate({
+    enter(node) {
+      if (node.name === 'Paragraph' && node.node.parent?.name === 'Document')
+        found.push({ from: node.from, to: node.to });
+    },
+  });
+  return found;
+}
+
+function edgeParagraph(text: string, edge: Edge) {
+  // The adjacent block must really be a paragraph; don't search past intervening Markdown.
+  const clean = text.trim();
+  const rows = paragraphs(clean);
+  const block = edge === 'head' ? rows[0] : rows.at(-1);
+  return block && (edge === 'head' ? block.from === 0 : block.to === clean.length)
+    ? {
+        text: clean.slice(block.from, block.to),
+        offset: text.length - text.trimStart().length + block.from,
+      }
+    : undefined;
+}
+
+function edgeUnits(text: string, edge: Edge) {
+  const units: (Span & { value: string })[] = [];
+  let from = 0;
+  for (const raw of text) {
+    const to = from + raw.length;
+    for (const value of sentenceKey(raw)) units.push({ value, from, to });
+    from = to;
+  }
+  return edge === 'head' ? units : units.reverse();
+}
+
+function unitGap(text: string, units: Span[], index: number, edge: Edge) {
+  const prior = units[index - 1],
+    next = units[index];
+  if (edge === 'head') return text.slice(prior?.to ?? 0, next?.from ?? text.length);
+  return text.slice(next?.to ?? 0, prior?.from ?? text.length);
+}
+
+/** Exact text in normalized space; cuts still refer to the untouched source string. */
+export function insertionBoundaryEcho(original: string, offset: number, fragment: string) {
+  const matches: { edge: Edge; range: Span; wholeParagraph: boolean }[] = [];
+  const inputs = [
+    { edge: 'head', neighbor: original.slice(0, offset), near: 'tail' },
+    { edge: 'tail', neighbor: original.slice(offset), near: 'head' },
+  ] as const;
+  for (const { edge, neighbor, near } of inputs) {
+    const candidate = edgeParagraph(fragment, edge);
+    const old = edgeParagraph(neighbor, near);
+    if (!candidate || !old) continue;
+    const curr = edgeUnits(candidate.text, edge);
+    const best = new Set<number>();
+    const cap = edgeWindow * 2; // Raw UTF-16 bound before normalizing each old edge.
+    const windows =
+      old.text.length <= cap * 2
+        ? [{ text: old.text, first: true, last: true }]
+        : [
+            { text: old.text.slice(0, cap), first: edge === 'head', last: edge === 'tail' },
+            { text: old.text.slice(-cap), first: edge === 'tail', last: edge === 'head' },
+          ];
+    for (const { text, first, last } of windows) {
+      const prev = edgeUnits(text, edge);
+      const starts = first ? [0] : [];
+      // Also compare the neighboring paragraph's opposite edge, e.g. its last sentence.
+      if (last)
+        for (let i = 1; i < prev.length; i++)
+          if (clauseBreak.test(unitGap(text, prev, i, edge))) starts.push(i);
+      for (const start of starts) {
+        let max = 0;
+        const limit = Math.min(curr.length, prev.length - start, edgeWindow);
+        while (max < limit && curr[max].value === prev[start + max].value) max++;
+        for (let length = max; length >= minEcho; length--) {
+          const completeOldEdge = last && start + length === prev.length;
+          if (start > 0 && !completeOldEdge) continue;
+          if (length !== curr.length && !clauseBreak.test(unitGap(candidate.text, curr, length, edge)))
+            continue;
+          // The artificial edge of a cropped window is not a real text boundary.
+          if (
+            !completeOldEdge &&
+            (start + length === prev.length ||
+              !clauseBreak.test(unitGap(text, prev, start + length, edge)))
+          )
+            continue;
+          best.add(length);
+          break;
+        }
+      }
+    }
+    // More than one cut at this edge would not be a unique safe deletion.
+    for (const count of best) {
+      const wholeParagraph = count === curr.length;
+      const range =
+        edge === 'head'
+          ? {
+              from: 0,
+              to: wholeParagraph
+                ? candidate.offset + candidate.text.length
+                : candidate.offset + curr[count].from,
+            }
+          : {
+              from: wholeParagraph ? candidate.offset : candidate.offset + curr[count - 1].from,
+              to: fragment.length,
+            };
+      matches.push({ edge, range, wholeParagraph });
+    }
+  }
+  return matches;
+}
+
+/** Stronger than candidate rejection: return a single cut proven safe in saved Markdown. */
+export function safeInsertionEchoCut(before: string, fragment: string, after: string) {
+  const echoes = insertionBoundaryEcho(before + after, before.length, fragment);
+  if (echoes.length !== 1) return;
+  const { edge, range: raw, wholeParagraph } = echoes[0];
+  const range = { ...raw };
+  if (wholeParagraph && edge === 'head') {
+    const rest = fragment.slice(range.to);
+    range.to += rest.length - rest.trimStart().length;
+  } else if (wholeParagraph && edge === 'tail') {
+    range.from = fragment.slice(0, range.from).trimEnd().length;
+  }
+  // Never delete Markdown delimiters, nor unmatched quotation/bracket punctuation.
+  const removed = fragment.slice(range.from, range.to);
+  if (/[#*_\x60<>\[\]{}()（）「」『』“”"'~\\|]/u.test(removed)) return;
+  const kept = fragment.slice(0, range.from) + fragment.slice(range.to);
+  if (!kept.trim()) return;
+  // A suffix cut must leave a complete boundary, not a dangling conjunction or comma.
+  if (edge === 'tail' && !wholeParagraph && !/[。！？!?；;.]\s*$/u.test(kept)) return;
+  const shape = (text: string) => {
+    const nodes: string[] = [];
+    parser.parse(text).iterate({
+      enter(node) {
+        nodes.push(node.name);
+      },
+    });
+    return nodes;
+  };
+  const previous = shape(before + fragment + after);
+  if (wholeParagraph) {
+    // Plain paragraph deletion is the only permitted Markdown structure change.
+    const count = paragraphs(before + fragment.slice(0, range.from)).length;
+    const indexes = previous.flatMap((name, i) => (name === 'Paragraph' ? [i] : []));
+    const index = indexes[count];
+    if (index === undefined) return;
+    previous.splice(index, 1);
+  }
+  const next = shape(before + kept + after);
+  if (previous.length !== next.length || previous.some((type, i) => type !== next[i])) return;
+  return { ...range, kept };
+}
+
+export function assessInsertion(
+  original: string,
+  offset: number,
+  fragment: string,
+  authorDirection = '',
+) {
+  const text = trimInsertionEcho(original, offset, fragment);
+  const issues: InsertionQualityIssue[] = [];
+  if (!text) return { text, issues: ['echo_only'] as InsertionQualityIssue[] };
+  const parts = sentences(text);
+  const neighborKeys = [
+    sentenceKey(original.slice(Math.max(0, offset - 1000), offset)),
+    sentenceKey(original.slice(offset, offset + 1000)),
+  ];
+  const spans = (from: number, width: number) => parts.slice(from, from + width).join('');
+  let echo = false,
+    repeat = false;
+  for (let start = 0; start < parts.length && !(echo && repeat); start++) {
+    // Look at a long sentence or a short sequence of sentences, not isolated words or names.
+    for (let width = 1; width <= 4 && start + width <= parts.length; width++) {
+      const key = spans(start, width);
+      if (key.length < minEcho) continue;
+      if (!echo && neighborKeys.some((neighbor) => neighbor.includes(key))) echo = true;
+      if (!repeat && start + width * 2 <= parts.length && key === spans(start + width, width))
+        repeat = true;
+    }
+  }
+  if (echo) issues.push('neighbor_echo');
+  else if (insertionBoundaryEcho(original, offset, text).length) issues.push('boundary_echo');
+  if (repeat) issues.push('repeated_passage');
+  if (workNote.test(text)) issues.push('work_note');
+  // Check the generated candidate only. A spelling supplied in the source or by the author stays available as literal text.
+  if (
+    /[我你他她它咱]自已/u.test(text) &&
+    !original.includes('自已') &&
+    !authorDirection.includes('自已')
+  )
+    issues.push('obvious_typo');
+  return { text, issues };
+}
+
 export function outlineInsertion(
   outline: Manuscript,
   chapter: Manuscript,

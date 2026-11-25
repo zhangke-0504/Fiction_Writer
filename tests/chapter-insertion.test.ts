@@ -142,6 +142,7 @@ test('an insertion with no new prose does not commit the chapter or outline', as
   const op = f.start(author, [
     () => use('book_generate_chapter', f.operation),
     () => text(after),
+    () => text(after),
     ({ history }) => {
       assert.match(JSON.stringify(history.at(-1)), /没有可提交的新增段落/);
       return text('没有写入。');
@@ -262,3 +263,129 @@ test('the tool does not draft a second insertion after a successful local additi
   assert.equal(result.status, 'completed', result.error);
   assert.equal(op.requests.filter(({ lane }) => lane === 'draft').length, 1);
 });
+
+const echoedSentence = '掌柜亲眼看见档案员把红色货单放进了黑皮箱';
+const qualityBody = before + echoedSentence + '。\r\n\r\n' + after;
+for (const [problem, candidate] of [
+  ['neighbor_echo', '门开了。' + echoedSentence + '！陌生人收起帽子。'],
+  ['repeated_passage', fragment + fragment],
+  ['work_note', '她把第五章那笔直播租约调了出来。'],
+  ['obvious_typo', '她把单子按在桌上，低声说：“我自已一笔一笔算。”'],
+] as const) {
+  test('rejects ' + problem + ' before a single corrected insertion commit', async (t) => {
+    const f = await fixture(t, qualityBody);
+    const baseline = await f.workspace.readAll(f.id);
+    const op = f.start(author, [
+      () => use('book_generate_chapter', f.operation),
+      () => text(candidate),
+      async ({ system }) => {
+        assert.match(system, /上一次候选未写入/);
+        assert.deepEqual((await f.workspace.readAll(f.id)).documents, baseline.documents);
+        return text(fragment);
+      },
+      ({ history }) => {
+        assert.match(JSON.stringify(history.at(-1)), /"inserted":true/);
+        return text('已增补。');
+      },
+    ]);
+    assert.equal((await op.wait()).status, 'completed');
+    const saved = await f.workspace.readAll(f.id);
+    assert.equal(
+      saved.documents.find((d) => d.id === f.target.id)?.body,
+      before + echoedSentence + '。\r\n\r\n' + fragment + '\r\n\r\n' + after,
+    );
+    assert.deepEqual(
+      saved.documents.filter((d) => d.id !== f.target.id && d.type !== 'outline'),
+      baseline.documents.filter((d) => d.id !== f.target.id && d.type !== 'outline'),
+    );
+    assert.equal(op.requests.filter(({ lane }) => lane === 'draft').length, 2);
+    assert.deepEqual(op.trace.rejected, []);
+  });
+}
+
+test('persistent quality failure prevents replay but does not poison another anchor in the chapter', async (t) => {
+  const f = await fixture(t, qualityBody);
+  const other = { ...f.operation, insertion: { ...f.operation.insertion, place: 'before' } };
+  const privateCandidate = 'INSERT_PRIVATE_CANDIDATE：她把第五章那笔直播租约调了出来。';
+  const op = f.start(author, [
+    () => use('book_generate_chapter', f.operation),
+    () => text(fragment + fragment),
+    () => text(privateCandidate),
+    async ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /insertion_quality.*work_note/);
+      assert.equal((await f.workspace.readDocument(f.id, f.target)).body, qualityBody);
+      assert.equal((await f.workspace.readDocument(f.id, f.currentOutline)).body, outlineText);
+      return use('book_generate_chapter', f.operation);
+    },
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /insertion_quality/);
+      return use('book_generate_chapter', other);
+    },
+    () => text(fragment),
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"inserted":true/);
+      return text('已在另一个位置增补。');
+    },
+  ]);
+  assert.equal((await op.wait()).status, 'completed');
+  assert.equal(op.requests.filter(({ lane }) => lane === 'draft').length, 3);
+  assert.deepEqual(
+    op.trace.rows
+      .filter((r) => r.event === 'chapter.insertion.checked')
+      .map((r) => r.fields?.issue ?? r.fields?.outcome),
+    ['repeated_passage', 'work_note', 'ok'],
+  );
+  assert.doesNotMatch(JSON.stringify(op.trace.rows), /INSERT_PRIVATE_CANDIDATE/);
+  assert.deepEqual(op.trace.rejected, []);
+  assert.equal(
+    (await f.workspace.readDocument(f.id, f.target)).body,
+    fragment + '\r\n\r\n' + qualityBody,
+  );
+  assert.equal(
+    (await f.workspace.readDocument(f.id, f.currentOutline)).body.match(/灰帽陌生人在酒馆登场/gu)
+      ?.length,
+    1,
+  );
+});
+
+const greenPrefix = '指缝里还沾着灯光照过的暖意';
+const greenBody = before + greenPrefix + '。他想起手边还有一份账簿。\r\n\r\n' + after;
+const greenEcho = before + greenPrefix + '，他把手翻过来，发现掌心有陌生的蓝色墨水。';
+for (const valid of [false, true]) {
+  test(
+    'cross-clause echo in the corrected candidate: commit only if clean (' + valid + ')',
+    async (t) => {
+      const f = await fixture(t, greenBody);
+      const old = await f.workspace.readAll(f.id);
+      const op = f.start(author, [
+        () => use('book_generate_chapter', f.operation),
+        () => text(fragment + fragment),
+        () => text(valid ? fragment : greenEcho),
+        ({ history }) => {
+          const reply = JSON.stringify(history.at(-1));
+          if (valid) assert.match(reply, /"inserted":true/);
+          else {
+            assert.match(reply, /insertion_quality.*boundary_echo/);
+            assert.doesNotMatch(reply, /insertionRef|"inserted":true|pendingSync/);
+          }
+          return text(valid ? '已增补。' : '此处未提交。');
+        },
+      ]);
+      const run = await op.wait();
+      assert.equal(run.status, 'completed', run.error);
+      const now = await f.workspace.readAll(f.id);
+      if (valid)
+        assert.equal(
+          now.documents.find((d) => d.id === f.target.id)?.body,
+          greenBody.replace('\r\n\r\n', '\r\n\r\n' + fragment + '\r\n\r\n'),
+        );
+      else assert.deepEqual(now.documents, old.documents);
+      assert.equal(op.requests.filter(({ lane }) => lane === 'draft').length, 2);
+      assert.equal(
+        op.trace.rows.filter((r) => r.event === 'workspace.document.committed').length,
+        valid ? 2 : 0,
+      );
+      assert.deepEqual(op.trace.rejected, []);
+    },
+  );
+}

@@ -36,12 +36,20 @@ export type InsertedScene = {
   length: number;
   digest: string;
 };
+export type InsertEchoCleanup = {
+  previousRevision: string;
+  from: number;
+  to: number;
+  digest: string;
+  preservedSync: string[];
+};
 export type EditCommit = {
   target: string;
   revisions: Record<string, string>;
   anchor?: string;
   scene?: InsertedScene & { assets: string[] };
   synced?: Record<string, string>;
+  cleanup?: InsertEchoCleanup;
 };
 export type BookEdit = { proposal: EditProposal; commits: EditCommit[] };
 
@@ -248,7 +256,6 @@ export function readEditCommit(value: unknown, plan: EditPlan): EditCommit | und
       v.fragmentOffset + v.length > v.size ||
       !hash(v.digest) ||
       !Array.isArray(v.assets) ||
-      !v.assets.length ||
       v.assets.length > maxEditTargets ||
       !v.assets.every((key) => typeof key === 'string' && created.has(key)) ||
       new Set(v.assets).size !== v.assets.length
@@ -261,6 +268,41 @@ export function readEditCommit(value: unknown, plan: EditPlan): EditCommit | und
       length: v.length,
       digest: v.digest,
       assets: v.assets,
+    };
+  }
+  let cleanup: InsertEchoCleanup | undefined;
+  if (value.cleanup !== undefined) {
+    const c = value.cleanup;
+    const created = plan.assets.filter((a) => a.action === 'create').map(assetTarget);
+    if (
+      !passage ||
+      scene ||
+      value.synced ||
+      revisions.length !== 1 ||
+      !hash(value.revisions[`chapter/${passage.chapterId}`]) ||
+      !record(c) ||
+      !hash(c.previousRevision) ||
+      !hash(c.digest) ||
+      typeof c.from !== 'number' ||
+      !Number.isSafeInteger(c.from) ||
+      c.from < 0 ||
+      typeof c.to !== 'number' ||
+      !Number.isSafeInteger(c.to) ||
+      c.to <= c.from ||
+      c.to > 2_000_000 ||
+      c.to - c.from >= 2200 ||
+      !Array.isArray(c.preservedSync) ||
+      c.preservedSync.length > maxEditTargets ||
+      !c.preservedSync.every((key) => created.includes(key)) ||
+      new Set(c.preservedSync).size !== c.preservedSync.length
+    )
+      return;
+    cleanup = {
+      previousRevision: c.previousRevision,
+      digest: c.digest,
+      from: c.from,
+      to: c.to,
+      preservedSync: c.preservedSync,
     };
   }
   let synced: EditCommit['synced'];
@@ -281,6 +323,7 @@ export function readEditCommit(value: unknown, plan: EditPlan): EditCommit | und
     anchor: value.anchor as string | undefined,
     ...(scene && { scene }),
     ...(synced && { synced }),
+    ...(cleanup && { cleanup }),
   };
 }
 

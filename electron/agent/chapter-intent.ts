@@ -144,3 +144,99 @@ export function minimumExistingSubjects(prompt: string) {
     )?.[1];
   return count ? chapterOrder(`第${count}章`) || 0 : 0;
 }
+
+/** Only the current author's directive (not prior dialogue, proposed plans, or file contents) can narrow a patch. */
+export function blocksProsePatch(prompt: string) {
+  const text = prompt.normalize('NFKC');
+  return /(?:不要|别|禁止|不许|不得|不能|无需|不必|不)\s*(?:再|擅自|自动|直接|自行)?\s*(?:动(?:笔|稿|正文|任何章)|写入|修(?:改|订|稿|正|补)|改(?:稿|动|写|正文|章|第|本章|这一章)|纠正|更正|勘误)|(?:仅|只)(?:需要|需|要)?\s*(?:讨论|分析|查看|阅读|检查|审阅|汇报|报告|列出|续写|插入|增补)|do not (?:edit|patch|modify|change|correct)\b/iu.test(
+    text,
+  );
+}
+
+const chapterRef =
+  /^(第\s*[\d零一二三四五六七八九十两]+\s*章|chapter\s+\d+|本章|这[一]?章|当前章(?:节)?|选中章(?:节)?)/iu;
+const quoted = /“([^”]+)”|「([^」]+)」|『([^』]+)』|"([^"]+)"/gu;
+
+export function prosePatchIntent(prompt: string, chapters: Manuscript[], selected?: string) {
+  // Mask quoted text for intent parsing (the exact values remain available for literal scope checks).
+  const literals: string[] = [];
+  const masked = prompt
+    .replace(quoted, (...match) => {
+      literals.push(match.slice(1, 5).find((value) => typeof value === 'string')!);
+      return '\uE000' + (literals.length - 1) + '\uE001';
+    })
+    .normalize('NFKC')
+    .trim();
+  if (blocksProsePatch(masked) || /[?]\s*$/u.test(masked) || rewriteTarget(masked, chapters, selected))
+    return;
+  const command = masked
+    .split(/(?:[，,。；;！!?]|\r?\n)/u, 1)[0]
+    .replace(/^(?:(?:请帮我|请你|请|帮我|麻烦你|只|仅)\s*)+/u, '');
+  const action =
+    /^(?:定点|局部)?(?:修改|修正|修一下|修复|纠正|更正|勘误|改正|改一下|改|替换|删掉|删除|去掉)\s*/u;
+  const conversion = /(?:替换|更正|修改|纠正|修正|改)(?:成|为|作|得)|改一下|修正|删掉|删除/u;
+  let subject: string,
+    commandText = command;
+  if (/^(?:把|将)\s*/u.test(command)) {
+    subject = command.replace(/^(?:把|将)\s*/u, '').split(conversion, 1)[0];
+    if (!conversion.test(command)) return;
+  } else if (/^在\s*/u.test(command)) {
+    subject = command.replace(/^在\s*/u, '');
+  } else if (action.test(command)) subject = command.replace(action, '');
+  else return;
+  const ref = chapterRef.exec(subject)?.[1];
+  const labeled = (value: string) =>
+    subject.startsWith(value) && /^(?:$|[的里中\s:：\uE000])/u.test(subject.slice(value.length));
+  const marker = /^\uE000(\d+)\uE001/u.exec(subject);
+  const names = chapters.filter(({ id, fields }) =>
+    ref
+      ? /^第|^chapter\s/i.test(ref)
+        ? fields.order === chapterOrder(ref)
+        : id === selected
+      : labeled(id) ||
+        (!!fields.title &&
+          (labeled(fields.title.normalize('NFKC')) ||
+            (marker && literals[Number(marker[1])] === fields.title))),
+  );
+  if (names.length !== 1) return;
+  const target = names[0];
+  const targetLength =
+    ref?.length ??
+    (marker
+      ? marker[0].length
+      : labeled(target.id)
+        ? target.id.length
+        : target.fields.title!.normalize('NFKC').length);
+  const focus = subject
+    .slice(targetLength)
+    .replace(/^[\s的里中:：]+/u, '')
+    .trim();
+  if (
+    !focus ||
+    /^(?:正文|全文|章节|内容|全部|整章|这一章|所有内容)$/u.test(focus) ||
+    /^(?:和|及|以及|、|还有)\s*(?:第\s*[\d零一二三四五六七八九十两]+\s*章|ch(?:apter)?[-_ ]?\d+)/iu.test(
+      focus,
+    )
+  )
+    return;
+  if (/^(?:在)/u.test(command)) {
+    if (!/^(?:把|将)/u.test(focus) && !action.test(focus)) return;
+    if (/^(?:把|将)/u.test(focus) && !conversion.test(focus)) return;
+    commandText = focus;
+  }
+  const literalEdits = [...focus.matchAll(/\uE000(\d+)\uE001/gu)];
+  const from = literalEdits[0] && literals[Number(literalEdits[0][1])];
+  const pair =
+    from &&
+    new RegExp(
+      '\\uE000' +
+        literalEdits[0][1] +
+        '\\uE001\\s*(?:改成|改为|改作|替换为|替换成|更正为)\\s*\\uE000(\\d+)\\uE001',
+      'u',
+    ).exec(commandText);
+  const exact =
+    from && pair && commandText.endsWith(pair[0]) && masked.replace(/[。！!]$/u, '').endsWith(pair[0])
+      ? { quote: from, replacement: literals[Number(pair[1])] }
+      : undefined;
+  return { chapterId: target.id, exact };
+}

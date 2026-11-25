@@ -519,48 +519,63 @@ test('another session, merely discussing, or a narrower approval cannot write ch
   );
 });
 
-test('partial approved edits keep committed parts and continue with fresh anchors, without duplicating them', async (t) => {
-  const f = await fixture(t);
-  await propose(f);
-  const first = f.start(agree, [
-    ...saveActor,
-    ...saveClue,
-    insertion(f, 4),
-    draft(4),
-    ...syncAll,
-    insertion(f, 6, { stale: true }),
-    ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /版本已变化/);
-      return text('后续位置尚未提交。');
-    },
-  ]);
-  const partial = await first.wait();
-  assert.equal(partial.status, 'failed');
-  assert.match(partial.error ?? '', /5\/7.*second-trace.*late-arrival/);
-  const beforeResume = await f.bytes(4);
-  await f.restart();
-  const resumed = f.start('继续', [
-    () => use('book_generate_assets', subject),
-    ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /"reused":true/);
-      return insertion(f, 6)();
-    },
-    draft(6),
-    insertion(f, 9),
-    draft(9),
-    ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /pendingSync.*subject\/agent-villain/u);
-      return syncRequest('subject');
-    },
-    ...syncAll.slice(1),
-    () => text('余下两处已保存。'),
-  ]);
-  const result = await resumed.wait();
-  assert.equal(result.status, 'completed', result.error);
-  assert.deepEqual(await f.bytes(4), beforeResume);
-  assert.equal(resumed.requests.filter((r) => r.lane === 'asset').length, 2);
-  assert.equal(resumed.requests.filter((r) => r.lane === 'draft').length, 2);
-});
+for (const blocked of ['stale', 'quality'] as const) {
+  test('partial approved edits keep committed parts and resume after ' + blocked, async (t) => {
+    const f = await fixture(t);
+    await propose(f);
+    const initial = await f.read();
+    const first = f.start(agree, [
+      ...saveActor,
+      ...saveClue,
+      insertion(f, 4),
+      draft(4),
+      ...syncAll,
+      insertion(f, 6, { stale: blocked === 'stale' }),
+      ...(blocked === 'quality'
+        ? [() => text('他把第五章那笔租约调了出来。'), () => text('写作说明：留下这个线索。')]
+        : []),
+      ({ history }) => {
+        assert.match(
+          JSON.stringify(history.at(-1)),
+          blocked === 'stale' ? /版本已变化/ : /insertion_quality/,
+        );
+        return text('后续位置尚未提交。');
+      },
+    ]);
+    const partial = await first.wait();
+    assert.equal(partial.status, 'failed');
+    assert.match(partial.error ?? '', /5\/7.*second-trace.*late-arrival/);
+    const written = (await f.read()).documents;
+    assert.deepEqual(
+      written.filter((d) => ['ch06', 'ch09'].includes(d.id)),
+      initial.documents.filter((d) => ['ch06', 'ch09'].includes(d.id)),
+    );
+    assert.doesNotMatch(written.find((d) => d.type === 'outline')!.body, /瞭望员又看到同样缺角/);
+    const beforeResume = await f.bytes(4);
+    await f.restart();
+    const resumed = f.start('继续', [
+      () => use('book_generate_assets', subject),
+      ({ history }) => {
+        assert.match(JSON.stringify(history.at(-1)), /"reused":true/);
+        return insertion(f, 6)();
+      },
+      draft(6),
+      insertion(f, 9),
+      draft(9),
+      ({ history }) => {
+        assert.match(JSON.stringify(history.at(-1)), /pendingSync.*subject\/agent-villain/u);
+        return syncRequest('subject');
+      },
+      ...syncAll.slice(1),
+      () => text('余下两处已保存。'),
+    ]);
+    const result = await resumed.wait();
+    assert.equal(result.status, 'completed', result.error);
+    assert.deepEqual(await f.bytes(4), beforeResume);
+    assert.equal(resumed.requests.filter((r) => r.lane === 'asset').length, 2);
+    assert.equal(resumed.requests.filter((r) => r.lane === 'draft').length, 2);
+  });
+}
 
 test('explicitly read-only limits still win over planning and execution language', () => {
   assert.equal(proposalOnly(directPrompt), false);
@@ -805,6 +820,90 @@ for (const sourceChanged of [false, true]) {
     assert.doesNotMatch(doc.body, /原文：/u);
     assert.match((await f.workspace.readDocument(f.id, chapter(9))).body, /灰衣人登上甲板/u);
     assert.equal(doc.body.includes('作者并发修改'), !sourceChanged);
+  });
+}
+
+for (const outcome of ['repair', 'reject', 'changed'] as const) {
+  test('sync corrects a missing evidence row once and preserves commits on ' + outcome, async (t) => {
+    const f = await fixture(t);
+    await propose(f);
+    const clueRef = { type: 'clue' as const, id: 'marked-chart' };
+    let originalClue = '';
+    let otherNotes = '';
+    let submitted = 0;
+    const incomplete: Script = async (req) => {
+      const tool = req.tools[0];
+      assert.equal(tool.name, 'submit_story_sync');
+      const schema = tool.schema.properties as { evidence: { minItems: number; maxItems: number } };
+      assert.equal(schema.evidence.minItems, 3);
+      assert.equal(schema.evidence.maxItems, 3);
+      const doc = await f.workspace.readDocument(f.id, clueRef);
+      originalClue ||= doc.body;
+      const result = await syncCandidate('clue')(req);
+      const args = JSON.parse(result.calls[0].args);
+      args.evidence.pop();
+      if (outcome === 'changed') {
+        const changed = await f.workspace.readDocument(f.id, chapter(6));
+        const report = await f.workspace.writeChanges(f.id, [
+          { ...changed, expect: changed.revision, body: changed.body + '\n\n作者并发改稿。' },
+        ]);
+        assert.equal(report.error, undefined);
+      }
+      submitted++;
+      return use('submit_story_sync', args);
+    };
+    const correction: Script = async (req) => {
+      assert.match(req.system, /需要 3 项，实际收到 2 项/);
+      assert.match(req.system, /source 1 到 3/);
+      const doc = await f.workspace.readDocument(f.id, clueRef);
+      assert.equal(doc.body, originalClue);
+      if (outcome === 'reject') return incomplete(req);
+      const result = await syncCandidate('clue')(req);
+      const args = JSON.parse(result.calls[0].args);
+      args.evidence[1] = { source: 2, status: 'omitted' };
+      submitted++;
+      return use('submit_story_sync', args);
+    };
+    const run = f.start(agree, [
+      ...saveActor,
+      ...saveClue,
+      insertion(f, 4),
+      draft(4),
+      insertion(f, 6),
+      draft(6),
+      insertion(f, 9),
+      draft(9),
+      () => syncRequest('subject'),
+      syncCandidate('subject'),
+      async () => {
+        otherNotes = (await f.read()).documents.find((doc) => doc.id === 'agent-villain')!.revision;
+        return syncRequest('clue');
+      },
+      incomplete,
+      ...(outcome === 'changed' ? [] : [correction]),
+      ({ history }) => {
+        const receipt = JSON.stringify(history.at(-1));
+        if (outcome === 'repair') assert.match(receipt, /"pendingSync":\[\]/);
+        else assert.match(receipt, outcome === 'changed' ? /conflict/ : /invalid_arguments.*需要 3 项/);
+        return text(outcome === 'repair' ? '说明已同步。' : '这条说明待同步。');
+      },
+    ]);
+    const result = await run.wait();
+    assert.equal(result.status, outcome === 'repair' ? 'completed' : 'failed', result.error);
+    assert.equal(submitted, outcome === 'changed' ? 1 : 2);
+    const docs = (await f.read()).documents;
+    assert.equal(docs.find((doc) => doc.id === 'agent-villain')!.revision, otherNotes);
+    const note = docs.find((doc) => doc.id === clueRef.id)!;
+    if (outcome === 'repair') assert.match(note.body, /原文：/u);
+    else assert.equal(note.body, originalClue);
+    const rejects = run.trace.rows.filter(
+      ({ event, fields }) => event === 'writing.edit.sync.candidate' && fields.outcome === 'rejected',
+    );
+    assert.deepEqual(
+      rejects.map(({ fields }) => [fields.issue, fields.count, fields.observed]),
+      Array.from({ length: outcome === 'reject' ? 2 : 1 }, () => ['evidence_count', 3, 2]),
+    );
+    assert.deepEqual(run.trace.rejected, []);
   });
 }
 

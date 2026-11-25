@@ -54,6 +54,7 @@ export interface RunContext {
   preview: (value?: ChapterPreview) => void;
   progress: (value: WorkProgress) => void;
   authorLine?: number;
+  narrowedWriting?: boolean;
   history?: SessionHistory;
   recordTool?: (receipt: ToolReceipt) => Promise<void>;
   continuation?: NovelContinuation;

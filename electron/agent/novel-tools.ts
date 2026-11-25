@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { classified, DiagnosticFailure } from '../diagnostics/trace.js';
 import type { Change, DocRef, Fields, Manuscript, WriteReport } from '../../shared/contracts.js';
 import type { WorkspaceService, Guard } from '../workspace.js';
@@ -10,10 +11,12 @@ import {
   storyBeats,
   storyLinks,
 } from '../documents.js';
-import { draftChapter, DraftCommitFailure } from './draft.js';
+import { draftChapter, DraftCommitFailure, InsertionQualityFailure } from './draft.js';
 import type { ChapterPlan } from './chapter-boundary.js';
 import {
   insertionAnchor,
+  insertPassage,
+  safeInsertionEchoCut,
   outlineInsertion,
   suggestInsertionPoints,
   type ChapterInsertion,
@@ -32,8 +35,19 @@ import {
   type EditCommit,
   type InsertedScene,
 } from './edit-proposal.js';
+import {
+  exactRange,
+  patchBody,
+  patchEntryLimit,
+  patchFragmentLimit,
+  reviewProsePatch,
+  type ProseEdit,
+  type PatchEvidence,
+} from './chapter-patch.js';
 import { chapterAssetRequirements } from './chapter-context.js';
 import {
+  blocksProsePatch,
+  prosePatchIntent,
   minimumExistingSubjects,
   passageTargetAllowed,
   chapterStage,
@@ -60,7 +74,13 @@ import { hasStoryDescription } from './story-notes.js';
 import type { ModelProvider } from './model.js';
 import type { SkillCatalog, SkillName } from './skills.js';
 import type { RunContext } from './runs.js';
-import { noteSyncTargets, syncStoryNote, type SceneStage } from './story-sync.js';
+import {
+  noteSyncTargets,
+  preservesSyncEvidence,
+  sceneText,
+  syncStoryNote,
+  type SceneStage,
+} from './story-sync.js';
 import { observedCommit } from './tool-receipts.js';
 import { diagnosticScope, noDiagnostic } from '../../shared/diagnostics.js';
 import {
@@ -83,6 +103,16 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
     : undefined;
 
 const activeTypes = ['outline', 'subject', 'clue', 'chapter'] as const;
+type CurrentInsertion = {
+  runId: string;
+  sessionId: string;
+  chapterId: string;
+  revision: string;
+  anchor: string;
+  insertion: ChapterInsertion;
+  commit: EditCommit;
+  consumed?: boolean;
+};
 type GoalRequest = {
   action: 'register' | 'resume' | 'check';
   chapterIds?: string[];
@@ -100,6 +130,7 @@ type Mutation = {
 const typeSchema = { type: 'string', enum: ['book', ...activeTypes] };
 const idSchema = str('使用文件的稳定 ID，而不是名称', 128);
 const page = { type: 'integer', minimum: 0 };
+const revisionSchema = { type: 'string', pattern: '^[a-f0-9]{64}$' };
 const editIdList = { type: 'array', maxItems: maxEditTargets, uniqueItems: true, items: idSchema };
 const editPlanSchema = object({
   summary: str('简短、可展示的修改目的；不写正文或整份说明', 800),
@@ -238,8 +269,14 @@ export class NovelTools {
   }
   private readonly referenceFailures = new Map<string, number>();
   private readonly chapterFailures = new Map<string, ToolFailure>();
+  private readonly insertionFailures = new Map<string, ToolFailure>();
+  private readonly currentInsertions = new Map<string, CurrentInsertion>();
   private readonly targetedReads = new Set<string>();
   private readonly readSet = new Map<string, Guard>();
+  private readonly chapterReads = new Map<string, { revision: string; ranges: [number, number][] }>();
+  private readonly patchedHere = new Set<string>();
+  private populatedAtStart?: Set<string>;
+  private readonly draftedHere = new Map<string, string>();
   private readonly offsets = new Map<string, { revision: string; next: number }>();
   private readonly createdHere = new Set<string>();
   private readonly directCommits: EditCommit[] = [];
@@ -271,6 +308,9 @@ export class NovelTools {
     private input: { authorPrompt?: string; selectedChapterId?: string } = {},
   ) {}
   prepareEdit(ctx: RunContext, documents: Manuscript[]) {
+    this.populatedAtStart ??= new Set(
+      documents.filter((d) => d.type === 'chapter' && d.body.trim()).map((d) => d.id),
+    );
     const author = this.input.authorPrompt ?? '';
     const confirmed = confirmedEdit(ctx.bookEdit, ctx.history?.lines ?? [], author);
     if (proposalOnly(author)) this.editMode = 'proposal';
@@ -298,7 +338,7 @@ export class NovelTools {
         done,
         complete: done === progress.total,
       });
-      return `\n本轮承接同会话已确认方案（不是整书任务或全局权限）。活动范围：${JSON.stringify(this.edit.plan)}。未提交的目标：${JSON.stringify(this.edit.remaining(documents))}。已写入的不重做。资产调用按方案的 kind/action/id，fields 与关联由方案提供。按需读取正文和大纲当前修订，用 book_generate_chapter mode=insert、insertion.targetId 匹配方案位置，附本章唯一原文锚点和当前大纲 revision。每处成功后的大纲 revision 会更新；不要用通用覆盖。正文必须实际写入。已写正文相关的新资料用 book_generate_assets action=update 同步，只传资料类型和 ID。待同步：${JSON.stringify(this.syncStatus(documents))}。`;
+      return `\n本轮承接同会话已确认方案（不是整书任务或全局权限）。活动范围：${JSON.stringify(this.edit.plan)}。未提交的目标：${JSON.stringify(this.edit.remaining(documents))}。已写入的不重做。资产调用按方案的 kind/action/id，fields 与关联由方案提供。按需读取正文和大纲当前修订，用 book_generate_chapter mode=insert、insertion.targetId 匹配方案位置，附本章唯一原文锚点和当前大纲 revision。每处成功后的大纲 revision 会更新；不要用通用覆盖。正文必须实际写入；该 Run 新段若仍有边界回声，用其成功插入回执请求 book_clean_insert_echo，拒绝时报告，不扩大授权。已写正文相关的新资料用 book_generate_assets action=update 同步，只传资料类型和 ID。待同步：${JSON.stringify(this.syncStatus(documents))}。`;
     }
     if (this.editMode === 'proposal')
       return '\n作者本轮只问方案，不写入作品。用索引查真实主体和章节 ID，定向查目标章、已有设定和大纲后，用 book_propose_edits 登记一份范围完整的建议，最终可见方案会随回复给出。中期多个迹象和后期实际登场要分别列章；登场与伏笔计划回收可以是不同章。列出新资料、真实关联与章锚点，不要提前执行。';
@@ -325,13 +365,18 @@ export class NovelTools {
     );
     return !restriction.test((this.input.authorPrompt ?? '').normalize('NFKC'));
   }
-  private syncTargets(documents: Manuscript[]) {
+  private syncTargets(
+    documents: Manuscript[],
+    history?: readonly EditCommit[],
+    includeRestricted = false,
+  ) {
+    const allows = (key: string) => includeRestricted || this.noteSyncAllowed(key);
     const edit = this.edit;
     if (!edit) {
       return noteSyncTargets(
-        this.directCommits,
+        history ?? this.directCommits,
         documents,
-        new Set([...this.createdHere].filter((key) => this.noteSyncAllowed(key))),
+        new Set([...this.createdHere].filter(allows)),
         this.directPassages,
       );
     }
@@ -339,7 +384,7 @@ export class NovelTools {
       edit.plan.assets
         .filter((a) => a.action === 'create')
         .map(assetTarget)
-        .filter((key) => this.noteSyncAllowed(key)),
+        .filter(allows),
     );
     const passages = new Map(
       edit.plan.passages.map((p) => [
@@ -356,7 +401,7 @@ export class NovelTools {
         },
       ]),
     );
-    return noteSyncTargets(edit.commits, documents, allowed, passages);
+    return noteSyncTargets(history ?? edit.commits, documents, allowed, passages);
   }
   private syncStatus(documents: Manuscript[]) {
     return this.syncTargets(documents)
@@ -978,6 +1023,7 @@ export class NovelTools {
       type?: Manuscript['type'];
       documentId?: string;
       offset?: number;
+      length?: number;
       index?: ReferenceIndex;
       novelGoal?: GoalRequest;
     },
@@ -1004,7 +1050,7 @@ export class NovelTools {
       if (matches.length !== 1) throw new Error('文档不存在或 ID 不唯一，请同时指定 type');
       const doc = matches[0],
         key = docKey(doc),
-        end = Math.min(doc.body.length, offset + 44_000),
+        end = Math.min(doc.body.length, offset + (args.length ?? 44_000)),
         continued = this.offsets.get(key);
       if (offset === 0 || (continued?.revision === doc.revision && continued.next === offset)) {
         this.targetedReads.add(this.documentReadKey(doc, offset));
@@ -1013,11 +1059,18 @@ export class NovelTools {
           this.offsets.delete(key);
         } else this.offsets.set(key, { revision: doc.revision, next: end });
       }
-      return {
+      const result = {
         document: { ...projection(doc, false), body: doc.body.slice(offset, end) },
         nextOffset: end < doc.body.length ? end : null,
         diagnostics: view.diagnostics.slice(0, 25),
       };
+      if (
+        doc.type === 'chapter' &&
+        offset < end &&
+        JSON.stringify({ ok: true, value: result }).length <= 120_000
+      )
+        this.rememberChapterRange(doc, offset, end);
+      return result;
     }
     const rows: unknown[] = [];
     let i = offset,
@@ -1038,6 +1091,373 @@ export class NovelTools {
       diagnostics: view.diagnostics.slice(0, 25),
       hint: '仅给出章节元数据；需要独立正文或超长故事资料，传 type/documentId，并用 offset 读完全文。',
     };
+  }
+  private rememberChapterRange(doc: Manuscript, start: number, end: number) {
+    const current = this.chapterReads.get(doc.id);
+    const earlier = current?.revision === doc.revision ? current.ranges : [];
+    const next: [number, number][] = [...earlier, [start, end] as [number, number]].sort(
+      (a, b) => a[0] - b[0],
+    );
+    const merged: [number, number][] = [];
+    for (const [from, to] of next) {
+      const last = merged.at(-1);
+      if (last && last[1] >= from) last[1] = Math.max(last[1], to);
+      else merged.push([from, to]);
+    }
+    this.chapterReads.set(doc.id, { revision: doc.revision, ranges: merged.slice(0, 64) });
+  }
+  private requirePatchQuote(doc: Manuscript, quote: string, evidence = false) {
+    const { start, end } = exactRange(doc.body, quote, evidence ? 'patch_evidence' : 'patch_anchor');
+    const read = this.chapterReads.get(doc.id);
+    if (read?.revision !== doc.revision || !read.ranges.some(([from, to]) => from <= start && end <= to))
+      throw new ToolFailure(
+        evidence ? 'patch_evidence' : 'context_required',
+        '请按章节 ID 定向读取当前修订及对应完整短原文。',
+        { chapterId: doc.id },
+      );
+  }
+  private recordsDraftForCorrection(chapterId: string, ctx: RunContext) {
+    const author = this.input.authorPrompt?.normalize('NFKC') ?? '';
+    return (
+      !!this.populatedAtStart &&
+      !this.populatedAtStart.has(chapterId) &&
+      this.target?.includes(chapterId) &&
+      this.wholeSkill &&
+      this.editMode === 'direct' &&
+      !ctx.continuation &&
+      !proposalOnly(author) &&
+      !blocksProsePatch(author) &&
+      !/^(?:请\s*)?(?:继续|接着|续写)/u.test(author.trim()) &&
+      /(?:写完|写成|写|创作|生成|编写|撰写|完成|补全|补齐|构思并写)[^。；;\n]{0,32}(?:整本|一整本|全书|整部|本书|这本小说|一部小说|[\d零一二三四五六七八九十两百]+\s*章)|(?:整本|全书|整部)[^。；;\n]{0,16}(?:写完|创作|生成)/u.test(
+        author,
+      )
+    );
+  }
+  private issueInsertionRef(
+    ctx: RunContext,
+    chapterId: string,
+    revision: string,
+    insertion: ChapterInsertion | undefined,
+    commit: EditCommit,
+  ) {
+    const { anchor, scene, revisions } = commit;
+    if (
+      !scene ||
+      !anchor ||
+      !insertion ||
+      ctx.narrowedWriting ||
+      ctx.signal.aborted ||
+      revisions['chapter/' + chapterId] !== revision ||
+      (insertion.outline && !revisions['outline/outline'])
+    )
+      return;
+    const insertionRef = randomUUID();
+    this.currentInsertions.set(insertionRef, {
+      runId: ctx.id,
+      sessionId: ctx.session.id,
+      chapterId,
+      revision,
+      anchor,
+      insertion,
+      commit,
+    });
+    ctx.diagnostic?.('chapter.insertion.receipt', {
+      documentRef: 'chapter/' + chapterId,
+      insertionRef,
+      revision,
+    });
+    return insertionRef;
+  }
+  private async cleanInsertion(
+    chapterId: string,
+    revision: string,
+    insertionRef: string,
+    ctx: RunContext,
+  ) {
+    const receipt = this.currentInsertions.get(insertionRef);
+    const ref = { type: 'chapter' as const, id: chapterId };
+    const chapterKey = docKey(ref);
+    let wrote = false;
+    const report = diagnosticScope(ctx.diagnostic ?? noDiagnostic, {
+      documentRef: chapterKey,
+      insertionRef: receipt?.runId === ctx.id ? insertionRef : undefined,
+    });
+    const reject = (reason: string, message: string): never => {
+      throw new ToolFailure(reason, message, { chapterId });
+    };
+    try {
+      ctx.signal.throwIfAborted();
+      const author = (this.input.authorPrompt ?? '').normalize('NFKC');
+      if (
+        ctx.session.bookId !== this.bookId ||
+        ctx.narrowedWriting ||
+        this.task ||
+        this.editMode === 'proposal' ||
+        this.editMode === 'unresolved' ||
+        proposalOnly(author) ||
+        /(?:不要|别|禁止|不允许|不许|不得|不能|无需|不必|不)\s*(?:(?:再|自动|直接|自行|擅自)\s*)?(?:删|移除|去掉|清理|去重|修订|改稿|(?:改动?|修改|动)(?:正文|新增|这段|插入段|原文))|(?:do not|don't|never) (?:edit|clean|remove|delete)\b/iu.test(
+          author,
+        )
+      )
+        reject('insert_cleanup_scope', '当前增补范围不允许回声清理。');
+      if (
+        !receipt ||
+        receipt.consumed ||
+        receipt.runId !== ctx.id ||
+        receipt.sessionId !== ctx.session.id ||
+        receipt.chapterId !== chapterId
+      )
+        throw new ToolFailure(
+          'insert_cleanup_receipt',
+          '这个插入回执不属于本 Run 的可用提交，或已被使用。',
+          { chapterId },
+        );
+      const { documents } = await this.workspace.readAll(this.bookId);
+      const doc = documents.find((row) => docKey(row) === chapterKey);
+      if (!doc || doc.revision !== revision || revision !== receipt.revision)
+        throw new ToolFailure('conflict', '章节已不是该次插入的提交版本，不重新猜测清理位置。', {
+          chapterId,
+        });
+      if (this.edit) {
+        this.edit.verifyPlacement(documents);
+        this.edit.passage(chapterId, receipt.insertion.targetId);
+        this.edit.verifySharedDocuments(documents, [chapterKey]);
+      } else if (
+        !passageTargetAllowed(
+          author,
+          documents.filter((row) => row.type === 'chapter'),
+          chapterId,
+          this.input.selectedChapterId,
+        )
+      )
+        reject('insert_cleanup_scope', '此位置已不在本轮允许的增补范围内。');
+      const scene = receipt.commit.scene!;
+      const start = scene.offset + scene.fragmentOffset;
+      const fragment = doc.body.slice(start, start + scene.length);
+      const original = doc.body.slice(0, scene.offset) + doc.body.slice(scene.offset + scene.size);
+      if (
+        fragment.length !== scene.length ||
+        digest(fragment) !== scene.digest ||
+        insertPassage(original, scene.offset, fragment) !== doc.body
+      )
+        reject('insert_cleanup_receipt', '当前片段与已写回执不一致，未清理。');
+      const anchor = insertionAnchor(
+        { ...doc, revision: receipt.insertion.revision, body: original },
+        receipt.insertion,
+      );
+      if (anchor.key !== receipt.anchor || anchor.offset !== scene.offset)
+        reject('insert_cleanup_receipt', '不能核实原插入锚点，未清理。');
+      const before = doc.body.slice(0, start);
+      const after = doc.body.slice(start + scene.length);
+      const cut = safeInsertionEchoCut(before, fragment, after);
+      if (!cut)
+        throw new ToolFailure(
+          'insert_cleanup_unsafe',
+          '未找到唯一且可安全删除的插入边界回声，保留已保存内容。',
+          { chapterId },
+        );
+      const body = before + cut.kept + after;
+      const projectedRevision = digest(renderDocument(doc, doc.fields, body));
+      const prospective = { ...doc, body, revision: projectedRevision };
+      const nextDocs = documents.map((entry) => (docKey(entry) === chapterKey ? prospective : entry));
+      const history = this.edit?.commits ?? this.directCommits;
+      if (!history.includes(receipt.commit) || (this.edit && !ctx.recordEditCommit))
+        reject('insert_cleanup_receipt', '缺少可记录的原插入提交。');
+      const commit: EditCommit = {
+        target: receipt.commit.target,
+        anchor: receipt.anchor,
+        revisions: { [chapterKey]: projectedRevision },
+        cleanup: {
+          previousRevision: revision,
+          from: start + cut.from,
+          to: start + cut.to,
+          digest: digest(cut.kept),
+          preservedSync: [],
+        },
+      };
+      const projectedHistory = [...history, commit];
+      for (const entry of history) {
+        if (!entry.revisions[chapterKey] || !entry.scene) continue;
+        if (!sceneText(entry, history, doc) || !sceneText(entry, projectedHistory, prospective))
+          reject('insert_cleanup_receipt', '不能验证同章片段在清理前后的定位，未写入。');
+      }
+      const pending: string[] = [],
+        retained: string[] = [],
+        guards: Guard[] = [];
+      const projectedSync = this.syncTargets(nextDocs, projectedHistory, true);
+      const priorSync = this.syncTargets(documents, history, true);
+      const associated = new Set(
+        history.flatMap((entry) => (entry.revisions[chapterKey] ? (entry.scene?.assets ?? []) : [])),
+      );
+      for (const key of associated) {
+        const prior = priorSync.find((entry) => entry.key === key);
+        const next = projectedSync.find((entry) => entry.key === key);
+        if (!prior?.ready || !next?.ready || !prior.document)
+          throw new ToolFailure('insert_cleanup_sync', '关联资料或来源已变化，不能维护同步一致性。', {
+            chapterId,
+          });
+        guards.push(
+          prior.document,
+          ...prior.sceneSources
+            .map(({ chapter }) => chapter)
+            .filter((chapter) => chapter.id !== chapterId),
+        );
+        if (preservesSyncEvidence(prior, next, chapterId)) retained.push(key);
+        else if (this.noteSyncAllowed(key)) pending.push(key);
+        else reject('insert_cleanup_sync', '清理后须重新核验相关资料，但作者限制了所需同步；未写入。');
+      }
+      commit.cleanup!.preservedSync = retained;
+      ctx.signal.throwIfAborted();
+      const write = editWriteContext(ctx);
+      const result = await this.workspace.writeChanges(
+        this.bookId,
+        [{ ...ref, fields: doc.fields, body, expect: revision }],
+        ctx.signal,
+        [...new Map(guards.map((guard) => [docKey(guard), guard])).values()],
+        write.ctx.diagnostic,
+        false,
+        chapterPlacementFingerprint(documents),
+      );
+      wrote = result.committed.some((entry) => docKey(entry) === chapterKey);
+      if (wrote) receipt.consumed = true;
+      if (result.error) throw new ToolFailure(result.reason ?? 'io_failure', result.error, result);
+      const actual = write.revisions([ref])[chapterKey];
+      if (actual !== projectedRevision)
+        reject('io_failure', '清理后提交版本未能核实，请读取现稿，不要重放。');
+      if (this.edit) await this.edit.record(ctx, commit);
+      else this.directCommits.push(commit);
+      for (const state of this.inserted.values())
+        if (state.chapterId === chapterId) state.revision = actual;
+      this.remember(prospective);
+      await this.publishEdit(ctx);
+      report('chapter.insertion.cleanup', {
+        outcome: 'ok',
+        revision: actual,
+        expectedRevision: revision,
+        syncPending: pending.length,
+        syncRetained: retained.length,
+      });
+      return {
+        chapterId,
+        insertionRef,
+        revision: actual,
+        cleaned: true,
+        pendingSync: this.syncStatus(nextDocs),
+      };
+    } catch (error) {
+      const reason = classified(error, ctx.signal);
+      report('chapter.insertion.cleanup', {
+        outcome: wrote ? 'partial' : reason === 'cancelled' ? 'cancelled' : 'failed',
+        reason,
+      });
+      throw error;
+    }
+  }
+  private async patchChapter(
+    chapterId: string,
+    revision: string,
+    edits: ProseEdit[],
+    evidence: PatchEvidence[] = [],
+    ctx: RunContext,
+  ) {
+    const ref = { type: 'chapter' as const, id: chapterId };
+    const reportPatch = diagnosticScope(ctx.diagnostic ?? noDiagnostic, { documentRef: docKey(ref) });
+    try {
+      ctx.signal.throwIfAborted();
+      const author = this.input.authorPrompt ?? '';
+      if (
+        ctx.session.bookId !== this.bookId ||
+        this.editMode !== 'direct' ||
+        proposalOnly(author) ||
+        blocksProsePatch(author)
+      )
+        throw new ToolFailure('patch_not_authorized', '当前请求不授权修改章节原文。');
+      const { documents } = await this.workspace.readAll(this.bookId);
+      const chapters = documents.filter((d) => d.type === 'chapter');
+      const intent = prosePatchIntent(author, chapters, this.input.selectedChapterId);
+      const explicit = intent?.chapterId === chapterId;
+      const owned =
+        !explicit &&
+        !ctx.continuation &&
+        this.target?.includes(chapterId) &&
+        this.draftedHere.get(chapterId);
+      if (!explicit && !owned)
+        throw new ToolFailure(
+          'patch_not_authorized',
+          '须由本轮作者指定定点修订，或目标是本轮从空白写出的整书新稿。',
+        );
+      const doc = chapters.find((d) => d.id === chapterId);
+      if (!doc) throw new ToolFailure('missing', '目标章不存在。');
+      if (this.patchedHere.has(chapterId))
+        throw new ToolFailure('patch_scope', '本轮已提交此章的局部修订；不重复写入或拆批扩大改动。');
+      if (doc.revision !== revision || (owned && revision !== owned))
+        throw new ToolFailure('conflict', '目标章修订已变化；不会用旧补丁覆盖当前正文。');
+      const body = patchBody(doc.body, edits);
+      for (const { quote } of edits) this.requirePatchQuote(doc, quote);
+      if (!explicit && !evidence.length)
+        throw new ToolFailure('patch_evidence', '新稿事实勘误需要已读取的前章短原文和版本。');
+      const guards: Guard[] = [];
+      for (const entry of evidence) {
+        const source = chapters.find((d) => d.id === entry.chapterId);
+        if (
+          !source ||
+          source.id === doc.id ||
+          (!explicit &&
+            (source.fields.order === undefined ||
+              doc.fields.order === undefined ||
+              source.fields.order >= doc.fields.order))
+        )
+          throw new ToolFailure(
+            'patch_evidence',
+            '勘误来源须为同作品真实的已保存证据；新稿自修只能引用前章。',
+          );
+        if (source.revision !== entry.revision)
+          throw new ToolFailure('conflict', '引用的证据章已变化，未提交修订。');
+        this.requirePatchQuote(source, entry.quote, true);
+        guards.push({ type: 'chapter', id: source.id, revision: source.revision });
+      }
+      if (explicit && intent.exact) {
+        if (
+          edits.length !== 1 ||
+          edits[0].quote !== intent.exact.quote ||
+          edits[0].replacement !== intent.exact.replacement
+        )
+          throw new ToolFailure('patch_scope', '修订超出作者明确指定的原文或替换文本。');
+      } else if (explicit) {
+        await reviewProsePatch(this.provider, ctx, {
+          author,
+          chapter: { id: doc.id, title: doc.fields.title, order: doc.fields.order },
+          edits,
+        });
+      } else await reviewProsePatch(this.provider, ctx, { evidence, edits });
+      ctx.signal.throwIfAborted();
+      const write = editWriteContext({ ...ctx, diagnostic: reportPatch });
+      const result = await this.workspace.writeChanges(
+        this.bookId,
+        [{ ...ref, fields: doc.fields, body, expect: doc.revision }],
+        ctx.signal,
+        guards,
+        write.ctx.diagnostic,
+      );
+      if (result.committed.some((item) => docKey(item) === docKey(ref))) this.patchedHere.add(chapterId);
+      if (result.error) throw new ToolFailure(result.reason ?? 'unknown', result.error, result);
+      const savedRevision = write.revisions([ref])[docKey(ref)];
+      reportPatch('chapter.patch.finished', {
+        outcome: 'ok',
+        count: edits.length,
+        revision: savedRevision,
+      });
+      return { chapterId, revision: savedRevision, patched: edits.length, factCorrection: !explicit };
+    } catch (error) {
+      const reason = classified(error, ctx.signal);
+      reportPatch('chapter.patch.finished', {
+        outcome: reason === 'cancelled' ? 'cancelled' : 'failed',
+        reason,
+      });
+      if (error instanceof DiagnosticFailure && !(error instanceof ToolFailure))
+        throw new ToolFailure(reason, error.message, { chapterId });
+      throw error;
+    }
   }
   private async apply(operations: Mutation[], ctx: RunContext) {
     this.requireEditAction();
@@ -1118,7 +1538,11 @@ export class NovelTools {
         throw new Error(`先读取当前版本：${key}`);
       if (m.action === 'delete') return { ...ref, expect: old!.revision, delete: true };
       if (m.type === 'chapter' && m.body !== undefined && m.body !== '')
-        throw new Error('请用 book_generate_chapter 生成正文；目录编辑只改标题、顺序或关联');
+        throw new ToolFailure(
+          'chapter_body_not_supported',
+          '目录工具只改标题、顺序或关联。经授权的定点修订用 book_patch_chapter；新写、续写或插入用 book_generate_chapter。',
+          { chapterId: m.id },
+        );
       const fields = { ...old?.fields, ...m.fields } as Fields & Record<string, unknown>;
       for (const field of Object.keys(fields)) if (fields[field] === null) delete fields[field];
       if (m.type === 'chapter' && !old && fields.order === undefined) fields.order = nextOrder++;
@@ -1672,9 +2096,14 @@ export class NovelTools {
         );
       guards = [replacement];
     }
-    const previousFailure = this.chapterFailures.get(chapterId);
+    const insertionKey = anchorKey && plan.insertion && anchorKey + ':' + plan.insertion.revision;
+    const previousFailure = insertionKey
+      ? this.insertionFailures.get(insertionKey)
+      : this.chapterFailures.get(chapterId);
     if (previousFailure) throw previousFailure;
-    const write = edit || this.connectedEntry ? editWriteContext(ctx) : undefined;
+    const draftOwned = mode === 'draft' && this.recordsDraftForCorrection(chapterId, ctx);
+    const write =
+      mode === 'insert' || edit || this.connectedEntry || draftOwned ? editWriteContext(ctx) : undefined;
     const chapterKey = `chapter/${chapterId}`;
     const created = edit
       ? new Set(edit.plan.assets.filter((a) => a.action === 'create').map(assetTarget))
@@ -1687,17 +2116,19 @@ export class NovelTools {
     ].filter((key) => created.has(key));
     const sceneTarget = editPassage ? passageTarget(editPassage) : `passage/${anchorKey ?? chapterId}`;
     const recordScene = async (revisions: Record<string, string>, scene?: InsertedScene) => {
-      const body = scene && sceneAssets.length ? { ...scene, assets: sceneAssets } : undefined;
-      if (edit && editPassage) {
-        await edit.record(ctx, { target: sceneTarget, anchor: anchorKey, revisions, scene: body });
-      } else if (this.connectedEntry && body) {
-        this.directPassages.set(sceneTarget, {
-          chapterId,
-          stage: entryStage ?? 'addition',
-          assets: sceneAssets,
-        });
-        this.directCommits.push({ target: sceneTarget, revisions, scene: body });
+      const body = scene && { ...scene, assets: sceneAssets };
+      const commit = { target: sceneTarget, anchor: anchorKey, revisions, scene: body };
+      if (edit && editPassage) await edit.record(ctx, commit);
+      else {
+        if (this.connectedEntry && body && sceneAssets.length)
+          this.directPassages.set(sceneTarget, {
+            chapterId,
+            stage: entryStage ?? 'addition',
+            assets: sceneAssets,
+          });
+        this.directCommits.push(commit);
       }
+      return commit;
     };
     let scene: InsertedScene | undefined;
     try {
@@ -1723,37 +2154,46 @@ export class NovelTools {
           skill: await this.skills.load('write-chapter', ctx.diagnostic),
           guard: guards,
           retryIncomplete: true,
+          onInsertionCorrection: insertionKey
+            ? (issues) =>
+                this.insertionFailures.set(
+                  insertionKey,
+                  new ToolFailure(
+                    'insertion_quality',
+                    '该位置已尝试定向修正；未保存时请报告问题，不要原样重发。',
+                    { chapterId, issues },
+                  ),
+                )
+            : undefined,
           budgetPurpose: target ? 'long-writing' : undefined,
           directProse: !!target || mode === 'insert',
-          captureInsertion: sceneAssets.length
-            ? (value) => {
-                scene = value;
-              }
-            : undefined,
+          captureInsertion:
+            mode === 'insert'
+              ? (value) => {
+                  scene = value;
+                }
+              : undefined,
           whole: !!target,
         },
       );
       this.remember(saved);
       let outlineRevision: string | undefined;
+      let insertionRef: string | undefined;
       if (mode === 'insert') {
         const state = { chapterId, revision: saved.revision, outlineUpdated: !!plan.insertion?.outline };
         this.inserted.set(anchorKey ?? chapterId, state);
         if (!edit) this.inserted.set(chapterId, state);
-        if (plan.insertion?.outline)
-          outlineRevision = write
-            ? write.revisions([{ type: 'outline', id: 'outline' }])['outline/outline']
-            : (await this.workspace.readDocument(this.bookId, { type: 'outline', id: 'outline' }))
-                .revision;
-        if (write) {
-          await recordScene(
-            write.revisions([
-              { type: 'chapter', id: chapterId },
-              { type: 'outline', id: 'outline' },
-            ]),
-            scene,
-          );
-          await this.publishEdit(ctx);
-        }
+        const expected: DocRef[] = [{ type: 'chapter', id: chapterId }];
+        if (plan.insertion?.outline) expected.push({ type: 'outline', id: 'outline' });
+        const revisions = write!.revisions(expected);
+        outlineRevision = revisions['outline/outline'];
+        const commit = await recordScene(revisions, scene);
+        insertionRef = this.issueInsertionRef(ctx, chapterId, saved.revision, plan.insertion, commit);
+        await this.publishEdit(ctx);
+      }
+      if (draftOwned && write && !ctx.signal.aborted) {
+        const ref = { type: 'chapter' as const, id: chapterId };
+        this.draftedHere.set(chapterId, write.revisions([ref])[chapterKey]);
       }
       if (target && !ctx.signal.aborted) {
         if (this.task?.failedChapterId === chapterId) this.task.failedChapterId = undefined;
@@ -1768,6 +2208,7 @@ export class NovelTools {
           inserted: true,
           outlineUpdated: !!plan.insertion?.outline,
           outlineRevision,
+          ...(insertionRef && { insertionRef }),
           ...((edit || this.connectedEntry) && {
             pendingSync: this.syncStatus((await this.workspace.readAll(this.bookId)).documents),
           }),
@@ -1805,13 +2246,17 @@ export class NovelTools {
           chapterId,
           ...(partial ?? {}),
           ...(error instanceof WritingContextFailure && writingIssueDetails(error)),
+          ...(error instanceof InsertionQualityFailure && { issues: error.issues }),
         },
       );
       if (
         !(error instanceof WritingContextFailure) &&
         (target || reason === 'incomplete_stream' || reason === 'output_limit')
       )
-        this.chapterFailures.set(chapterId, failure);
+        (insertionKey ? this.insertionFailures : this.chapterFailures).set(
+          insertionKey || chapterId,
+          failure,
+        );
       if (target && this.task && !ctx.signal.aborted) {
         this.task.failedChapterId = chapterId;
         const check = this.check(await this.workspace.readAll(this.bookId));
@@ -1859,12 +2304,18 @@ export class NovelTools {
       {
         name: 'book_get_context',
         description:
-          '读取当前作品。按 type/documentId 定向读取；index=chapters/subjects/beats 查真实 ID；offset 分页。按写入要求核对有关现稿，不反复读取未变化的同版资料。整书用 novelGoal 登记、续接或检查目标，不负责执行生成。',
+          '读取当前作品。按 type/documentId 定向读取；index=chapters/subjects/beats 查真实 ID；offset/length 可读限定范围内的精确原文与版本。按写入要求核对有关现稿，不反复读取未变化的同版资料。整书用 novelGoal 登记、续接或检查目标，不负责执行生成。',
         schema: object(
           {
             type: typeSchema,
             documentId: idSchema,
             offset: page,
+            length: {
+              type: 'integer',
+              minimum: 1,
+              maximum: 6000,
+              description: '定向读取原文时可选；兼用于取修订所需的精确短句',
+            },
             index: { type: 'string', enum: indexes },
             novelGoal: object(
               {
@@ -1900,7 +2351,7 @@ export class NovelTools {
       {
         name: 'book_apply_changes',
         description:
-          '提交小说资料变更。若用整书 Skill，先用 book_get_context 的 novelGoal 登记／续接。修改既有或已变化的故事资料前，调用不带 index/type 的 book_get_context，读完各页或按 ID 补读。本轮已显式读到的资料未变化时无需重复取回。可批量提交；引用用真实 ID，可选关系字段用 null 清除。AI 生成或补齐主体／伏笔说明用 book_generate_assets；整书不能在这里新建或填写它们。',
+          '提交小说资料及章节目录变更，不接受章节正文。局部修订用 book_patch_chapter。若用整书 Skill，先用 book_get_context 的 novelGoal 登记／续接。修改既有或已变化的故事资料前，调用不带 index/type 的 book_get_context，读完各页或按 ID 补读。本轮已显式读到的资料未变化时无需重复取回。可批量提交；引用用真实 ID，可选关系字段用 null 清除。AI 生成或补齐主体／伏笔说明用 book_generate_assets；整书不能在这里新建或填写它们。',
         schema: object({
           operations: {
             type: 'array',
@@ -1970,9 +2421,59 @@ export class NovelTools {
           this.generateAssets({ kind, action, targets }, direction, ctx),
       },
       {
+        name: 'book_clean_insert_echo',
+        description:
+          '仅清理本轮刚提交的插入片段首尾可证实的相邻旧文回声。传成功 insert 返回的 insertionRef、章 ID 和该次提交的修订；不提供范围或新文，不修改旧稿。拒绝时保留现稿并报告。若返回待同步，用合法的资料同步动作核验。',
+        schema: object({
+          chapterId: idSchema,
+          revision: revisionSchema,
+          insertionRef: { type: 'string', pattern: '^[a-f0-9-]{36}$' },
+        }),
+        execute: async ({ chapterId, revision, insertionRef }, ctx) =>
+          this.cleanInsertion(chapterId, revision, insertionRef, ctx),
+      },
+      {
+        name: 'book_patch_chapter',
+        description:
+          '按当前作者明确授权定点修改一章的少量原文，不用于插入新场景或整章重写。先用 book_get_context 按章节 ID 读取精确短文与当前版本。只有本轮从空白生成并保持原提交版本的整书新稿，才可另凭已读取的前章原文证据做明确事实勘误；不补写不确定的剧情。',
+        schema: object(
+          {
+            chapterId: idSchema,
+            revision: revisionSchema,
+            edits: {
+              type: 'array',
+              minItems: 1,
+              maxItems: patchEntryLimit,
+              items: object({
+                quote: str('已读取的当前版中唯一的完整短原文，不得截断或归一化', patchFragmentLimit),
+                replacement: {
+                  type: 'string',
+                  maxLength: patchFragmentLimit,
+                  description: '替换后的局部正文；空字符串表示定点删除',
+                },
+              }),
+            },
+            evidence: {
+              type: 'array',
+              minItems: 1,
+              maxItems: patchEntryLimit,
+              uniqueItems: true,
+              items: object({
+                chapterId: idSchema,
+                revision: revisionSchema,
+                quote: str('已读取的其他来源章精确短原文', patchFragmentLimit),
+              }),
+            },
+          },
+          ['chapterId', 'revision', 'edits'],
+        ),
+        execute: async ({ chapterId, revision, edits, evidence }, ctx) =>
+          this.patchChapter(chapterId, revision, edits, evidence, ctx),
+      },
+      {
         name: 'book_generate_chapter',
         description:
-          '流式生成空白章、续写、明确重写或在旧章锚点只插入新段落。insert 是作者要求新增出场／场景时的局部能力，先读该章拿版本和唯一短原文；可一并传有版本的大纲章节增补。用 subjectIds / clueIds 指定内容依赖。若没有已写过渡且后章已有正文，提供 nextBoundary。整书只按序写空白章，replace 需本轮明确授权。',
+          '流式生成空白章、续写、明确重写或在旧章锚点只插入新段落。insert 是作者要求新增出场／场景时的局部能力，先读该章拿版本和唯一短原文；可一并传有版本的大纲章节增补。正常插入成功可返回 insertionRef，只有本轮凭该回执可请求清理新增片段的确定回声。用 subjectIds / clueIds 指定内容依赖。若没有已写过渡且后章已有正文，提供 nextBoundary。整书只按序写空白章，replace 需本轮明确授权。',
         schema: object(
           {
             chapterId: idSchema,

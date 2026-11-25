@@ -250,6 +250,7 @@ export async function runAgent(
       try {
         const value = await tool.execute(params as Record<string, unknown>, {
           ...ctx,
+          narrowedWriting: narrowed,
           progress(value) {
             context.setProgress(value);
             ctx.progress(value);

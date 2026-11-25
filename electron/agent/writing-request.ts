@@ -49,7 +49,7 @@ const chapterActions: Record<ChapterAction, string> = {
   append: '只输出接在现有结尾之后的新增正文，不复述或改写已有段落。',
   replace: '在作者明确授权范围内从头重写目标章，不修改其他章节。',
   insert:
-    '只输出要放入指定锚点的新增段落（通常 200–650 汉字）；与锚点两侧衔接，不输出已有句段、整章或标题，不提前写后续结局。',
+    '只输出要放入指定锚点的新增段落（通常 200–650 汉字）；锚点两侧仅供衔接参考，不复述其中句段、不重复新段、不用“第几章”引用稿件，不输出标题、工作说明或后续结局。',
 };
 const assetActions: Record<AssetAction, string> = {
   create: '仅给指定的新资产生成说明。',
@@ -164,6 +164,7 @@ export function buildWritingRequest(
   options: {
     budgetPurpose?: ModelRequest['budgetPurpose'];
     project?: (blocks: readonly WritingBlock[]) => unknown;
+    correction?: string;
   } = {},
 ) {
   const template =
@@ -178,6 +179,7 @@ export function buildWritingRequest(
     scope.kind === 'chapter' ? scope.chapterSkill : undefined,
     scope.kind === 'chapter' ? chapterActions[scope.action] : assetActions[scope.action],
     scope.kind === 'chapter' && scope.whole ? wholeLength : undefined,
+    options.correction,
     scope.kind === 'chapter'
       ? 'earlierStory 是已保存的前文，plans 是尚未发生的安排，后接条件不是已发生事实。'
       : '只用 submit_story_descriptions 返回候选，不输出分析、整章正文或其他调用。',
