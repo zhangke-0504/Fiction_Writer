@@ -1,4 +1,4 @@
-import type { Effort, ToolResult } from '../../shared/contracts.js';
+import type { Effort, ModelCapabilities, ToolResult } from '../../shared/contracts.js';
 import type { ReportDiagnostic } from '../../shared/diagnostics.js';
 export interface ToolSpec {
   name: string;
@@ -18,11 +18,12 @@ export interface AssistantTurn {
 }
 export type Turn =
   { role: 'user'; text: string } | AssistantTurn | { role: 'tool'; id: string; result: ToolResult };
+export type BudgetPurpose = 'standard' | 'long-writing' | 'probe' | 'compaction' | 'readback';
 export interface ModelRequest {
   system: string;
   history: Turn[];
   tools: ToolSpec[];
-  maxTokens?: number;
+  budgetPurpose?: BudgetPurpose;
   /** A prose-only subrequest may use the endpoint's documented direct generation option. */
   directProse?: boolean;
   /** A bounded task projecting saved text into a single result tool. */
@@ -36,8 +37,10 @@ export interface ModelRequest {
 }
 export interface ModelProvider {
   effort: Effort | 'default';
-  extendedOutputTokens?: number;
-  /** Optional known input budget for a provider, otherwise use a conservative estimate. */
+  capabilities?: ModelCapabilities;
+  /** Optional additional limit of the active protocol / mode. */
+  outputTokenLimit?: number;
+  /** Optional additional limit on input for a provider or fixture. */
   inputTokenBudget?: number;
   /** Some thinking endpoints reject prior text-only assistant messages as native continuation. */
   textHistoryInPrompt?: boolean;

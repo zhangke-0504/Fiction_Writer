@@ -6,7 +6,7 @@ import type { Manuscript } from '../../shared/contracts.js';
 import type { Guard } from '../workspace.js';
 import type { ChapterReadbackContext as Context } from './chapter-context.js';
 import type { ModelProvider, ToolSpec, Turn } from './model.js';
-import { inputBudget, inputEstimate } from './context-budget.js';
+import { inputEstimate, planModelBudget } from './context-budget.js';
 import { callRef } from './tool-receipts.js';
 import type { RunContext } from './runs.js';
 import { noteExcerpt, type NoteExcerpt } from './story-notes.js';
@@ -102,7 +102,7 @@ export async function collectChapterReadbacks(
       },
     ];
     // Optional readback can be skipped for a small endpoint rather than sending an oversized selection request.
-    if (inputEstimate(system, history, [tool]) > inputBudget(model, 2048))
+    if (inputEstimate(system, history, [tool]) > planModelBudget(model, 'readback').inputTokens)
       return { readbacks, guards: [] };
     const selection = await model.turn({
       diagnostic: report,
@@ -110,7 +110,7 @@ export async function collectChapterReadbacks(
       system,
       history,
       tools: [tool],
-      maxTokens: 2_048,
+      budgetPurpose: 'readback',
       signal,
       onText: () => {},
     });

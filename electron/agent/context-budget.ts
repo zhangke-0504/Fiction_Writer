@@ -1,8 +1,9 @@
-import type { ChatLine } from '../../shared/contracts.js';
+import type { CapabilitySource, ChatLine, ModelCapabilities } from '../../shared/contracts.js';
 import type { ReportDiagnostic } from '../../shared/diagnostics.js';
 import { DiagnosticFailure } from '../diagnostics/trace.js';
-import type { ModelProvider, ToolSpec, Turn } from './model.js';
+import type { BudgetPurpose, ModelProvider, ToolSpec, Turn } from './model.js';
 import type { ToolReceipt } from './tool-receipts.js';
+import { genericCapabilities } from './provider-capabilities.js';
 
 export type SessionCheckpoint = { through: number; summary: string; source: 'model' | 'excerpt' };
 export type SessionHistory = {
@@ -30,8 +31,27 @@ export function readCheckpoint(value: unknown, lineCount: number): SessionCheckp
 
 /** A deliberately conservative UTF-8 proxy, including CJK and native protocol state. */
 export const tokens = (text: string) => Math.ceil(Buffer.byteLength(text, 'utf8') / 2);
-export const inputBudget = (provider: ModelProvider, output = 8192) =>
-  provider.inputTokenBudget ?? 64_000 - output - 1200;
+const outputTargets: Record<BudgetPurpose, number> = {
+  standard: 8_192,
+  'long-writing': 65_536,
+  probe: 1_024,
+  compaction: 2_048,
+  readback: 2_048,
+};
+export function planModelBudget(provider: ModelProvider, purpose: BudgetPurpose = 'standard') {
+  const capabilities: ModelCapabilities = provider.capabilities ?? genericCapabilities;
+  const maxTokens = Math.min(
+    outputTargets[purpose],
+    capabilities.maxOutputTokens,
+    provider.outputTokenLimit ?? Infinity,
+  );
+  const inputTokens = Math.min(
+    capabilities.contextWindow - maxTokens - 1_200,
+    capabilities.maxInputTokens ?? Infinity,
+    provider.inputTokenBudget ?? Infinity,
+  );
+  return { purpose, capabilities, maxTokens, inputTokens };
+}
 export function inputEstimate(system: string, history: readonly Turn[], tools: ToolSpec[]) {
   return (
     tokens(system) +
@@ -89,7 +109,7 @@ async function summarize(
   sessionSignal: AbortSignal,
   report?: ReportDiagnostic,
 ): Promise<Pick<SessionCheckpoint, 'summary' | 'source'>> {
-  const limit = Math.min(7200, inputBudget(provider, 2048) - 380);
+  const limit = Math.min(7200, planModelBudget(provider, 'compaction').inputTokens - 380);
   if (limit > 520) {
     const timeout = AbortSignal.any([sessionSignal, AbortSignal.timeout(15_000)]);
     let stop: (() => void) | undefined;
@@ -109,7 +129,7 @@ async function summarize(
           history,
           signal: timeout,
           tools: [],
-          maxTokens: 2048,
+          budgetPurpose: 'compaction',
           onText() {},
           diagnostic: report,
         }),
@@ -134,17 +154,26 @@ async function summarize(
   };
 }
 
+type SessionHistoryBudget = { inputTokens: number; capabilitySource: CapabilitySource; spare: number };
+
+export function sessionHistoryAllowance({ inputTokens, capabilitySource, spare }: SessionHistoryBudget) {
+  const space = Math.floor(Math.max(0, spare) * 0.43);
+  const ceiling = capabilitySource === 'provider' ? Math.floor(Math.max(0, inputTokens) * 0.05) : 9_800;
+  return Math.min(space, ceiling);
+}
+
 /** The cursor counts original JSONL chat lines, including invisible-to-model status/tool lines. */
 export async function prepareSessionHistory(
   source: SessionHistory | undefined,
   provider: ModelProvider,
-  spare: number,
+  budget: SessionHistoryBudget,
   signal: AbortSignal,
   report?: ReportDiagnostic,
 ): Promise<{ prelude: string; turns: Turn[] }> {
   if (!source) return { prelude: '', turns: [] };
   const { lines } = source;
-  const allowance = Math.min(9800, Math.max(0, Math.floor(spare * 0.43)));
+  const { spare } = budget;
+  const allowance = sessionHistoryAllowance(budget);
   const previous = source.checkpoint;
   let through = previous?.through ?? 0;
   const retained: Turn[] = [];

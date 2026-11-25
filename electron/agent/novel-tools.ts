@@ -436,7 +436,7 @@ export class NovelTools {
   }
   // For manual acceptance, the per-run cap is uniform regardless of goal size.
   roundLimit = () => defaultRoundLimit;
-  outputTokens = () => (this.wholeSkill ? this.provider.extendedOutputTokens : undefined);
+  budgetPurpose = () => (this.wholeSkill ? 'long-writing' as const : undefined);
   restorePrimaryFailure() {
     const last = [...this.chapterFailures.values()].at(-1);
     if (this.wholeSkill && last) throw last;
@@ -1464,7 +1464,7 @@ export class NovelTools {
           skill: await this.skills.load('write-chapter', ctx.diagnostic),
           guard: guards,
           retryIncomplete: true,
-          maxTokens: target ? this.provider.extendedOutputTokens : undefined,
+          budgetPurpose: target ? 'long-writing' : undefined,
           directProse: !!target || mode === 'insert',
           captureInsertion: sceneAssets.length
             ? (value) => {

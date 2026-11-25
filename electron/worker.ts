@@ -184,8 +184,7 @@ async function startSession(args: StartRun, report: ReportDiagnostic, requestId?
         ];
       }
       try {
-        const budget = novel && { roundLimit: novel.roundLimit, outputTokens: novel.outputTokens };
-        await runAgent(ctx, provider, system, [], request, tools, budget, reportAttachedMemory);
+        await runAgent(ctx, provider, system, [], request, tools, novel, reportAttachedMemory);
       } catch (error) {
         if (classified(error, ctx.signal) === 'iteration_limit') novel?.restorePrimaryFailure();
         throw error;
@@ -259,7 +258,7 @@ async function handle(
       return profiles.list();
     case 'profiles.save': {
       await ensureProfiles();
-      const profile = await profiles.save(args);
+      const profile = await profiles.save(args, requestId);
       journal.emit({ type: 'profiles-change' });
       return profile;
     }

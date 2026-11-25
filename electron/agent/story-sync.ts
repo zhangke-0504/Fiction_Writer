@@ -3,7 +3,7 @@ import { diagnosticScope, noDiagnostic } from '../../shared/diagnostics.js';
 import type { Manuscript } from '../../shared/contracts.js';
 import { digest, docKey, renderDocument, storyLinks } from '../documents.js';
 import type { WorkspaceService } from '../workspace.js';
-import { inputBudget, inputEstimate } from './context-budget.js';
+import { inputEstimate, planModelBudget } from './context-budget.js';
 import type { EditCommit, EditPassage } from './edit-proposal.js';
 import { object, ToolFailure } from './loop.js';
 import type { ModelProvider, Turn } from './model.js';
@@ -380,8 +380,8 @@ export async function syncStoryNote(
       }),
     },
   ];
-  const maxTokens = model.extendedOutputTokens;
-  if (inputEstimate(system, history, tools) > inputBudget(model, maxTokens))
+  const budgetPurpose = 'long-writing';
+  if (inputEstimate(system, history, tools) > planModelBudget(model, budgetPurpose).inputTokens)
     throw new ToolFailure('context_limit', '关联片段和资料状态超出同步请求预算。');
   const spanId = randomUUID();
   const trace = diagnosticScope(ctx.diagnostic ?? noDiagnostic, {
@@ -394,7 +394,7 @@ export async function syncStoryNote(
     system,
     history,
     tools,
-    maxTokens,
+    budgetPurpose,
     directToolResult: true,
     signal: ctx.signal,
     spanId,

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { ModelProfile, RuntimeView, Session } from '../../shared/contracts';
 
 test('encrypted profiles, routing selection, effort fallback and attachment snapshot', async ({}, testInfo) => {
+  test.setTimeout(90_000);
   const requests: { url?: string; body: any }[] = [];
   let release!: () => void;
   const wait = new Promise<void>((resolve) => {
@@ -61,6 +62,12 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
     const request = <T>(method: string, args?: unknown) =>
       page.evaluate(([m, a]) => window.fw.request<T>(m, a), [method, args] as const);
     await page.getByRole('button', { name: '设置', exact: true }).click();
+    await expect(page.getByRole('heading', { name: '选择供应商' })).toBeVisible();
+    await page.getByRole('button', { name: /DeepSeek/ }).click();
+    await expect(page.getByLabel('API 请求地址')).toHaveValue('https://api.deepseek.com/anthropic');
+    await expect(page.getByLabel('模型 ID')).toHaveValue('');
+    await page.getByRole('button', { name: '返回供应商列表' }).click();
+    await page.getByRole('button', { name: /自定义配置/ }).click();
     await page.getByLabel('名称').fill('测试供应商 A');
     await page.getByLabel('模型 ID').fill('test-a');
     await page.getByLabel('API Key').fill(key);
@@ -69,6 +76,7 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
     await expect(page.getByText('配置已保存', { exact: true })).toBeVisible();
     await expect(page.getByLabel('API Key')).toHaveValue('');
     await page.getByRole('button', { name: '新建配置' }).click();
+    await page.getByRole('button', { name: /DeepSeek/ }).click();
     await page.getByLabel('名称').fill('测试供应商 B');
     await page.getByLabel('模型 ID').fill('test-b');
     await page.getByLabel('API Key').fill(key);
@@ -80,6 +88,11 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
     let profiles = await request<ModelProfile[]>('profiles.list');
     const a = profiles.find((p) => p.model === 'test-a')!,
       b = profiles.find((p) => p.model === 'test-b')!;
+    await expect(page.getByText('额度未识别，使用通用兜底值')).toBeVisible();
+    expect(a.providerId).toBe('custom');
+    expect(b.providerId).toBe('deepseek');
+    expect(b.capabilities).toMatchObject({ contextWindow: 64_000, maxOutputTokens: 8_192, source: 'generic-fallback' });
+    expect(requests).toHaveLength(0);
     expect(JSON.stringify(profiles)).not.toContain(key);
     expect(await readFile(join(root, 'state', 'profiles.json'), 'utf8')).not.toContain(key);
     await page.reload();
@@ -183,6 +196,11 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
     await reopened.getByRole('button', { name: '发送' }).click();
     await expectComplete(first.id, 3);
     expect(requests[3].url).toBe('/one/v1/chat/completions');
+    expect(requests.map(({ body }) => body.max_tokens)).toEqual([8_192, 8_192, 8_192, 8_192]);
+    const reopenedProfiles = await request<ModelProfile[]>('profiles.list');
+    expect(reopenedProfiles.find((p) => p.id === a.id)?.capabilities).toEqual(a.capabilities);
+    expect(reopenedProfiles.find((p) => p.id === b.id)?.capabilities).toEqual(b.capabilities);
+    expect(JSON.stringify(reopenedProfiles)).not.toContain(key);
     for (const book of [first, second]) {
       const memory = join(root, 'library', book.id, '.fiction-writer', 'memory.json');
       expect(await readFile(memory, 'utf8')).not.toContain(key);

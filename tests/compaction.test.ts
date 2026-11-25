@@ -8,7 +8,14 @@ import { RunManager } from '../electron/agent/runs.js';
 import { Journal } from '../electron/journal.js';
 import { ScriptedProvider } from '../electron/agent/scripted.js';
 import { object, runAgent, ToolFailure } from '../electron/agent/loop.js';
-import { inputEstimate, tokens } from '../electron/agent/context-budget.js';
+import {
+  inputEstimate,
+  planModelBudget,
+  sessionHistoryAllowance,
+  tokens,
+} from '../electron/agent/context-budget.js';
+import { createProvider } from '../electron/agent/provider.js';
+import type { ModelCapabilities } from '../shared/contracts.js';
 import { WorkspaceService } from '../electron/workspace.js';
 import { collectDiagnostics } from './diagnostic-fixture.js';
 import type { AssistantTurn } from '../electron/agent/model.js';
@@ -36,6 +43,134 @@ async function fixture(t: import('node:test').TestContext) {
       .map((line) => JSON.parse(line));
   return { root, trace, restart, disk, entries };
 }
+
+const deepSeekLimits = { contextWindow: 1_048_576, maxOutputTokens: 393_216 };
+
+test('old dialogue allowance uses the planned input limit only for confirmed provider metadata', () => {
+  const allowance = (capabilities?: ModelCapabilities, spare?: number) => {
+    const provider = Object.assign(new ScriptedProvider([]), { capabilities });
+    const budget = planModelBudget(provider);
+    return sessionHistoryAllowance({
+      inputTokens: budget.inputTokens,
+      capabilitySource: budget.capabilities.source,
+      spare: spare ?? budget.inputTokens - 1_000,
+    });
+  };
+  const confirmed = { ...deepSeekLimits, source: 'provider' } as const;
+  assert.equal(allowance(confirmed), 51_959);
+  assert.equal(allowance({ ...confirmed, maxInputTokens: 32_000 }), 1_600);
+  assert.equal(allowance({ ...confirmed, contextWindow: 24_000, maxOutputTokens: 2_000 }), 1_040);
+  assert.equal(allowance(confirmed, 20_001), 8_600);
+  assert.equal(allowance(confirmed, 0), 0);
+  assert.equal(allowance(confirmed, -1), 0);
+  const vendorFallback = { ...deepSeekLimits, source: 'provider-fallback' } as const;
+  assert.equal(allowance(vendorFallback), 9_800);
+  assert.equal(allowance(vendorFallback, 20_001), 8_600);
+  assert.equal(
+    allowance({ contextWindow: 64_000, maxOutputTokens: 8_192, source: 'generic-fallback' }),
+    9_800,
+  );
+  assert.equal(allowance(), 9_800);
+});
+
+test('a confirmed allowance brings more complete same-session groups onto the wire without reopening a checkpoint', async (t) => {
+  const { root, disk, entries, restart } = await fixture(t);
+  let runs = await restart();
+  const bookId = randomUUID();
+  const { id } = await runs.create({ cwd: root, bookId }, '会话 A');
+  const { id: other } = await runs.create({ cwd: root, bookId }, '会话 B');
+  const record = async (sessionId: string, prompt: string, text: string) => {
+    runs.start(sessionId, prompt, (ctx) => ctx.line({ role: 'assistant', text }));
+    await runs.wait(sessionId);
+    assert.equal(runs.get(sessionId).run?.status, 'completed');
+  };
+  await record(id, 'A_ARCHIVED_DIRECTION', 'ARCHIVED_ASSISTANT_' + 'x'.repeat(24_000));
+  await record(other, 'B_PRIVATE_PROMPT', 'B_PRIVATE_REPLY');
+  const wires: {
+    system: string;
+    max_tokens: number;
+    messages: { role: string; content: { text: string }[] }[];
+  }[] = [];
+  t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => {
+    wires.push(JSON.parse(String(init.body)));
+    const events = [
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'fixture reply' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      { type: 'message_stop' },
+    ];
+    return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''), {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  });
+  const send = async (sessionId: string, prompt: string, source: ModelCapabilities['source']) => {
+    const provider = createProvider(
+      {
+        id: 'deepseek-fixture',
+        name: 'DeepSeek',
+        providerId: 'deepseek',
+        protocol: 'messages',
+        baseUrl: 'https://api.deepseek.com/anthropic',
+        model: 'deepseek-flash',
+        capabilities: { ...deepSeekLimits, source },
+      },
+      'local-test-key',
+    );
+    runs.start(sessionId, prompt, async (ctx) => {
+      await runAgent(ctx, provider, 'test harness', [], prompt, []);
+    });
+    await runs.wait(sessionId);
+    const run = runs.get(sessionId).run;
+    assert.equal(run?.status, 'completed', run?.error);
+  };
+  const history = (wire: (typeof wires)[number]) =>
+    wire.messages.map(({ role, content }) => [role, content.map(({ text }) => text).join('')]);
+  const checkpoints = async () =>
+    (await entries(id)).filter((row) => row.compaction).map((row) => row.compaction);
+
+  await send(id, 'A_FALLBACK_REQUEST', 'provider-fallback');
+  assert.deepEqual(
+    wires.map((wire) => wire.max_tokens),
+    [2_048, 8_192],
+  );
+  assert.deepEqual(history(wires[1]), [['user', 'A_FALLBACK_REQUEST']]);
+  const existing = await checkpoints();
+  assert.equal(existing.length, 1);
+  assert.equal(existing[0].through, 2);
+  assert.equal(existing[0].source, 'model');
+
+  const first = 'A_RECENT_FIRST_' + 'a'.repeat(24_000);
+  const second = 'A_RECENT_SECOND_' + 'b'.repeat(24_000);
+  await record(id, 'A_FIRST_PROMPT', first);
+  await record(id, 'A_SECOND_PROMPT', second);
+  const raw = structuredClone(runs.get(id).messages);
+  const prefix = await disk(id);
+  runs = await restart();
+  await send(id, 'A_CURRENT', 'provider');
+  assert.equal(wires.length, 3); // No fresh compaction needed for the now-larger tail.
+  assert.deepEqual(history(wires[2]), [
+    ['user', 'A_FALLBACK_REQUEST'],
+    ['assistant', 'fixture reply'],
+    ['user', 'A_FIRST_PROMPT'],
+    ['assistant', first],
+    ['user', 'A_SECOND_PROMPT'],
+    ['assistant', second],
+    ['user', 'A_CURRENT'],
+  ]);
+  assert.match(wires[2].system, /会话摘要：/);
+  assert.doesNotMatch(JSON.stringify(wires[2]), /ARCHIVED_ASSISTANT_|B_PRIVATE_/);
+  assert.deepEqual(await checkpoints(), existing);
+  assert.ok((await disk(id)).startsWith(prefix));
+  assert.deepEqual(runs.get(id).messages.slice(0, raw.length), raw);
+
+  await send(other, 'B_CURRENT', 'provider');
+  assert.deepEqual(history(wires[3]), [
+    ['user', 'B_PRIVATE_PROMPT'],
+    ['assistant', 'B_PRIVATE_REPLY'],
+    ['user', 'B_CURRENT'],
+  ]);
+  assert.doesNotMatch(JSON.stringify(wires[3]), /A_ARCHIVED_|A_RECENT_/);
+});
 
 for (const source of ['model', 'excerpt'] as const) {
   test(`append a private ${source} checkpoint and restore it after restart without changing old messages`, async (t) => {

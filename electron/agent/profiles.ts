@@ -3,8 +3,15 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ModelProfile, Protocol } from '../../shared/contracts.js';
+import {
+  canDiscover,
+  discoverCapabilities,
+  fallbackCapabilities,
+  isOfficialDeepSeek,
+  savedCapabilities,
+} from './provider-capabilities.js';
 
-type Settings = Omit<ModelProfile, 'id'> & { id?: string; cipher?: string };
+type Settings = Omit<ModelProfile, 'id' | 'capabilities'> & { id?: string; cipher?: string };
 type Stored = ModelProfile & { cipher: string };
 export function baseAddress(value: string) {
   let url: URL;
@@ -24,6 +31,12 @@ export function baseAddress(value: string) {
   url.pathname = url.pathname.replace(/\/+$/, '');
   return url.toString().replace(/\/$/, '');
 }
+function view({ cipher: _, ...stored }: Stored): ModelProfile {
+  const providerId = stored.providerId ?? (isOfficialDeepSeek(stored) ? 'deepseek' : 'custom');
+  const profile = { ...stored, providerId };
+  return { ...profile, capabilities: savedCapabilities(profile) };
+}
+
 export class ProfileStore {
   private stored: Stored[] = [];
   private chain = Promise.resolve();
@@ -31,6 +44,7 @@ export class ProfileStore {
   constructor(
     private folder: string,
     private decrypt: (cipher: string, requestId?: string) => Promise<string>,
+    private discover = discoverCapabilities,
   ) {
     this.path = join(folder, 'profiles.json');
   }
@@ -48,6 +62,7 @@ export class ProfileStore {
             typeof item.model !== 'string' ||
             typeof item.baseUrl !== 'string' ||
             typeof item.cipher !== 'string' ||
+            (item.providerId !== undefined && !['deepseek', 'custom'].includes(item.providerId)) ||
             !['chat', 'responses', 'messages'].includes(item.protocol),
         )
       )
@@ -58,15 +73,14 @@ export class ProfileStore {
     }
   }
   list() {
-    return this.stored.map(({ cipher: _, ...profile }) => ({ ...profile }));
+    return this.stored.map(view);
   }
   async resolve(id: string, requestId?: string) {
     const record = this.stored.find((profile) => profile.id === id);
     if (!record) throw new DiagnosticFailure('profile_missing', '请先选择一个已保存的模型配置');
-    const { cipher, ...profile } = record;
-    return { profile, key: await this.decrypt(cipher, requestId) };
+    return { profile: view(record), key: await this.decrypt(record.cipher, requestId) };
   }
-  save(input: Settings): Promise<ModelProfile> {
+  save(input: Settings, requestId?: string): Promise<ModelProfile> {
     const next = this.chain.then(async () => {
       const prior = this.stored.find((profile) => profile.id === input.id),
         name = input.name?.trim(),
@@ -79,13 +93,24 @@ export class ProfileStore {
       if (input.id && !prior) throw new Error('模型配置已不存在');
       const cipher = input.cipher || prior?.cipher;
       if (!cipher) throw new Error('请输入 API Key');
+      const providerId = input.providerId ?? (prior ? view(prior).providerId : 'custom');
+      if (providerId !== 'custom' && providerId !== 'deepseek') throw new Error('请选择有效的供应商');
       const profile: ModelProfile = {
         id: prior?.id ?? randomUUID(),
         name,
         model,
         baseUrl: baseAddress(input.baseUrl),
         protocol,
+        providerId,
       };
+      if (canDiscover(profile)) {
+        if (!input.cipher && prior && new URL(prior.baseUrl).origin !== new URL(profile.baseUrl).origin)
+          throw new Error('请求地址已切换到不同来源，请重新填写 API Key');
+        const key = await this.decrypt(cipher, requestId);
+        profile.capabilities = await this.discover(profile, key);
+      } else {
+        profile.capabilities = fallbackCapabilities(profile);
+      }
       const records = [...this.stored.filter((row) => row.id !== profile.id), { ...profile, cipher }];
       const temp = this.path + '.' + randomUUID() + '.tmp';
       try {

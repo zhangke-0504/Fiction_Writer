@@ -240,7 +240,7 @@ async function invoke(method: string, args: unknown, requestId?: string) {
   }
   if (method === 'shutdown') throw new DiagnosticFailure('invalid_request', '无效请求');
   if (method === 'profiles.save') {
-    const { id, name, model, baseUrl, protocol, apiKey } = args as Record<string, string | undefined>;
+    const { id, name, model, baseUrl, protocol, providerId, apiKey } = args as Record<string, string | undefined>;
     const key = apiKey?.trim();
     let cipher: string | undefined;
     if (key) {
@@ -265,7 +265,7 @@ async function invoke(method: string, args: unknown, requestId?: string) {
         throw new DiagnosticFailure('credential_unavailable', '无法加密 API Key');
       }
     }
-    return request(method, { id, name, model, baseUrl, protocol, cipher }, requestId);
+    return request(method, { id, name, model, baseUrl, protocol, providerId, cipher }, requestId);
   }
   if (method === 'runtime.snapshot') {
     const selectedWorker = workerId;

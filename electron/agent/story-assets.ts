@@ -445,7 +445,7 @@ export async function generateStoryAssets(
   const compiled = (() => {
     try {
       return buildWritingRequest(model, scope, intent, assetContext(documents, targets, intent), {
-        maxTokens: model.extendedOutputTokens,
+        budgetPurpose: 'long-writing',
       });
     } catch (error) {
       if (error instanceof WritingContextFailure) reportWritingBlock(trace, scope, error);

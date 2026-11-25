@@ -9,13 +9,13 @@ import {
   type JsonObject,
   type UserMessage,
 } from '@earendil-works/pi-ai';
-import type { AssistantTurn, ModelProvider, ToolSpec, Turn } from './model.js';
+import type { AssistantTurn, ModelProvider, ModelRequest, ToolSpec, Turn } from './model.js';
 import { MalformedMessagesArguments } from './provider.js';
 import type { ReportMemoryDispatch } from './book-memory.js';
 import type { RunContext } from './runs.js';
 import type { ToolResult } from '../../shared/contracts.js';
 import { ActiveContext } from './active-context.js';
-import { contextOverflow, inputBudget, inputEstimate, prepareSessionHistory } from './context-budget.js';
+import { contextOverflow, inputEstimate, planModelBudget, prepareSessionHistory } from './context-budget.js';
 import {
   callRef,
   commitReceiptLimit,
@@ -120,7 +120,7 @@ function commandOutcome(value: unknown) {
 export const defaultRoundLimit = 200;
 interface AgentBudget {
   roundLimit: () => number;
-  outputTokens: () => number | undefined;
+  budgetPurpose: () => ModelRequest['budgetPurpose'];
 }
 
 export async function runAgent(
@@ -134,14 +134,14 @@ export async function runAgent(
   reportAttachedMemory?: ReportMemoryDispatch,
 ) {
   const trace = diagnosticScope(safeReporter(ctx.diagnostic ?? noDiagnostic), { lane: 'agent' });
-  const maxOutput = () => (typeof budget === 'number' ? undefined : budget.outputTokens());
-  const spare =
-    inputBudget(provider, maxOutput()) - inputEstimate(system, [{ role: 'user', text: prompt }], tools);
+  const purpose = () => (typeof budget === 'number' ? undefined : budget.budgetPurpose());
+  const { inputTokens, capabilities } = planModelBudget(provider, purpose());
+  const spare = inputTokens - inputEstimate(system, [{ role: 'user', text: prompt }], tools);
   if (spare < 0) throw contextOverflow();
   const session = await prepareSessionHistory(
     ctx.history,
     provider,
-    spare,
+    { inputTokens, capabilitySource: capabilities.source, spare },
     ctx.signal,
     diagnosticScope(trace, { lane: 'compaction' }),
   );
@@ -315,8 +315,8 @@ export async function runAgent(
     };
     void (async () => {
       try {
-        const maxTokens = maxOutput();
-        const wire = context.fit(inputBudget(provider, maxTokens));
+        const budgetPurpose = purpose();
+        const wire = context.fit(planModelBudget(provider, budgetPurpose).inputTokens);
         history = wire.history;
         const stats = context.stats;
         if (stats.removed + stats.reductions !== previousCompaction) {
@@ -333,7 +333,7 @@ export async function runAgent(
           return provider.turn({
             ...wire,
             tools,
-            maxTokens,
+            budgetPurpose,
             signal: ctx.signal,
             onText: ctx.text,
             diagnostic: requestTrace,

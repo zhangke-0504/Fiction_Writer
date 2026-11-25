@@ -3,6 +3,8 @@ import { diagnosticScope, noDiagnostic, type ReportDiagnostic } from '../../shar
 import { classified, elapsed, safeReporter } from '../diagnostics/trace.js';
 import type { Effort, ModelProfile } from '../../shared/contracts.js';
 import type { AssistantTurn, ModelProvider, ModelRequest, ToolCall, ToolSpec } from './model.js';
+import { contextOverflow, inputEstimate, planModelBudget } from './context-budget.js';
+import { isOfficialDeepSeek, savedCapabilities } from './provider-capabilities.js';
 import { ModelStreamReadError, sse } from './sse.js';
 
 const operation = { chat: '/chat/completions', responses: '/responses', messages: '/messages' } as const;
@@ -113,7 +115,7 @@ function toolDefinitions(tools: ToolSpec[], protocol: ModelProfile['protocol']) 
         : { type: 'function', function: { name, description, parameters: schema } },
   );
 }
-function chatBody(request: ModelRequest, profile: ModelProfile) {
+function chatBody(request: ModelRequest, profile: ModelProfile, maxTokens: number) {
   const messages: unknown[] = [{ role: 'system', content: request.system }];
   for (const turn of request.history) {
     if (turn.role === 'user') messages.push({ role: 'user', content: turn.text });
@@ -138,9 +140,9 @@ function chatBody(request: ModelRequest, profile: ModelProfile) {
   const tokenField = /^(o[134](?:-|$)|gpt-5)/.test(profile.model)
     ? 'max_completion_tokens'
     : 'max_tokens';
-  return { messages, [tokenField]: request.maxTokens ?? 8192 };
+  return { messages, [tokenField]: maxTokens };
 }
-function responsesBody(request: ModelRequest) {
+function responsesBody(request: ModelRequest, maxTokens: number) {
   const input: unknown[] = [];
   for (const turn of request.history) {
     if (turn.role === 'user') input.push({ role: 'user', content: turn.text });
@@ -163,10 +165,10 @@ function responsesBody(request: ModelRequest) {
     input,
     instructions: request.system,
     store: false,
-    max_output_tokens: request.maxTokens ?? 8192,
+    max_output_tokens: maxTokens,
   };
 }
-function messagesBody(request: ModelRequest) {
+function messagesBody(request: ModelRequest, maxTokens: number) {
   type Row = { role: 'user' | 'assistant'; content: Array<Record<string, unknown>> };
   const messages: Row[] = [];
   const add = (role: Row['role'], ...content: Row['content']) => {
@@ -187,7 +189,7 @@ function messagesBody(request: ModelRequest) {
       else if (turn.text) add('assistant', { type: 'text', text: turn.text });
     }
   }
-  return { messages, system: request.system, max_tokens: request.maxTokens ?? 8192 };
+  return { messages, system: request.system, max_tokens: maxTokens };
 }
 type Payload = { label: string; value: any };
 async function* stream(
@@ -433,17 +435,14 @@ export function createProvider(
   timeoutMs = 120_000,
 ): ModelProvider {
   const configuration = settings(profile, effort);
-  // The official DeepSeek Messages endpoint documents a larger budget (including thinking tokens).
-  // Do not assume the same limit for models behind other gateways.
-  const extendedOutputTokens =
+  // This is protocol compatibility, not derived from the advertised token limits.
+  const deepSeekMessages =
     profile.protocol === 'messages' &&
-    /^https:\/\/api\.deepseek\.com\/anthropic(?:\/v1)?$/i.test(profile.baseUrl) &&
-    /^deepseek-(?:flash|v4-(?:flash|pro))$/i.test(profile.model)
-      ? 16_384
-      : undefined;
-  return {
+    isOfficialDeepSeek(profile) &&
+    /^deepseek-(?:flash|v4-(?:flash|pro))$/i.test(profile.model);
+  const provider: ModelProvider = {
     effort: configuration.used,
-    extendedOutputTokens,
+    capabilities: savedCapabilities(profile),
     textHistoryInPrompt: profile.protocol === 'chat' && /^deepseek-v4-/i.test(profile.model),
     async turn(request) {
       const spanId = request.spanId ?? randomUUID();
@@ -460,10 +459,15 @@ export function createProvider(
       });
       let httpStatus: number | undefined;
       try {
+        const { purpose, capabilities, maxTokens, inputTokens } = planModelBudget(
+          provider,
+          request.budgetPurpose,
+        );
+        const estimatedInput = inputEstimate(request.system, request.history, request.tools);
+        request.signal.throwIfAborted();
+        if (maxTokens < 1 || estimatedInput > inputTokens) throw contextOverflow();
         const turnTimeout =
-          extendedOutputTokens !== undefined &&
-          request.maxTokens === extendedOutputTokens &&
-          timeoutMs === 120_000
+          deepSeekMessages && purpose === 'long-writing' && maxTokens > 8_192 && timeoutMs === 120_000
             ? 180_000
             : timeoutMs;
         const signal = AbortSignal.any([request.signal, AbortSignal.timeout(turnTimeout)]);
@@ -478,16 +482,16 @@ export function createProvider(
         } else hdr.authorization = `Bearer ${key}`;
         const params =
           profile.protocol === 'chat'
-            ? chatBody(request, profile)
+            ? chatBody(request, profile, maxTokens)
             : profile.protocol === 'responses'
-              ? responsesBody(request)
-              : messagesBody(request);
+              ? responsesBody(request, maxTokens)
+              : messagesBody(request, maxTokens);
         const body = JSON.stringify({
           ...params,
           model: profile.model,
           stream: true,
           ...configuration.fields,
-          ...(extendedOutputTokens &&
+          ...(deepSeekMessages &&
             ((request.directProse && !request.tools.length) ||
               (request.directToolResult && request.tools.length === 1)) && {
               thinking: { type: 'disabled' },
@@ -498,6 +502,14 @@ export function createProvider(
         try {
           signal.throwIfAborted();
           const pending = fetch(url, { method: 'POST', headers: hdr, redirect: 'error', body, signal });
+          report('model.budget_dispatched', {
+            purpose,
+            capabilitySource: capabilities.source,
+            contextWindow: capabilities.contextWindow,
+            maxOutputTokens: capabilities.maxOutputTokens,
+            estimatedInput,
+            maxTokens,
+          });
           request.onDispatch?.(spanId);
           response = await pending;
         } catch {
@@ -576,6 +588,7 @@ export function createProvider(
       }
     },
   };
+  return provider;
 }
 export async function checkProvider(
   profile: ModelProfile,
@@ -592,7 +605,7 @@ export async function checkProvider(
     tools: [],
     signal,
     diagnostic: report,
-    maxTokens: 1024,
+    budgetPurpose: 'probe',
     onText: () => {},
   };
   try {

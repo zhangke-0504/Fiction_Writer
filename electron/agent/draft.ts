@@ -5,7 +5,7 @@ import { applySkill } from './skills.js';
 import type { InsertedScene } from './edit-proposal.js';
 import type { Change, Manuscript, WriteReport } from '../../shared/contracts.js';
 import { chapterPlacementFingerprint, digest, docKey } from '../documents.js';
-import type { AssistantTurn, ModelProvider } from './model.js';
+import type { AssistantTurn, ModelProvider, ModelRequest } from './model.js';
 import type { RunContext } from './runs.js';
 import type { WorkspaceService, Guard } from '../workspace.js';
 import { chapterContext, projectChapter } from './chapter-context.js';
@@ -58,7 +58,7 @@ export async function draftChapter(
     plan?: ChapterPlan;
     insertion?: ChapterInsertion;
     expectedPlacement?: string;
-    maxTokens?: number;
+    budgetPurpose?: ModelRequest['budgetPurpose'];
     directProse?: boolean;
     captureInsertion?: (scene: InsertedScene) => void;
   } = {},
@@ -157,7 +157,7 @@ export async function draftChapter(
     const blocks = [...structural, ...context.memory(memory), ...evidence];
     const compile = (supplement: WritingBlock[]) =>
       buildWritingRequest(model, scope, scopedIntent, [...supplement, ...blocks], {
-        maxTokens: options.maxTokens,
+        budgetPurpose: options.budgetPurpose,
         project: projectChapter,
       });
     const initial = compile([]);

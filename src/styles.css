@@ -967,6 +967,39 @@ dialog::backdrop {
   margin: 0 0 17px;
   font-size: 19px;
 }
+.provider-choice {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 12px;
+  text-align: left;
+  width: min(100%, 360px);
+  padding: 12px;
+}
+.provider-choice small {
+  display: block;
+  color: var(--muted);
+  margin-top: 3px;
+}
+.provider-heading {
+  margin: 18px 0 8px;
+}
+.provider-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 10px;
+}
+.profile-capabilities {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin: 0 0 16px;
+  color: var(--muted);
+}
+.profile-capabilities small {
+  flex-basis: 100%;
+}
 .settings-body label small {
   display: block;
   margin-top: 6px;

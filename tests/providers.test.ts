@@ -8,6 +8,7 @@ import type { RunContext } from '../electron/agent/runs.js';
 import type { ToolReceipt } from '../electron/agent/tool-receipts.js';
 import { createProvider, checkProvider } from '../electron/agent/provider.js';
 import type { ModelRequest } from '../electron/agent/model.js';
+import { planModelBudget } from '../electron/agent/context-budget.js';
 import { buildWritingRequest } from '../electron/agent/writing-request.js';
 import type { ModelProfile, Protocol } from '../shared/contracts.js';
 const key = 'synthetic-only-secret-fixture';
@@ -108,11 +109,11 @@ test('Chat Completions joins fragmented calls and returns tool ID plus DeepSeek 
     const events = trace.rows.filter((e) => e.fields.spanId === start.fields.spanId);
     assert.deepEqual(
       events.map((e) => e.event),
-      ['model.started', 'model.http', 'model.first_event', 'model.finished'],
+      ['model.started', 'model.budget_dispatched', 'model.http', 'model.first_event', 'model.finished'],
     );
     assert.equal(events.at(-1)!.fields.outcome, 'ok');
-    assert.equal(events[1].fields.httpStatus, 200);
-    assert.equal(typeof events[2].fields.elapsedMs, 'number');
+    assert.equal(events[2].fields.httpStatus, 200);
+    assert.equal(typeof events[3].fields.elapsedMs, 'number');
   }
   assert.doesNotMatch(JSON.stringify(trace.rows), /fixture reasoning|call_1|a\.md/);
 });
@@ -240,11 +241,11 @@ test('auth diagnostics never include provider response body and ordinary chat ca
   assert.deepEqual(trace.rejected, []);
   assert.deepEqual(
     trace.rows.map((e) => e.event),
-    ['model.started', 'model.http', 'model.finished', 'probe.finished'],
+    ['model.started', 'model.budget_dispatched', 'model.http', 'model.finished', 'probe.finished'],
   );
-  assert.equal(trace.rows[2].fields.httpStatus, 401);
-  assert.equal(trace.rows[2].fields.reason, 'auth');
-  assert.equal(trace.rows[2].fields.lane, 'probe');
+  assert.equal(trace.rows[3].fields.httpStatus, 401);
+  assert.equal(trace.rows[3].fields.reason, 'auth');
+  assert.equal(trace.rows[3].fields.lane, 'probe');
   assert.ok(!JSON.stringify(trace.rows).includes(key));
   const chatOnly = await fixture(t, 'chat', (_body, res) =>
     sse(res, chat({ content: 'OK' }), chat({}, 'stop')),
@@ -781,25 +782,168 @@ test('the Messages invalid-block diagnostics are bounded and report omissions', 
   assert.deepEqual(trace.rejected, []);
 });
 
-test('a larger tool output budget is only advertised for supported official DeepSeek profiles', () => {
+test('DeepSeek uses a shared window with distinct standard, long-writing and small request targets', () => {
   const profile: ModelProfile = {
     id: 'fixture',
     name: 'fixture',
     model: 'deepseek-flash',
     protocol: 'messages',
+    providerId: 'deepseek',
     baseUrl: 'https://api.deepseek.com/anthropic',
   };
-  assert.equal(createProvider(profile, key).extendedOutputTokens, 16_384);
-  assert.equal(
-    createProvider({ ...profile, baseUrl: 'https://example.invalid/anthropic' }, key)
-      .extendedOutputTokens,
-    undefined,
+  const provider = createProvider(profile, key);
+  const summary = (purpose?: ModelRequest['budgetPurpose']) => {
+    const { inputTokens, maxTokens } = planModelBudget(provider, purpose);
+    return [inputTokens, maxTokens];
+  };
+  assert.deepEqual(summary(), [1_039_184, 8_192]);
+  assert.deepEqual(summary('long-writing'), [981_840, 65_536]);
+  assert.deepEqual(summary('compaction'), [1_045_328, 2_048]);
+  assert.deepEqual(summary('readback'), [1_045_328, 2_048]);
+  assert.deepEqual(summary('probe'), [1_046_352, 1_024]);
+  assert.equal(planModelBudget({ ...provider, outputTokenLimit: 1600 }, 'long-writing').maxTokens, 1600);
+  assert.equal(planModelBudget({ ...provider, inputTokenBudget: 8000 }).inputTokens, 8000);
+  for (const patch of [{ baseUrl: 'https://example.invalid/anthropic' }, { model: 'other-model' }])
+    assert.equal(
+      planModelBudget(createProvider({ ...profile, ...patch }, key), 'long-writing').maxTokens,
+      8_192,
+    );
+});
+
+for (const protocol of ['chat', 'responses', 'messages'] as const) {
+  test(`${protocol}: dispatch records the actual budget, while a blocked request never dispatches`, async (t) => {
+    const trace = collectDiagnostics();
+    const wires: Record<string, unknown>[] = [];
+    const baseUrl = 'https://api.deepseek.com' + (protocol === 'messages' ? '/anthropic' : '');
+    const profile: ModelProfile = {
+      id: 'synthetic',
+      name: 'fixture',
+      model: 'deepseek-flash',
+      baseUrl,
+      protocol,
+      providerId: 'deepseek',
+      capabilities: {
+        source: 'provider',
+        contextWindow: 20_000,
+        maxOutputTokens: 2_400,
+        maxInputTokens: 10_000,
+      },
+    };
+    t.mock.method(globalThis, 'fetch', async (_: unknown, init: RequestInit) => {
+      wires.push(JSON.parse(String(init.body)));
+      const events =
+        protocol === 'chat'
+          ? [chat({ content: 'OK' }, 'stop')]
+          : protocol === 'responses'
+            ? [{ type: 'response.completed', response: { output: [] } }]
+            : [{ type: 'message_delta', delta: { stop_reason: 'end_turn' } }, { type: 'message_stop' }];
+      return eventResponse(events);
+    });
+    const marker = 'MUST_NOT_LOG_PROMPT_NEAR_BUDGET';
+    const request: ModelRequest = {
+      ...ctx(),
+      system: marker,
+      diagnostic: trace.report,
+      budgetPurpose: 'long-writing',
+    };
+    const provider = createProvider(profile, key);
+    await provider.turn(request);
+    assert.equal(planModelBudget(provider, 'long-writing').inputTokens, 10_000);
+    await assert.rejects(
+      provider.turn({ ...request, system: marker.repeat(1_000) }),
+      /超过模型输入预算/,
+    );
+    assert.equal(wires.length, 1);
+    assert.equal(wires[0][protocol === 'responses' ? 'max_output_tokens' : 'max_tokens'], 2_400);
+    const actual = trace.rows.filter((row) => row.event === 'model.budget_dispatched');
+    assert.equal(actual.length, 1);
+    assert.deepEqual(trace.rejected, []);
+    assert.equal(actual[0].fields.contextWindow, 20_000);
+    assert.equal(actual[0].fields.maxOutputTokens, 2_400);
+    assert.equal(actual[0].fields.maxTokens, 2_400);
+    assert.equal(actual[0].fields.capabilitySource, 'provider');
+    assert.equal(actual[0].fields.purpose, 'long-writing');
+    assert.equal(trace.rows.at(-1)?.fields.reason, 'context_limit');
+    const rows = JSON.stringify(trace.rows);
+    assert.ok(![key, baseUrl, marker].some((secret) => rows.includes(secret)));
+  });
+}
+
+function eventResponse(events: unknown[]) {
+  return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''), {
+    headers: { 'content-type': 'text/event-stream' },
+  });
+}
+
+test('long-writing budget begins after delivery, not on the request first carrying the Skill', async (t) => {
+  const trace = collectDiagnostics();
+  const bodies: { messages: unknown[]; max_tokens: number }[] = [];
+  t.mock.method(globalThis, 'fetch', async (_: unknown, init: RequestInit) => {
+    bodies.push(JSON.parse(String(init.body)));
+    const name = ['skill_load', 'fixture_step'][bodies.length - 1];
+    return eventResponse(
+      name
+        ? [
+            {
+              type: 'content_block_start',
+              index: 0,
+              content_block: { type: 'tool_use', id: `call_${name}`, name, input: {} },
+            },
+            { type: 'content_block_stop', index: 0 },
+            { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+            { type: 'message_stop' },
+          ]
+        : [
+            { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'OK' } },
+            { type: 'content_block_stop', index: 0 },
+            { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+            { type: 'message_stop' },
+          ],
+    );
+  });
+  const provider = createProvider(
+    {
+      id: 'fixture',
+      name: 'fixture',
+      providerId: 'deepseek',
+      model: 'deepseek-flash',
+      baseUrl: 'https://api.deepseek.com/anthropic',
+      protocol: 'messages',
+    },
+    key,
   );
-  assert.equal(
-    createProvider({ ...profile, model: 'other-model' }, key).extendedOutputTokens,
-    undefined,
+  let applied = false;
+  await runAgent(
+    harnessFixture(trace),
+    provider,
+    '',
+    [],
+    'fixture',
+    [
+      {
+        name: 'skill_load',
+        description: 'fixture',
+        schema: object({}, []),
+        execute: async () => ({ name: 'generate-novel', instructions: 'WHOLE_SKILL_FIXTURE' }),
+        onResultSent() {
+          applied = true;
+        },
+      },
+      {
+        name: 'fixture_step',
+        description: 'fixture',
+        schema: object({}, []),
+        execute: async () => 'OK',
+      },
+    ],
+    { roundLimit: () => 200, budgetPurpose: () => (applied ? 'long-writing' : undefined) },
   );
-  assert.equal(createProvider({ ...profile, protocol: 'chat' }, key).extendedOutputTokens, undefined);
+  assert.deepEqual(
+    bodies.map((row) => row.max_tokens),
+    [8_192, 8_192, 65_536],
+  );
+  assert.doesNotMatch(JSON.stringify(bodies[0]), /WHOLE_SKILL_FIXTURE/);
+  assert.match(JSON.stringify(bodies[1]), /WHOLE_SKILL_FIXTURE/);
 });
 
 test('official DeepSeek uses direct output only for eligible prose and bounded result requests', async (t) => {

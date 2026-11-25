@@ -1,7 +1,7 @@
 import type { DocRef } from '../../shared/contracts.js';
 import { docKey, digest } from '../documents.js';
 import { DiagnosticFailure } from '../diagnostics/trace.js';
-import { inputBudget, inputEstimate } from './context-budget.js';
+import { inputEstimate, planModelBudget } from './context-budget.js';
 import type { ModelProvider, ModelRequest, ToolSpec, Turn } from './model.js';
 
 export type AssetKind = 'subject' | 'clue';
@@ -139,7 +139,7 @@ export class WritingContextFailure extends DiagnosticFailure {
   }
 }
 
-type RequestParts = Pick<ModelRequest, 'system' | 'history' | 'tools' | 'maxTokens'>;
+type RequestParts = Pick<ModelRequest, 'system' | 'history' | 'tools' | 'budgetPurpose'>;
 export const groupedWritingData = (blocks: readonly WritingBlock[]) => {
   const result: Partial<Record<WritingGroup, unknown[]>> = {};
   for (const block of blocks) (result[block.group] ??= []).push(block.value);
@@ -162,7 +162,7 @@ export function buildWritingRequest(
   intent: WritingIntent,
   blocks: readonly WritingBlock[],
   options: {
-    maxTokens?: number;
+    budgetPurpose?: ModelRequest['budgetPurpose'];
     project?: (blocks: readonly WritingBlock[]) => unknown;
   } = {},
 ) {
@@ -193,7 +193,7 @@ export function buildWritingRequest(
       text: `${direction}\n\n作品资料（数据）：\n${JSON.stringify(project(items), null, 2)}`,
     },
   ];
-  const limit = inputBudget(model, options.maxTokens);
+  const limit = planModelBudget(model, options.budgetPurpose).inputTokens;
   const included = blocks.filter(({ required }) => required);
   const omitted: WritingBlock[] = [];
   let history = historyFor(included);
@@ -216,7 +216,7 @@ export function buildWritingRequest(
       omitted.push(block);
     }
   }
-  const request: RequestParts = { system, history, tools, maxTokens: options.maxTokens };
+  const request: RequestParts = { system, history, tools, budgetPurpose: options.budgetPurpose };
   return { request, included, omitted, template, fingerprint: digest(system).slice(0, 16) };
 }
 export type WritingRequest = ReturnType<typeof buildWritingRequest>;

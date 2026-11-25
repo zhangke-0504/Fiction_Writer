@@ -69,12 +69,24 @@ export interface WriteReport {
 }
 export type Protocol = 'chat' | 'responses' | 'messages';
 export type Effort = 'low' | 'medium' | 'high';
+export type ProviderId = 'custom' | 'deepseek';
+export type CapabilitySource = 'provider' | 'provider-fallback' | 'generic-fallback';
+export type CapabilityIssue = 'not_supported' | 'unavailable' | 'auth' | 'timeout' | 'invalid' | 'model_missing';
+export interface ModelCapabilities {
+  contextWindow: number;
+  maxOutputTokens: number;
+  maxInputTokens?: number;
+  source: CapabilitySource;
+  issue?: CapabilityIssue;
+}
 export interface ModelProfile {
   id: string;
   name: string;
   baseUrl: string;
   model: string;
   protocol: Protocol;
+  providerId?: ProviderId;
+  capabilities?: ModelCapabilities;
 }
 export interface Target {
   cwd: string;
