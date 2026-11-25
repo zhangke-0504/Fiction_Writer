@@ -48,7 +48,15 @@ import {
   type ChapterAction,
   type WritingIntent,
 } from './writing-request.js';
-import { defaultRoundLimit, object, str, ToolFailure, type LocalTool } from './loop.js';
+import {
+  defaultRoundLimit,
+  object,
+  str,
+  ToolFailure,
+  type LocalTool,
+  type NarrowedWritingStep,
+} from './loop.js';
+import { hasStoryDescription } from './story-notes.js';
 import type { ModelProvider } from './model.js';
 import type { SkillCatalog, SkillName } from './skills.js';
 import type { RunContext } from './runs.js';
@@ -68,6 +76,11 @@ import {
   type NovelCheck,
   type NovelTaskState,
 } from './novel-goal.js';
+
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+  value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 
 const activeTypes = ['outline', 'subject', 'clue', 'chapter'] as const;
 type GoalRequest = {
@@ -225,6 +238,7 @@ export class NovelTools {
   }
   private readonly referenceFailures = new Map<string, number>();
   private readonly chapterFailures = new Map<string, ToolFailure>();
+  private readonly targetedReads = new Set<string>();
   private readonly readSet = new Map<string, Guard>();
   private readonly offsets = new Map<string, { revision: string; next: number }>();
   private readonly createdHere = new Set<string>();
@@ -430,13 +444,255 @@ export class NovelTools {
       pendingSync: this.syncStatus((await this.workspace.readAll(this.bookId)).documents),
     };
   }
+  canDeliverWholeSkill = () => this.editMode === 'direct' && !this.stagedEntry;
   skillApplied(name: SkillName) {
-    if (this.editMode !== 'direct' || this.stagedEntry) return;
-    if (name === 'generate-novel') this.wholeSkill = true;
+    if (this.canDeliverWholeSkill() && name === 'generate-novel') this.wholeSkill = true;
   }
   // For manual acceptance, the per-run cap is uniform regardless of goal size.
   roundLimit = () => defaultRoundLimit;
-  budgetPurpose = () => (this.wholeSkill ? 'long-writing' as const : undefined);
+  budgetPurpose = () => (this.wholeSkill ? ('long-writing' as const) : undefined);
+  /** Recovery offers only work justified by the live goal or confirmed plan, never by partial model output. */
+  narrowedWritingStep = async (ctx: RunContext): Promise<NarrowedWritingStep | undefined> => {
+    const edit = this.editMode === 'confirmed' && this.edit?.hasTargets ? this.edit : undefined;
+    if (
+      ctx.session.bookId !== this.bookId ||
+      (!edit && !(this.wholeSkill && this.canDeliverWholeSkill()))
+    )
+      return;
+    const view = await this.workspace.readAll(this.bookId);
+    ctx.signal.throwIfAborted();
+    if (view.diagnostics.length) return;
+    const docs = view.documents;
+    const byKey = new Map(docs.map((doc) => [docKey(doc), doc]));
+    const options: {
+      name: string;
+      hint: string;
+      accepts: (args: Record<string, unknown>) => boolean;
+    }[] = [];
+    const add = (name: string, hint: string, accepts: (args: Record<string, unknown>) => boolean) =>
+      options.push({ name, hint, accepts });
+    const readKeys = new Set<string>();
+    const readDoc = (key: string) => {
+      const doc = byKey.get(key);
+      if (!doc || readKeys.has(key)) return;
+      readKeys.add(key);
+      const cursor = this.offsets.get(key);
+      const offset = cursor?.revision === doc.revision ? cursor.next : 0;
+      if (
+        this.targetedReads.has(this.documentReadKey(doc, offset)) ||
+        (doc.type !== 'chapter' && this.readSet.get(key)?.revision === doc.revision)
+      )
+        return;
+      add(
+        'book_get_context',
+        `核对 ${key}（offset=${offset}）`,
+        (a) =>
+          a.type === doc.type &&
+          a.documentId === doc.id &&
+          (a.offset ?? 0) === offset &&
+          !a.index &&
+          !a.novelGoal,
+      );
+    };
+    const readIndex = (index: ReferenceIndex) => {
+      if (this.targetedReads.has(this.indexReadKey(docs, index, 0))) return;
+      add(
+        'book_get_context',
+        `核对 ${index} 索引首页`,
+        (a) => a.index === index && (a.offset ?? 0) === 0 && !a.type && !a.documentId && !a.novelGoal,
+      );
+    };
+    const offerAsset = (kind: string, id: string | undefined, action: string) => {
+      add('book_generate_assets', `${action} ${kind}/${id ?? '一个必要的新资料'}`, (a) => {
+        const target = Array.isArray(a.targets) && a.targets.length === 1 && asRecord(a.targets[0]);
+        return (
+          !!target &&
+          a.kind === kind &&
+          a.action === action &&
+          (id ? target.id === id : isId(target.id) && !byKey.has(`${kind}/${target.id}`))
+        );
+      });
+    };
+    const plan = (status: string, complete = false): NarrowedWritingStep => ({
+      status,
+      complete,
+      canAdvance: options.length > 0,
+      instructions: options
+        .slice(0, 8)
+        .map(({ name, hint }) => `${name}：${hint}`)
+        .join('；'),
+      accepts: (name: string, args: Record<string, unknown>) =>
+        options.slice(0, 8).some((entry) => entry.name === name && entry.accepts(args)),
+    });
+
+    if (edit) {
+      const remaining = new Set(edit.remaining(docs));
+      try {
+        edit.verifyPlacement(docs);
+        edit.verifySharedDocuments(
+          docs,
+          edit.plan.passages.flatMap((p) => [`chapter/${p.chapterId}`, 'outline/outline']),
+        );
+        for (const a of edit.plan.assets) edit.verifyRecorded(docs, assetTarget(a));
+        for (const p of edit.plan.passages) edit.verifyRecorded(docs, passageTarget(p));
+      } catch (error) {
+        if (error instanceof ToolFailure) return;
+        throw error;
+      }
+      const sync = this.syncStatus(docs);
+      const { done, total } = this.editProgress(docs);
+      const status = `确认方案已核对 ${done}/${total} 项；待做：${[...remaining, ...sync.map(({ key }) => `同步 ${key}`)].slice(0, 6).join('、') || '无'}`;
+      if (!remaining.size && !sync.length) return plan(status, true);
+      for (const a of edit.plan.assets) {
+        const key = assetTarget(a);
+        if (!remaining.has(key)) continue;
+        if (a.action === 'create' && byKey.has(key)) return { ...plan(status), canAdvance: false };
+        try {
+          if (
+            edit.assets({ kind: a.kind, action: a.action, targets: [{ id: a.id }] }, docs).pending.length
+          )
+            offerAsset(a.kind, a.id, a.action);
+        } catch (error) {
+          if (error instanceof ToolFailure) return;
+          throw error;
+        }
+        if (a.action !== 'create') readDoc(key);
+      }
+      for (const p of edit.plan.passages) {
+        if (!remaining.has(passageTarget(p))) continue;
+        const chapter = byKey.get(`chapter/${p.chapterId}`),
+          outline = byKey.get('outline/outline');
+        if (!chapter || !outline) continue;
+        try {
+          edit.linked(p, docs);
+        } catch (error) {
+          if (error instanceof ToolFailure) continue;
+          throw error;
+        }
+        add(
+          'book_generate_chapter',
+          `仅增补 ${p.chapterId} 的位置 ${p.id}，使用最新原文锚点和大纲版本`,
+          (a) => {
+            const insertion = asRecord(a.insertion);
+            return (
+              a.mode === 'insert' &&
+              a.chapterId === p.chapterId &&
+              insertion?.targetId === p.id &&
+              insertion.revision === chapter.revision &&
+              asRecord(insertion.outline)?.revision === outline.revision
+            );
+          },
+        );
+        readDoc(`chapter/${p.chapterId}`);
+        readDoc('outline/outline');
+      }
+      for (const { key, ready } of sync) {
+        if (!ready) continue;
+        const [kind, id] = key.split('/');
+        offerAsset(kind, id, 'update');
+      }
+      return plan(status);
+    }
+
+    if (!this.task) {
+      const action = ctx.continuation ? 'resume' : 'register';
+      add('book_get_context', `novelGoal.${action}，沿用完整整书目标，不分批登记`, (a) => {
+        const goal = asRecord(a.novelGoal);
+        return (
+          goal?.action === action &&
+          !goal.updateDirection &&
+          !a.type &&
+          !a.documentId &&
+          !a.index &&
+          a.offset === undefined
+        );
+      });
+      readIndex('chapters');
+      for (const doc of docs.filter((d) => d.type === 'book' || d.type === 'outline'))
+        readDoc(docKey(doc));
+      return plan('整书指引已派发，目标尚未在本轮核对，无法判定具体卡在哪一章');
+    }
+    const check = this.check(view);
+    const status = `已保存正文 ${check.done}/${check.total} 章${goalProblem(check) ? `；${goalProblem(check)}` : ''}`;
+    if (check.catalogConflict) return plan(status);
+    if (check.complete) return plan(status, true);
+    const outline = docs.find((d) => d.type === 'outline');
+    const needsOutline = !outline?.body.trim();
+    // Only append the next missing directory entry; order and existing references stay with the original validator.
+    if (check.missingChapters.length) {
+      const id = check.missingChapters[0];
+      const chapters = docs.filter((d) => d.type === 'chapter');
+      const present = chapters.map((d) => d.id);
+      const nextOrder = Math.max(0, ...chapters.map((d) => d.fields.order ?? 0)) + 1;
+      if (sameChapterIds(present, this.task.chapterIds.slice(0, present.length)))
+        add('book_apply_changes', `仅建立目录项 ${id}，不在参数内写正文`, (a) => {
+          const op =
+            Array.isArray(a.operations) && a.operations.length === 1 && asRecord(a.operations[0]);
+          return (
+            !!op &&
+            op.type === 'chapter' &&
+            op.action === 'create' &&
+            op.id === id &&
+            !op.body &&
+            (asRecord(op.fields)?.order === undefined || asRecord(op.fields)?.order === nextOrder)
+          );
+        });
+    }
+    const outlineBasis = needsOutline
+      ? docs.filter(
+          (doc) =>
+            ['outline', 'subject', 'clue'].includes(doc.type) &&
+            this.readSet.get(docKey(doc))?.revision !== doc.revision,
+        )
+      : [];
+    if (needsOutline && !outlineBasis.length) {
+      add('book_apply_changes', '只提交一份完整且简短的大纲，不覆写已有正文或大纲', (a) => {
+        const op = Array.isArray(a.operations) && a.operations.length === 1 && asRecord(a.operations[0]);
+        return (
+          !!op &&
+          op.type === 'outline' &&
+          op.id === (outline?.id ?? 'outline') &&
+          op.action === (outline ? 'update' : 'create') &&
+          typeof op.body === 'string' &&
+          !!op.body.trim()
+        );
+      });
+    }
+    for (const ref of check.missingAssetRefs) {
+      const doc = byKey.get(docKey(ref));
+      if (this.referenceFailures.has(docKey(ref))) continue;
+      if (!doc) offerAsset(ref.type, ref.id, 'create');
+      else if (!hasStoryDescription(doc.body)) offerAsset(ref.type, ref.id, 'fill');
+      if (doc) readDoc(docKey(ref));
+    }
+    if (
+      !docs.some((d) => d.type === 'subject' && hasStoryDescription(d.body)) &&
+      !check.missingAssetRefs.some((d) => d.type === 'subject')
+    )
+      offerAsset('subject', undefined, 'create');
+    if (
+      check.catalogReady &&
+      check.missingAssets.includes('有说明且关联埋设与回收章节的伏笔') &&
+      !check.missingAssetRefs.some((d) => d.type === 'clue')
+    )
+      offerAsset('clue', undefined, 'create');
+    if (check.ready && check.firstUnwritten && !this.chapterFailures.has(check.firstUnwritten)) {
+      add(
+        'book_generate_chapter',
+        `仅写下一空白章 ${check.firstUnwritten}`,
+        (a) => a.mode === 'draft' && a.chapterId === check.firstUnwritten && !a.insertion,
+      );
+      readDoc(`chapter/${check.firstUnwritten}`);
+    }
+    for (const d of outlineBasis) readDoc(docKey(d));
+    return plan(status);
+  };
+  private documentReadKey(doc: Manuscript, offset: number) {
+    return `${docKey(doc)}:${doc.revision}:${offset}`;
+  }
+  private indexReadKey(docs: Manuscript[], index: ReferenceIndex, offset: number) {
+    return `index:${index}:${offset}:${digest(JSON.stringify(referenceIndex(docs, index, offset)))}`;
+  }
   restorePrimaryFailure() {
     const last = [...this.chapterFailures.values()].at(-1);
     if (this.wholeSkill && last) throw last;
@@ -732,12 +988,14 @@ export class NovelTools {
       throw new ToolFailure('invalid_options', '本轮不是整书请求，不登记或续接整书目标。');
     if (args.novelGoal) return this.goalView(args.novelGoal, view, ctx);
     const offset = args.offset ?? 0;
-    if (args.index)
+    if (args.index) {
+      this.targetedReads.add(this.indexReadKey(view.documents, args.index, offset));
       return {
         ...referenceIndex(view.documents, args.index, offset),
         ...(this.connectedEntry &&
           args.index === 'chapters' && { entryChoices: this.entryChoices(view.documents) }),
       };
+    }
     const documents = view.documents
       .filter((d) => !args.type || d.type === args.type)
       .sort((a, b) => priority[a.type] - priority[b.type]);
@@ -749,6 +1007,7 @@ export class NovelTools {
         end = Math.min(doc.body.length, offset + 44_000),
         continued = this.offsets.get(key);
       if (offset === 0 || (continued?.revision === doc.revision && continued.next === offset)) {
+        this.targetedReads.add(this.documentReadKey(doc, offset));
         if (end === doc.body.length) {
           this.remember(doc);
           this.offsets.delete(key);

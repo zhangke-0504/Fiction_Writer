@@ -24,6 +24,7 @@ export interface ModelRequest {
   history: Turn[];
   tools: ToolSpec[];
   budgetPurpose?: BudgetPurpose;
+  budgetBasis?: 'first-whole-skill' | 'active-whole-skill';
   /** A prose-only subrequest may use the endpoint's documented direct generation option. */
   directProse?: boolean;
   /** A bounded task projecting saved text into a single result tool. */

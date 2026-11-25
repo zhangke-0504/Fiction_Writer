@@ -396,6 +396,7 @@ const diag = new Map<string, Definition>(
     }),
     'model.budget_dispatched': worker({
       purpose: one('standard', 'long-writing', 'probe', 'compaction', 'readback'),
+      budgetBasis: one('first-whole-skill', 'active-whole-skill'),
       capabilitySource: one('provider', 'provider-fallback', 'generic-fallback'),
       contextWindow: sequence,
       maxOutputTokens: sequence,
@@ -421,6 +422,23 @@ const diag = new Map<string, Definition>(
       'warn',
     ),
     'model.arguments_retry': worker({ reason }, 'warn'),
+    'model.output_limit_recovery': worker({
+      recovery: one(
+        'dispatched',
+        'advanced',
+        'completed',
+        'ineligible',
+        'no_safe_step',
+        'input_blocked',
+        'repeat_limit',
+        'attempt_used',
+        'failed',
+        'cancelled',
+        'invalid_step',
+        'no_progress',
+      ),
+      reason,
+    }),
     'writing.edit.scope': worker({
       editMode: one('direct', 'proposal', 'confirmed', 'unresolved'),
       outcome,

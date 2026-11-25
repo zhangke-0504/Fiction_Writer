@@ -1,3 +1,4 @@
+import { SkillCatalog } from '../electron/agent/skills.js';
 import { collectDiagnostics } from './diagnostic-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -8,7 +9,7 @@ import type { RunContext } from '../electron/agent/runs.js';
 import type { ToolReceipt } from '../electron/agent/tool-receipts.js';
 import { createProvider, checkProvider } from '../electron/agent/provider.js';
 import type { ModelRequest } from '../electron/agent/model.js';
-import { planModelBudget } from '../electron/agent/context-budget.js';
+import { inputEstimate, planModelBudget } from '../electron/agent/context-budget.js';
 import { buildWritingRequest } from '../electron/agent/writing-request.js';
 import type { ModelProfile, Protocol } from '../shared/contracts.js';
 const key = 'synthetic-only-secret-fixture';
@@ -875,76 +876,310 @@ function eventResponse(events: unknown[]) {
   });
 }
 
-test('long-writing budget begins after delivery, not on the request first carrying the Skill', async (t) => {
-  const trace = collectDiagnostics();
-  const bodies: { messages: unknown[]; max_tokens: number }[] = [];
-  t.mock.method(globalThis, 'fetch', async (_: unknown, init: RequestInit) => {
-    bodies.push(JSON.parse(String(init.body)));
-    const name = ['skill_load', 'fixture_step'][bodies.length - 1];
-    return eventResponse(
-      name
-        ? [
-            {
-              type: 'content_block_start',
-              index: 0,
-              content_block: { type: 'tool_use', id: `call_${name}`, name, input: {} },
-            },
-            { type: 'content_block_stop', index: 0 },
-            { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
-            { type: 'message_stop' },
-          ]
-        : [
-            { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'OK' } },
-            { type: 'content_block_stop', index: 0 },
-            { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
-            { type: 'message_stop' },
-          ],
+for (const variant of [
+  'first-delivery',
+  'clamped',
+  'ineligible',
+  'candidates',
+  'failed-load',
+  'blocked',
+  'cancelled',
+] as const) {
+  test(`whole-book budget follows actual Skill dispatch (${variant})`, async (t) => {
+    const trace = collectDiagnostics();
+    const bodies: { messages: unknown[]; max_tokens: number }[] = [];
+    const catalog = new SkillCatalog('skills');
+    const guide = await catalog.load('generate-novel');
+    const cancel = new AbortController();
+    t.mock.method(globalThis, 'fetch', async (_: unknown, init: RequestInit) => {
+      bodies.push(JSON.parse(String(init.body)));
+      const name =
+        bodies.length === 1
+          ? variant === 'candidates'
+            ? 'skill_search'
+            : 'skill_load'
+          : bodies.length === 2
+            ? 'fixture_step'
+            : undefined;
+      const input =
+        variant === 'candidates'
+          ? { query: '整书' }
+          : variant === 'failed-load'
+            ? { name: 'not-a-skill' }
+            : { name: 'generate-novel' };
+      return eventResponse(
+        name
+          ? [
+              {
+                type: 'content_block_start',
+                index: 0,
+                content_block: {
+                  type: 'tool_use',
+                  id: `call_${name}`,
+                  name,
+                  input: name === 'fixture_step' ? {} : input,
+                },
+              },
+              { type: 'content_block_stop', index: 0 },
+              { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+              { type: 'message_stop' },
+            ]
+          : [
+              { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'OK' } },
+              { type: 'content_block_stop', index: 0 },
+              { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+              { type: 'message_stop' },
+            ],
+      );
+    });
+    const provider = createProvider(
+      {
+        id: 'fixture',
+        name: 'fixture',
+        providerId: 'deepseek',
+        model: 'deepseek-flash',
+        baseUrl: 'https://api.deepseek.com/anthropic',
+        protocol: 'messages',
+      },
+      key,
     );
-  });
-  const provider = createProvider(
-    {
-      id: 'fixture',
-      name: 'fixture',
-      providerId: 'deepseek',
-      model: 'deepseek-flash',
-      baseUrl: 'https://api.deepseek.com/anthropic',
-      protocol: 'messages',
-    },
-    key,
-  );
-  let applied = false;
-  await runAgent(
-    harnessFixture(trace),
-    provider,
-    '',
-    [],
-    'fixture',
-    [
-      {
-        name: 'skill_load',
-        description: 'fixture',
-        schema: object({}, []),
-        execute: async () => ({ name: 'generate-novel', instructions: 'WHOLE_SKILL_FIXTURE' }),
-        onResultSent() {
-          applied = true;
+    if (variant === 'clamped') provider.outputTokenLimit = 12_000;
+    if (variant === 'blocked') {
+      provider.inputTokenBudget = 9_000;
+      t.mock.method(catalog, 'load', async () => 'REQUIRED_WHOLE_SKILL '.repeat(900));
+    }
+    let applied = false;
+    const eligible = variant !== 'ineligible';
+    const result = runAgent(
+      harnessFixture(trace, {
+        signal: cancel.signal,
+        diagnostic(event, fields) {
+          trace.report(event, fields);
+          if (variant === 'cancelled' && event === 'tool.result_ready') cancel.abort();
         },
-      },
+      }),
+      provider,
+      '',
+      [],
+      'fixture',
+      [
+        ...catalog.tools((name) => {
+          if (eligible && name === 'generate-novel') applied = true;
+        }),
+        {
+          name: 'fixture_step',
+          description: 'fixture',
+          schema: object({}, []),
+          execute: async () => 'OK',
+        },
+      ],
       {
-        name: 'fixture_step',
-        description: 'fixture',
-        schema: object({}, []),
-        execute: async () => 'OK',
+        roundLimit: () => 200,
+        canDeliverWholeSkill: () => eligible,
+        budgetPurpose: () => (applied ? 'long-writing' : undefined),
       },
-    ],
-    { roundLimit: () => 200, budgetPurpose: () => (applied ? 'long-writing' : undefined) },
-  );
-  assert.deepEqual(
-    bodies.map((row) => row.max_tokens),
-    [8_192, 8_192, 65_536],
-  );
-  assert.doesNotMatch(JSON.stringify(bodies[0]), /WHOLE_SKILL_FIXTURE/);
-  assert.match(JSON.stringify(bodies[1]), /WHOLE_SKILL_FIXTURE/);
-});
+    );
+    if (variant === 'blocked' || variant === 'cancelled') {
+      await assert.rejects(result);
+      assert.deepEqual(
+        bodies.map((row) => row.max_tokens),
+        [8_192],
+      );
+      assert.ok(!applied);
+      assert.ok(!trace.rows.some((row) => row.event === 'skill.applied'));
+      if (variant === 'blocked')
+        assert.ok(trace.rows.some((row) => row.fields.reason === 'context_limit'));
+      return;
+    }
+    await result;
+    const wantsLong = variant === 'first-delivery' || variant === 'clamped';
+    const long = variant === 'clamped' ? 12_000 : 65_536;
+    assert.deepEqual(
+      bodies.map((row) => row.max_tokens),
+      wantsLong ? [8_192, long, long] : [8_192, 8_192, 8_192],
+    );
+    assert.equal(applied, wantsLong);
+    if (wantsLong) {
+      const match = trace.rows.filter((row) => row.event === 'skill.applied');
+      assert.equal(match.length, 1);
+      const budget = trace.rows.filter((row) => row.event === 'model.budget_dispatched')[1];
+      assert.equal(budget.fields.spanId, match[0].fields.spanId);
+      assert.equal(budget.fields.maxTokens, long);
+      assert.equal(budget.fields.budgetBasis, 'first-whole-skill');
+      const results = (
+        bodies[1].messages as { content: { type: string; content: string; tool_use_id: string }[] }[]
+      )
+        .flatMap((row) => row.content)
+        .filter((block) => block.type === 'tool_result');
+      assert.equal(results[0].tool_use_id, 'call_skill_load');
+      assert.deepEqual(JSON.parse(results[0].content).value, {
+        name: 'generate-novel',
+        instructions: guide,
+      });
+    }
+  });
+}
+
+const messagesEnd = (reason: string) => [
+  { type: 'message_delta', delta: { stop_reason: reason } },
+  { type: 'message_stop' },
+];
+const messagesTool = (index: number, name: string, input: unknown) => [
+  {
+    type: 'content_block_start',
+    index,
+    content_block: { type: 'tool_use', id: 'call-' + index, name, input },
+  },
+  { type: 'content_block_stop', index },
+];
+const recoveryText = (text: string) => [
+  { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+  { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } },
+  { type: 'content_block_stop', index: 0 },
+];
+
+for (const variant of [
+  'success',
+  'second-limit',
+  'later-limit',
+  'no-safe-step',
+  'input-blocked',
+  'cancelled',
+  'late-cancel',
+  'json-then-limit',
+  'limit-then-json',
+  'large-argument',
+  'multi-action',
+  'outside-plan',
+  'no-progress',
+] as const) {
+  test('a Messages output limit has bounded and safe recovery (' + variant + ')', async (t) => {
+    const trace = collectDiagnostics();
+    const bodies: { system: string; messages: unknown[]; max_tokens: number }[] = [];
+    const cancel = new AbortController();
+    const provider = createProvider(
+      {
+        id: 'fixture',
+        name: 'fixture',
+        protocol: 'messages',
+        model: 'fixture',
+        baseUrl: 'http://127.0.0.1:1',
+      },
+      key,
+    );
+    const sensitive = 'SENSITIVE_PARTIAL_RESPONSE';
+    const name = variant === 'no-progress' ? 'book_apply_changes' : 'book_get_context';
+    const limit = () =>
+      eventResponse([
+        ...recoveryText(sensitive),
+        ...messagesTool(1, name, { target: sensitive }),
+        ...messagesEnd('max_tokens'),
+      ]);
+    const bad = () =>
+      eventResponse([
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'tool_use', id: 'bad-call', name, input: {} },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'input_json_delta', partial_json: '{"target":' },
+        },
+        { type: 'content_block_stop', index: 0 },
+        ...messagesEnd('tool_use'),
+      ]);
+    t.mock.method(globalThis, 'fetch', async (_: unknown, init: RequestInit) => {
+      bodies.push(JSON.parse(String(init.body)));
+      if (bodies.length === 1) return variant === 'json-then-limit' ? bad() : limit();
+      if (bodies.length === 2) {
+        if (variant === 'limit-then-json') return bad();
+        if (variant === 'second-limit' || variant === 'json-then-limit') return limit();
+        const target =
+          variant === 'large-argument' ? 'ok'.repeat(1300) : variant === 'outside-plan' ? 'wrong' : 'ok';
+        return eventResponse([
+          ...messagesTool(0, name, { target }),
+          ...(variant === 'multi-action' ? messagesTool(1, name, { target: 'ok' }) : []),
+          ...messagesEnd('tool_use'),
+        ]);
+      }
+      return variant === 'later-limit'
+        ? limit()
+        : eventResponse([...recoveryText('已核对证据。'), ...messagesEnd('end_turn')]);
+    });
+    let executions = 0;
+    let resets = 0;
+    const saved: string[] = [];
+    const system = 'fixture system';
+    const prompt = 'fixture prompt';
+    const tool = {
+      name,
+      description: 'fixture',
+      schema: object({ target: { type: 'string' } }),
+      execute: async () => {
+        executions++;
+        return {};
+      },
+    };
+    if (variant === 'input-blocked')
+      provider.inputTokenBudget = inputEstimate(system, [{ role: 'user', text: prompt }], [tool]) + 10;
+    const ctx = harnessFixture(trace, {
+      signal: cancel.signal,
+      session: { id: randomUUID(), bookId: 'book', cwd: '.', label: 'fixture', updated: '' },
+      async line(line) {
+        saved.push(line.text);
+      },
+      resetText() {
+        resets++;
+      },
+      diagnostic(event, fields) {
+        trace.report(event, fields);
+        if (
+          variant === 'late-cancel' &&
+          event === 'model.output_limit_recovery' &&
+          fields?.recovery === 'dispatched'
+        )
+          cancel.abort();
+      },
+    });
+    const operation = runAgent(ctx, provider, system, [], prompt, [tool], {
+      roundLimit: () => 200,
+      budgetPurpose: () => undefined,
+      async narrowedWritingStep() {
+        if (variant === 'cancelled') cancel.abort();
+        return {
+          canAdvance: variant !== 'no-safe-step',
+          complete: variant === 'success' && executions === 1,
+          instructions: '核对指定资料',
+          status: '尚留指定动作',
+          accepts: (toolName, a) =>
+            toolName === name && (a.target === 'ok' || variant === 'large-argument'),
+        };
+      },
+    });
+    if (variant === 'success') await operation;
+    else await assert.rejects(operation);
+    const onlyFirst = ['no-safe-step', 'input-blocked', 'cancelled'].includes(variant);
+    assert.equal(bodies.length, onlyFirst ? 1 : ['success', 'later-limit'].includes(variant) ? 3 : 2);
+    assert.equal(executions, ['success', 'later-limit', 'no-progress'].includes(variant) ? 1 : 0);
+    assert.ok(resets >= 1);
+    assert.doesNotMatch(JSON.stringify([bodies, saved, trace.rows]), /SENSITIVE_PARTIAL_RESPONSE/);
+    assert.ok(bodies.every((b) => b.max_tokens === 8_192));
+    assert.deepEqual(trace.rejected, []);
+    const events = trace.rows.filter((row) => row.event === 'model.output_limit_recovery');
+    const replanned = !onlyFirst && variant !== 'json-then-limit';
+    assert.equal(events.filter((row) => row.fields.recovery === 'dispatched').length, replanned ? 1 : 0);
+    if (replanned) {
+      assert.match(bodies[1].system, /逐项续接/);
+      const start = trace.rows.filter((row) => row.event === 'model.budget_dispatched');
+      const retry = events.find((e) => e.fields.recovery === 'dispatched')!;
+      assert.equal(retry.fields.spanId, start[1].fields.spanId);
+      assert.equal(retry.fields.originalSpanId, start[0].fields.spanId);
+      assert.equal(start[1].fields.turn, start[0].fields.turn);
+    }
+  });
+}
 
 test('official DeepSeek uses direct output only for eligible prose and bounded result requests', async (t) => {
   const requests: { thinking?: { type: string } }[] = [];

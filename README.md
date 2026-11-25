@@ -63,7 +63,9 @@ explorer.exe $logDir
 
 设置中的「保存配置」会查询匹配的官方 DeepSeek 模型额度；查询失败或端点未适配时显示兜底来源。额度随全局配置保存，新建小说或重启不会再次查询。「测试连接与工具」仍独立验证流式请求，不是保存额度的前提。
 
-排查触限时，用 `runId` 找到 `model.budget_dispatched`，再按 `spanId` 对照 `model.finished`。`capabilitySource` 区分供应商声明、厂商兜底和通用兜底；`contextWindow` 和 `maxOutputTokens` 是该配置用于规划的上限，`purpose` 是本次用途，`estimatedInput` 是最后的输入估算，`maxTokens` 是实际发出的输出限额。派发不证明上游收到，也不是服务器实际用量。必要上下文超预算可能在派发前以 `context_limit` 失败，此时没有对应派发记录；`output_limit` 的现有处理不变。
+排查触限时，用 `runId` 找到 `model.budget_dispatched`，再按 `spanId` 对照 `model.finished`。`capabilitySource` 区分供应商声明、厂商兜底和通用兜底；`contextWindow` 和 `maxOutputTokens` 是该配置用于规划的上限，`purpose` 是本次用途，`estimatedInput` 是最后的输入估算，`maxTokens` 是实际发出的输出限额。派发不证明上游收到，也不是服务器实际用量。首次携带整书指南时，按同一个 `spanId` 对照 `skill.applied` 与 `model.budget_dispatched` 中的 `budgetBasis=first-whole-skill`；后续已生效的整书请求用 `active-whole-skill`。必要上下文超预算可能在派发前以 `context_limit` 失败，此时没有对应派发记录。
+
+Messages 小说主 Agent 明确触限时，可用 `model.output_limit_recovery` 区分实际的拆小续接（`dispatched`）、不适用或不可拆、已用完尝试、无进展及再次触限。按 `runId`、`turn`、`originalSpanId` 和续接请求的 `spanId` 核对；续接不提额，只做一个未完成的合法小动作。同一 Run 最多续接一次，出错响应中的工具不会执行，也不会重做已保存的内容。只凭 `tool` 和文件提交回执判断哪些动作实际落盘，不把触限估算当作供应商计费记录。
 
 ### 按 Harness 诊断编号排查
 

@@ -5,6 +5,7 @@ import type { AssistantTurn, ToolSpec, Turn } from './model.js';
 import { recentReceiptLimit, type ToolReceipt } from './tool-receipts.js';
 
 type ResultTurn = Extract<Turn, { role: 'tool' }>;
+export type ProtectedResult = Pick<ResultTurn, 'id' | 'result'>;
 type Cycle = { assistant: AssistantTurn; results: ResultTurn[]; receipts: ToolReceipt[] };
 const rereadable = new Set([
   'list_files',
@@ -117,8 +118,10 @@ export class ActiveContext {
       .filter(Boolean)
       .join('\n');
   }
-  private wire(limit: number) {
-    const system = [this.base, this.prelude, this.activeSummary(limit)].filter(Boolean).join('\n\n');
+  private wire(limit: number, notice?: string) {
+    const system = [this.base, this.prelude, this.activeSummary(limit), notice]
+      .filter(Boolean)
+      .join('\n\n');
     const flat = this.textHistoryInPrompt && this.past.length;
     const history: Turn[] = [
       ...(flat ? [] : this.past),
@@ -132,9 +135,10 @@ export class ActiveContext {
     ];
     return { system, history };
   }
-  private shrink(cycle: Cycle, limit: number, readOnly: boolean) {
+  private shrink(cycle: Cycle, limit: number, readOnly: boolean, keep?: ProtectedResult) {
     let shrunk = 0;
     cycle.results = cycle.results.map((row, i) => {
+      if (row.result === keep?.result && row.id === keep.id) return row;
       const tool = cycle.assistant.calls[i].name;
       const { ok, reason, error, value } = row.result;
       if ((readOnly && !rereadable.has(tool)) || tokens(JSON.stringify(row.result)) <= limit + 150)
@@ -152,21 +156,30 @@ export class ActiveContext {
     return shrunk;
   }
 
-  fit(limit: number) {
+  fit(limit: number, keep?: ProtectedResult, notice?: string) {
     const measure = () => {
-      const wire = this.wire(limit);
+      const wire = this.wire(limit, notice);
+      if (
+        keep &&
+        !wire.history.some(
+          (row) => row.role === 'tool' && row.id === keep.id && row.result === keep.result,
+        )
+      )
+        throw contextOverflow();
       return { wire, fits: inputEstimate(wire.system, wire.history, this.tools) <= limit };
     };
     let { wire, fits } = measure();
     if (fits) return wire;
 
     // First reduce old, re-readable payloads without changing any call, ID or native block.
-    for (const cycle of this.cycles.slice(0, -1)) this.shrink(cycle, 720, true);
+    for (const cycle of this.cycles.slice(0, -1)) this.shrink(cycle, 720, true, keep);
     this.compacted ||= this.reductions > 0;
     ({ wire, fits } = measure());
     // Cut only whole completed groups. The latest native assistant + matching results stays intact.
     while (!fits && this.cycles.length > 1) {
       this.compacted = true;
+      if (keep && this.cycles[0].results.some((row) => row.id === keep.id && row.result === keep.result))
+        break;
       this.summarizeCycle(this.cycles.shift()!);
       ({ wire, fits } = measure());
     }
@@ -176,7 +189,7 @@ export class ActiveContext {
     const latest = this.cycles.at(-1);
     if (latest) {
       for (const size of [Math.max(480, Math.floor((limit * 0.09) / latest.results.length)), 280]) {
-        this.compacted = !!this.shrink(latest, size, false) || this.compacted;
+        this.compacted = !!this.shrink(latest, size, false, keep) || this.compacted;
         ({ wire, fits } = measure());
         if (fits) return wire;
       }

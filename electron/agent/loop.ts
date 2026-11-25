@@ -10,12 +10,18 @@ import {
   type UserMessage,
 } from '@earendil-works/pi-ai';
 import type { AssistantTurn, ModelProvider, ModelRequest, ToolSpec, Turn } from './model.js';
-import { MalformedMessagesArguments } from './provider.js';
+import { MalformedMessagesArguments, MessagesOutputLimit } from './provider.js';
 import type { ReportMemoryDispatch } from './book-memory.js';
 import type { RunContext } from './runs.js';
 import type { ToolResult } from '../../shared/contracts.js';
 import { ActiveContext } from './active-context.js';
-import { contextOverflow, inputEstimate, planModelBudget, prepareSessionHistory } from './context-budget.js';
+import {
+  contextOverflow,
+  inputEstimate,
+  planModelBudget,
+  prepareSessionHistory,
+  tokens,
+} from './context-budget.js';
 import {
   callRef,
   commitReceiptLimit,
@@ -26,6 +32,7 @@ import {
 
 export interface LocalTool extends ToolSpec {
   execute: (args: Record<string, any>, ctx: RunContext) => Promise<unknown>;
+  isWholeSkillResult?: (result: ToolResult) => boolean;
   onResultSent?: (result: ToolResult, report: ReportDiagnostic) => void;
 }
 /** A domain failure can carry a bounded tool result, without forwarding it to diagnostics. */
@@ -91,6 +98,8 @@ interface Round {
   number: number;
   answer?: AssistantTurn;
   receipts: ToolReceipt[];
+  narrowStep?: NarrowedWritingStep;
+  narrowSpanId?: string;
   started: number;
   report: ReportDiagnostic;
   candidates: Map<string, Candidate>;
@@ -118,9 +127,18 @@ function commandOutcome(value: unknown) {
 }
 
 export const defaultRoundLimit = 200;
+export interface NarrowedWritingStep {
+  readonly complete: boolean;
+  readonly canAdvance: boolean;
+  readonly status: string;
+  readonly instructions: string;
+  accepts(name: string, args: Record<string, unknown>): boolean;
+}
 interface AgentBudget {
   roundLimit: () => number;
   budgetPurpose: () => ModelRequest['budgetPurpose'];
+  canDeliverWholeSkill?: () => boolean;
+  narrowedWritingStep?: (ctx: RunContext) => Promise<NarrowedWritingStep | undefined>;
 }
 
 export async function runAgent(
@@ -159,7 +177,38 @@ export async function runAgent(
   let projectionFailure: DiagnosticFailure | undefined;
   let previousCompaction = 0;
   const registered = new Map(tools.map((tool) => [tool.name, tool]));
-  const outbound: { candidate: Candidate; result: ToolResult; tool?: LocalTool }[] = [];
+  const outbound: { id: string; candidate: Candidate; result: ToolResult; tool?: LocalTool }[] = [];
+  let narrowed = false;
+  let recoveryOrigin: string | undefined;
+  const recovery = (
+    report: ReportDiagnostic,
+    state: string,
+    reason?: string,
+    original?: string,
+    span?: string,
+  ) =>
+    report('model.output_limit_recovery', {
+      recovery: state,
+      reason,
+      originalSpanId: original,
+      spanId: span,
+    });
+  const stepFor = () =>
+    typeof budget === 'number' || !ctx.session.bookId ? undefined : budget.narrowedWritingStep?.(ctx);
+  const stopped = (why: string, step?: NarrowedWritingStep, reason = 'output_limit') =>
+    new DiagnosticFailure(
+      reason,
+      `${why}。${step ? step.status + '。' : ''}已保存的内容保留，可在同一会话继续。`,
+    );
+  const narrowNotice = (step: NarrowedWritingStep, maxTokens: number) =>
+    [
+      '输出触限后的逐项续接：原触限回复及其工具调用未执行。原目标与授权不变，不重复已保存事项。',
+      step.complete
+        ? '现稿已通过完成核对；只作简短总结，不再调用工具。'
+        : `本次只提交一个下列范围内、可独立校验的工具调用。参数须简短（估算不超过 ${Math.floor(maxTokens / 8)} token）；不复述原稿，不提交其他动作。`,
+      step.status,
+      step.instructions,
+    ].join('\n');
   let rounds = 0;
   const roundLimit = () => (typeof budget === 'number' ? budget : budget.roundLimit());
   let active: Round | undefined;
@@ -315,16 +364,44 @@ export async function runAgent(
     };
     void (async () => {
       try {
-        const budgetPurpose = purpose();
-        const wire = context.fit(planModelBudget(provider, budgetPurpose).inputTokens);
-        history = wire.history;
-        const stats = context.stats;
-        if (stats.removed + stats.reductions !== previousCompaction) {
-          previousCompaction = stats.removed + stats.reductions;
-          report('context.compacted', { count: stats.removed, omittedCount: stats.reductions });
+        ctx.signal.throwIfAborted();
+        const activePurpose = purpose();
+        const pendingWholeSkill =
+          activePurpose !== 'long-writing' &&
+          typeof budget !== 'number' &&
+          budget.canDeliverWholeSkill?.()
+            ? outbound.find(
+                ({ candidate, tool, result }) =>
+                  candidate.executed && tool?.isWholeSkillResult?.(result),
+              )
+            : undefined;
+        const budgetPurpose = pendingWholeSkill ? 'long-writing' : activePurpose;
+        const planned = planModelBudget(provider, budgetPurpose);
+        const fit = (step?: NarrowedWritingStep) => {
+          const wire = context.fit(
+            planned.inputTokens,
+            pendingWholeSkill,
+            step && narrowNotice(step, planned.maxTokens),
+          );
+          history = wire.history;
+          const stats = context.stats;
+          if (stats.removed + stats.reductions !== previousCompaction) {
+            previousCompaction = stats.removed + stats.reductions;
+            report('context.compacted', { count: stats.removed, omittedCount: stats.reductions });
+          }
+          return wire;
+        };
+        if (narrowed) {
+          round.narrowStep = await stepFor();
+          ctx.signal.throwIfAborted();
+          if (!round.narrowStep || (!round.narrowStep.complete && !round.narrowStep.canAdvance)) {
+            recovery(report, 'no_safe_step', 'output_limit', recoveryOrigin);
+            throw stopped('已不能安全选出下一项，停止自动续接', round.narrowStep);
+          }
         }
+        let wire = fit(round.narrowStep);
         let answeredSpanId = spanId;
-        const send = (attemptId: string, attempt: 1 | 2) => {
+        const send = (attemptId: string, attempt: 1 | 2, replan = false) => {
           const requestTrace = diagnosticScope(report, {
             spanId: attemptId,
             attempt,
@@ -334,11 +411,18 @@ export async function runAgent(
             ...wire,
             tools,
             budgetPurpose,
+            budgetBasis: pendingWholeSkill
+              ? 'first-whole-skill'
+              : activePurpose === 'long-writing'
+                ? 'active-whole-skill'
+                : undefined,
             signal: ctx.signal,
             onText: ctx.text,
             diagnostic: requestTrace,
             spanId: attemptId,
             onDispatch(nextSpanId) {
+              if (round.narrowStep) round.narrowSpanId = nextSpanId;
+              if (replan) recovery(requestTrace, 'dispatched', 'output_limit', spanId, nextSpanId);
               // The base system block is intact in the fitted wire projection.
               reportAttachedMemory?.(diagnosticScope(requestTrace, { spanId: nextSpanId }));
               // Dispatch metadata and business receipts for already executed tools stay unique.
@@ -356,31 +440,116 @@ export async function runAgent(
         try {
           answer = await send(spanId, 1);
         } catch (error) {
-          if (!(error instanceof MalformedMessagesArguments)) throw error;
-          // Up to this boundary no native reply or tool candidate from this round entered Pi.
-          ctx.resetText?.();
-          ctx.signal.throwIfAborted();
-          const retryId = randomUUID();
-          report('model.arguments_retry', {
-            spanId: retryId,
-            originalSpanId: spanId,
-            attempt: 2,
-            reason: 'invalid_json',
-          });
-          try {
-            answer = await send(retryId, 2);
-            answeredSpanId = retryId;
-          } catch (retryError) {
+          if (error instanceof MessagesOutputLimit) {
             ctx.resetText?.();
             ctx.signal.throwIfAborted();
-            throw new DiagnosticFailure(
-              classified(retryError, ctx.signal),
-              `Messages 工具参数无效，已重取一次当前轮，仍未完成：${safeText(retryError)}。本轮未执行工具；已保存内容保留，可在同一会话继续。`,
-              { cause: retryError },
-            );
+            if (narrowed) {
+              recovery(report, 'repeat_limit', 'output_limit', recoveryOrigin);
+              throw stopped('单步续接后再次达到输出上限，未执行该轮工具', round.narrowStep);
+            }
+            recoveryOrigin = spanId;
+            const step = await stepFor();
+            ctx.signal.throwIfAborted();
+            if (!step || step.complete || !step.canAdvance) {
+              recovery(report, step ? 'no_safe_step' : 'ineligible', 'output_limit', spanId);
+              throw stopped('模型达到输出上限，未能安全拆出下一项，未执行本轮工具', step);
+            }
+            try {
+              wire = fit(step);
+            } catch (fitError) {
+              if (classified(fitError) !== 'context_limit') throw fitError;
+              recovery(report, 'input_blocked', 'context_limit', spanId);
+              throw stopped('模型达到输出上限，续接所需上下文无法装入', step);
+            }
+            ctx.signal.throwIfAborted();
+            narrowed = true;
+            round.narrowStep = step;
+            const retryId = randomUUID();
+            try {
+              answer = await send(retryId, 2, true);
+              answeredSpanId = retryId;
+            } catch (retryError) {
+              ctx.resetText?.();
+              ctx.signal.throwIfAborted();
+              recovery(
+                report,
+                retryError instanceof MessagesOutputLimit ? 'repeat_limit' : 'failed',
+                classified(retryError),
+                spanId,
+                round.narrowSpanId,
+              );
+              throw stopped(
+                retryError instanceof MessagesOutputLimit
+                  ? '单步续接仍达到输出上限，未执行本轮工具'
+                  : '单步续接未完成，未执行本轮工具',
+                step,
+                classified(retryError, ctx.signal),
+              );
+            }
+          } else {
+            if (!(error instanceof MalformedMessagesArguments)) throw error;
+            // Up to this boundary no native reply or tool candidate from this round entered Pi.
+            ctx.resetText?.();
+            ctx.signal.throwIfAborted();
+            const retryId = randomUUID();
+            report('model.arguments_retry', {
+              spanId: retryId,
+              originalSpanId: spanId,
+              attempt: 2,
+              reason: 'invalid_json',
+            });
+            try {
+              answer = await send(retryId, 2);
+              answeredSpanId = retryId;
+            } catch (retryError) {
+              ctx.resetText?.();
+              ctx.signal.throwIfAborted();
+              if (retryError instanceof MessagesOutputLimit) {
+                recovery(report, 'attempt_used', 'output_limit', spanId, retryId);
+                throw stopped(
+                  '重取坏 JSON 后达到输出上限，本轮已使用额外尝试，未执行本轮工具',
+                  round.narrowStep,
+                );
+              }
+              throw new DiagnosticFailure(
+                classified(retryError, ctx.signal),
+                `Messages 工具参数无效，已重取一次当前轮，仍未完成：${safeText(retryError)}。本轮未执行工具；已保存内容保留，可在同一会话继续。`,
+                { cause: retryError },
+              );
+            }
           }
         }
         ctx.signal.throwIfAborted();
+        const step = round.narrowStep;
+        if (step) {
+          const call = answer.calls[0];
+          const valid = step.complete
+            ? answer.calls.length === 0 && !!answer.text.trim()
+            : answer.calls.length === 1 &&
+              !!call &&
+              tokens(call.args) <= Math.floor(planned.maxTokens / 8) &&
+              (() => {
+                try {
+                  return step.accepts(call.name, parseArgs(call.args));
+                } catch {
+                  return false;
+                }
+              })();
+          if (!valid) {
+            ctx.resetText?.();
+            for (const rejected of answer.calls.slice(0, 16)) {
+              diagnosticScope(report, { spanId: answeredSpanId, callId: randomUUID() })(
+                'tool.rejected',
+                {
+                  tool: registered.get(rejected.name)?.name ?? 'unknown',
+                  reason: 'invalid_call',
+                },
+              );
+            }
+            recovery(report, 'invalid_step', 'invalid_call', recoveryOrigin, answeredSpanId);
+            throw stopped('续接响应没有给出一个合法且必要的小动作，未执行本轮工具', step);
+          }
+        }
         const badBatch =
           answer.calls.length > 16 ||
           new Set(answer.calls.map((c) => c.id)).size !== answer.calls.length;
@@ -427,6 +596,8 @@ export async function runAgent(
         base.stopReason = answer.calls.length ? 'toolUse' : 'stop';
       } catch (e) {
         round.failure = classified(e, ctx.signal);
+        if (ctx.signal.aborted && recoveryOrigin)
+          recovery(report, 'cancelled', 'cancelled', recoveryOrigin, round.narrowSpanId);
         base.stopReason = ctx.signal.aborted ? 'aborted' : 'error';
         base.errorMessage = safeText(e);
       } finally {
@@ -469,10 +640,17 @@ export async function runAgent(
               if (!candidate.executed)
                 reject(candidate, ctx.signal.aborted ? 'cancelled' : 'invalid_arguments');
               candidate.report('tool.result_ready', { outcome: detail.ok ? 'ok' : 'failed' });
-              outbound.push({ candidate, result: detail, tool: registered.get(tool.toolName) });
+              outbound.push({
+                id: tool.toolCallId,
+                candidate,
+                result: detail,
+                tool: registered.get(tool.toolName),
+              });
             }
           }
           if (ctx.signal.aborted || message.stopReason === 'aborted') {
+            if (active?.narrowStep && message.stopReason !== 'aborted')
+              recovery(active.report, 'cancelled', 'cancelled', recoveryOrigin, active.narrowSpanId);
             for (const candidate of active?.candidates.values() ?? []) reject(candidate, 'cancelled');
             finish('cancelled', 'cancelled', toolResults.length);
           } else if (message.stopReason === 'error') {
@@ -480,6 +658,27 @@ export async function runAgent(
             finish('failed', failure);
           } else if (receiptFailure) {
             finish('failed', 'io_failure', toolResults.length);
+            return { action: 'end' };
+          } else if (
+            active?.narrowStep &&
+            toolResults.length &&
+            !active.receipts.some(
+              (r) => r.outcome === 'ok' && (r.commitCount > 0 || r.tool === 'book_get_context'),
+            )
+          ) {
+            recovery(
+              active.report,
+              'no_progress',
+              results[0]?.result.reason,
+              recoveryOrigin,
+              active.narrowSpanId,
+            );
+            projectionFailure = stopped(
+              '逐项续接没有取得新的可核对结果',
+              active.narrowStep,
+              results[0]?.result.reason ?? 'output_limit',
+            );
+            finish('failed', projectionFailure.diagnosticReason, toolResults.length);
             return { action: 'end' };
           } else if (rounds >= roundLimit() && toolResults.length) {
             finish('failed', 'iteration_limit', toolResults.length);
@@ -492,6 +691,14 @@ export async function runAgent(
               finish('failed', projectionFailure.diagnosticReason, toolResults.length);
               return { action: 'end' };
             }
+            if (active?.narrowStep)
+              recovery(
+                active.report,
+                toolResults.length ? 'advanced' : 'completed',
+                undefined,
+                recoveryOrigin,
+                active.narrowSpanId,
+              );
             finish('ok', toolResults.length ? 'continue_tools' : 'complete', toolResults.length);
           }
         },

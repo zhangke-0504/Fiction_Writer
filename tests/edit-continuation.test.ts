@@ -13,7 +13,9 @@ import { proposalOnly, readEditPlan } from '../electron/agent/edit-proposal.js';
 import { runAgent } from '../electron/agent/loop.js';
 import { SkillCatalog } from '../electron/agent/skills.js';
 import { captureWritingRequests, isolatedRequest } from './writing-request-fixture.js';
-import type { Script } from '../electron/agent/scripted.js';
+import type { ModelProvider } from '../electron/agent/model.js';
+import { messagesRecoveryFixture } from './messages-recovery-fixture.js';
+import { ScriptedProvider, type Script } from '../electron/agent/scripted.js';
 import { collectDiagnostics } from './diagnostic-fixture.js';
 
 const planPrompt =
@@ -102,8 +104,15 @@ async function fixture(t: TestContext) {
   let runs = await newManager();
   const session = await runs.create({ cwd: workspace.bookRoot(id), bookId: id }, '验收');
   const catalog = new SkillCatalog(fileURLToPath(new URL('../skills', import.meta.url)));
-  const start = (prompt: string, script: Script[], sessionId = session.id) => {
-    const { provider, requests } = captureWritingRequests(script);
+  const start = (
+    prompt: string,
+    script: Script[],
+    sessionId = session.id,
+    transport?: ModelProvider,
+  ) => {
+    const captured = captureWritingRequests(script);
+    const { requests } = captured;
+    const provider = transport ?? captured.provider;
     const trace = collectDiagnostics();
     const novel = new NovelTools(workspace, id, provider, catalog, { authorPrompt: prompt });
     runs.start(
@@ -388,6 +397,82 @@ test('the displayed plan is read-only until approved, and the same session resum
   assert.equal(foreshadowing.fields.payoffChapterId, 'ch09');
   assert.ok(foreshadowing.fields.subjectIds?.includes(villain.id));
 });
+
+for (const repeat of [false, true]) {
+  test(
+    'confirmed cross-chapter work preserves earlier writes after an output limit (repeat=' +
+      repeat +
+      ')',
+    async (t) => {
+      const f = await fixture(t);
+      await propose(f);
+      const lastChapterBefore = await f.bytes(9);
+      const inner = new ScriptedProvider([
+        saveActor[1],
+        saveClue[1],
+        draft(4),
+        draft(6),
+        ...(repeat ? [] : [draft(9), syncCandidate('subject'), syncCandidate('clue')]),
+      ]);
+      const { provider, scripted, wires } = messagesRecoveryFixture(
+        t,
+        (req) => req.system.startsWith('OUTER_ONLY_FIXTURE'),
+        inner,
+      );
+      let before: Buffer | undefined;
+      const rejected = async () => ({
+        ...(await insertion(f, 4)()),
+        text: 'TRUNCATED_PRIVATE_EDIT',
+        native: 'truncated-fixture',
+      });
+      scripted.push(
+        () => use('book_generate_assets', { ...subject, targets: [{ id: 'agent-villain' }] }),
+        () => use('book_generate_assets', { ...clue, targets: [{ id: 'marked-chart' }] }),
+        insertion(f, 4),
+        async () => {
+          before = await f.bytes(4);
+          return rejected();
+        },
+        insertion(f, 6),
+        ...(repeat
+          ? [rejected]
+          : [
+              insertion(f, 9),
+              () => syncRequest('subject'),
+              () => syncRequest('clue'),
+              () => text('已完成实际修改。'),
+            ]),
+      );
+      const run = f.start(agree, [], f.session.id, provider);
+      const result = await run.wait();
+      assert.equal(result.status, repeat ? 'failed' : 'completed', result.error);
+      if (repeat) {
+        assert.match(result.error ?? '', /再次达到输出上限.*late-arrival.*已保存/s);
+        assert.deepEqual(await f.bytes(9), lastChapterBefore);
+      } else assert.equal(result.progress?.done, 7);
+      assert.equal(wires.length, repeat ? 6 : 9);
+      assert.equal(scripted.length, 0);
+      assert.deepEqual(await f.bytes(4), before);
+      for (const n of repeat ? [4, 6] : [4, 6, 9]) {
+        const body = (await f.bytes(n)).toString('utf8');
+        assert.equal(body.split(fragments[n]).length, 2);
+        assert.ok(body.includes(anchor(n)));
+      }
+      assert.ok(wires.slice(4).every((w) => w.system.includes('逐项续接') && w.max_tokens === 8192));
+      assert.doesNotMatch(
+        JSON.stringify([wires, f.view().messages, run.trace.rows]),
+        /TRUNCATED_PRIVATE_EDIT/,
+      );
+      assert.equal(
+        run.trace.rows.filter(
+          (r) => r.event === 'model.output_limit_recovery' && r.fields.recovery === 'dispatched',
+        ).length,
+        1,
+      );
+      assert.deepEqual(run.trace.rejected, []);
+    },
+  );
+}
 
 test('another session, merely discussing, or a narrower approval cannot write chapters', async (t) => {
   const f = await fixture(t);

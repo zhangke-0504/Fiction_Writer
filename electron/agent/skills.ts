@@ -156,6 +156,15 @@ export class SkillCatalog {
           name,
           instructions: await this.load(name, ctx.diagnostic),
         }),
+        isWholeSkillResult(result) {
+          const skill = result.value as { name?: unknown; instructions?: unknown } | undefined;
+          return (
+            result.ok &&
+            skill?.name === 'generate-novel' &&
+            typeof skill.instructions === 'string' &&
+            !!skill.instructions.trim()
+          );
+        },
         onResultSent(result, report) {
           const skill = result.value as { name?: unknown; instructions?: unknown } | undefined;
           if (result.ok && isSkillName(skill?.name) && typeof skill.instructions === 'string') {

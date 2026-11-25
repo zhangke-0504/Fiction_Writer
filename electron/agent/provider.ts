@@ -24,6 +24,12 @@ export class MalformedMessagesArguments extends ProviderError {
     super('Messages 工具参数不是完整 JSON', 'protocol', 'malformed_stream');
   }
 }
+/** A closed Messages response whose provider explicitly ran out of output tokens. */
+export class MessagesOutputLimit extends ProviderError {
+  constructor() {
+    super('Messages 输出达到模型长度上限，未取得完整结果', 'protocol', 'output_limit');
+  }
+}
 const error = (message: string, detail?: ProviderError['detail']) =>
   new ProviderError(message, 'protocol', detail);
 function reply(text: string, calls: ToolCall[], native?: unknown): AssistantTurn {
@@ -364,8 +370,7 @@ async function parseMessages(
         break;
       }
     }
-    if (closed && finish === 'max_tokens')
-      throw error('Messages 输出达到模型长度上限，未取得完整结果', 'output_limit');
+    if (closed && finish === 'max_tokens') throw new MessagesOutputLimit();
     if (!closed || !['end_turn', 'tool_use', 'stop_sequence'].includes(finish))
       throw error('Messages 输出中断或缺少有效的结束状态', 'incomplete_stream');
   } catch (cause) {
@@ -504,6 +509,7 @@ export function createProvider(
           const pending = fetch(url, { method: 'POST', headers: hdr, redirect: 'error', body, signal });
           report('model.budget_dispatched', {
             purpose,
+            budgetBasis: request.budgetBasis,
             capabilitySource: capabilities.source,
             contextWindow: capabilities.contextWindow,
             maxOutputTokens: capabilities.maxOutputTokens,

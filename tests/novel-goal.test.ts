@@ -8,6 +8,8 @@ import { NovelTools } from '../electron/agent/novel-tools.js';
 import { defaultRoundLimit, runAgent } from '../electron/agent/loop.js';
 import { RunManager } from '../electron/agent/runs.js';
 import { ScriptedProvider, type Script } from '../electron/agent/scripted.js';
+import { messagesRecoveryFixture } from './messages-recovery-fixture.js';
+import { collectDiagnostics } from './diagnostic-fixture.js';
 import { SkillCatalog } from '../electron/agent/skills.js';
 import { Journal } from '../electron/journal.js';
 import { WorkspaceService } from '../electron/workspace.js';
@@ -169,6 +171,73 @@ test('already saved chapters are reused and only the next empty chapter is draft
 
 const resume = (updateDirection = false) =>
   tool('resume', 'book_get_context', { novelGoal: { action: 'resume', updateDirection } });
+test('a truncated first whole-book action recovers the full goal and writes only its next blank chapter', async (t) => {
+  const f = await fixture(t, 2);
+  const trace = collectDiagnostics();
+  const stable = await f.workspace.readDocument(f.id, { type: 'chapter', id: 'one' });
+  const prompt = '基于蝙蝠侠写3章完整小说，保留现有正文';
+  const { provider, scripted, wires } = messagesRecoveryFixture(
+    t,
+    (req) => req.system.startsWith('OUTER'),
+    new ScriptedProvider([() => text('她从信里读懂暗号。船转向家乡，平安进港。')]),
+  );
+  const truncated = tool('rejected', 'book_apply_changes', {
+    operations: [{ type: 'chapter', action: 'delete', id: 'one' }],
+  });
+  scripted.push(
+    activate,
+    () => ({ ...truncated, text: 'PRIVATE_TRUNCATED_OUTLINE', native: 'truncated-fixture' }),
+    () => goal('register', chapterIds),
+    () => tool('next-chapter', 'book_generate_chapter', { mode: 'draft', chapterId: 'three' }),
+    () => text('三章已核对。'),
+  );
+  const novel = new NovelTools(f.workspace, f.id, provider, f.catalog, { authorPrompt: prompt });
+  f.runs.start(
+    f.session.id,
+    prompt,
+    async (ctx) => {
+      const scope = novel.prepareEdit(ctx, (await f.workspace.readAll(f.id)).documents);
+      await runAgent(
+        ctx,
+        provider,
+        'OUTER' + scope,
+        [],
+        prompt,
+        [...f.catalog.tools((name) => novel.skillApplied(name)), ...novel.tools()],
+        novel,
+      );
+      await novel.assertFinished(ctx);
+    },
+    'high',
+    trace.report,
+  );
+  await f.runs.wait(f.session.id);
+  const state = f.runs.get(f.session.id);
+  assert.equal(state.run?.status, 'completed', state.run?.error);
+  assert.equal(state.run?.progress?.done, 3);
+  assert.equal(scripted.length, 0);
+  assert.deepEqual(
+    wires.map((w) => w.max_tokens),
+    [8192, 65536, 65536, 65536, 65536],
+  );
+  assert.match(JSON.stringify(wires[2].messages), /generate-novel/);
+  assert.match(wires[2].system, /novelGoal.register/);
+  assert.doesNotMatch(
+    JSON.stringify([wires, trace.rows, state.messages]),
+    /PRIVATE_TRUNCATED_OUTLINE|call-rejected/,
+  );
+  assert.equal(
+    trace.rows.filter((r) => r.event === 'skill.applied' && r.fields.skill === 'generate-novel').length,
+    1,
+  );
+  assert.deepEqual(trace.rejected, []);
+  assert.deepEqual(await f.workspace.readDocument(f.id, { type: 'chapter', id: 'one' }), stable);
+  assert.match(
+    (await f.workspace.readDocument(f.id, { type: 'chapter', id: 'three' })).body,
+    /平安进港/,
+  );
+});
+
 const draftThird = () =>
   tool('draft-third', 'book_generate_chapter', { chapterId: 'three', mode: 'draft' });
 async function reboot(f: Awaited<ReturnType<typeof fixture>>) {
