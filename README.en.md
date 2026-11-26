@@ -26,3 +26,22 @@ This builds and launches the Electron desktop app. No separate web server is nee
 Your novels are stored under `Fiction_Writer/library` in your Windows Documents folder. To back up or move a novel, copy its entire folder. Model profiles and session history are stored separately and do not transfer with the novel.
 
 See [AGENTS.md](AGENTS.md) for development and contribution guidelines.
+
+## Acknowledgments
+
+Thanks to the maintainers and contributors of these open-source projects:
+
+- [Pi](https://github.com/earendil-works/pi): The Harness agent loop uses the Pi SDK. We also took cues from how Pi summarizes older context while keeping recent messages and skips truncated tool calls.
+- [OpenCode](https://github.com/anomalyco/opencode): Its separation of run state from events informed the early Harness design.
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent): Its use of memory size limits and atomic writes informed how we store book-scoped memory.
+- [OpenClaw](https://github.com/openclaw/openclaw): Its separation of candidate evidence from established long-term memory informed book-scoped memory. Its distinction between bounded continuation and resending the same request also informed output-limit recovery.
+- [OpenAI Codex](https://github.com/openai/codex): Harness took cues from how Codex distinguishes incomplete model responses from transport retries, budgets tool results separately, and waits for delegated tasks when needed.
+- [CC Switch](https://github.com/farion1231/cc-switch): Its provider grouping and two-step flow informed how we add model profiles: choose a preset or the custom option, then fill in the settings.
+
+## Buy me a coffee
+
+If you enjoy using Fiction Writer, feel free to scan the WeChat Pay QR code below and buy me a coffee. Thanks for your support!
+
+<p align="center">
+  <img src="docs/assets/wechat-pay.png" alt="WeChat Pay QR code to buy me a coffee" width="360" />
+</p>
