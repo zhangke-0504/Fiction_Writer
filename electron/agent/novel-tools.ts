@@ -27,6 +27,7 @@ import {
   type ChapterInsertion,
 } from './chapter-insertion.js';
 import { checkBookEditPlan, ConfirmedBookEdit } from './book-edit.js';
+import { assetPatchFields, patchAssetDescription, type AssetPatch } from './asset-patch.js';
 import type { BookTaskScope, ScopeOperation } from './task-scope.js';
 import {
   approvesEdit,
@@ -1344,10 +1345,15 @@ export class NovelTools {
       reads.offsets.delete(key);
     } else if (first[0] === 0) reads.offsets.set(key, { revision: doc.revision, next: first[1] });
   }
+  private readCovers(doc: Manuscript, start: number, end: number) {
+    const read = this.reads.sourceReads.get(docKey(doc));
+    return (
+      read?.revision === doc.revision && read.ranges.some(([from, to]) => from <= start && end <= to)
+    );
+  }
   private requirePatchQuote(doc: Manuscript, quote: string, evidence = false) {
     const { start, end } = exactRange(doc.body, quote, evidence ? 'patch_evidence' : 'patch_anchor');
-    const read = this.reads.sourceReads.get(docKey(doc));
-    if (read?.revision !== doc.revision || !read.ranges.some(([from, to]) => from <= start && end <= to))
+    if (!this.readCovers(doc, start, end))
       throw new ToolFailure(
         evidence ? 'patch_evidence' : 'context_required',
         '请按章节 ID 定向读取当前修订及对应完整短原文。',
@@ -1685,11 +1691,12 @@ export class NovelTools {
         )
           throw new ToolFailure('patch_scope', '修订超出作者明确指定的原文或替换文本。');
       } else if (explicit) {
-        await reviewProsePatch(this.provider, ctx, {
-          author,
-          chapter: { id: doc.id, title: doc.fields.title, order: doc.fields.order },
-          edits,
-        });
+        await reviewProsePatch(
+          this.provider,
+          { ...ctx, diagnostic: reportPatch },
+          { author, chapter: { id: doc.id, title: doc.fields.title, order: doc.fields.order }, edits },
+          explicitScope,
+        );
       } else await reviewProsePatch(this.provider, ctx, { evidence, edits });
       ctx.signal.throwIfAborted();
       const patchContext = { ...ctx, diagnostic: reportPatch };
@@ -1734,6 +1741,77 @@ export class NovelTools {
       throw error;
     }
   }
+  private async patchAsset(kind: 'subject' | 'clue', id: string, patch: AssetPatch, ctx: RunContext) {
+    const ref = { type: kind, id };
+    const key = docKey(ref);
+    const operation = `${kind}.update` as const;
+    const scope = this.input.scope;
+    const report = diagnosticScope(ctx.diagnostic ?? noDiagnostic, { documentRef: key });
+    try {
+      ctx.signal.throwIfAborted();
+      if (!isId(id)) throw new ToolFailure('invalid_arguments', '请使用有效的资料 ID。');
+      if (
+        !scope ||
+        ctx.session.bookId !== this.bookId ||
+        this.editMode !== 'direct' ||
+        this.wholeWork ||
+        ctx.narrowedWriting
+      )
+        throw new ToolFailure('patch_not_authorized', '资料定点修订仅用于绑定作品的普通范围任务。');
+      if (!scope.allowsAssetPatch(operation, id, ctx, patch))
+        throw new ToolFailure(
+          'patch_not_authorized',
+          '此精确修订不匹配本轮的 assetPatch 登记；文档级更新或只待办不能代替。',
+        );
+      if (
+        this.createdHere.has(key) &&
+        this.syncTargets((await this.workspace.readAll(this.bookId)).documents).some(
+          (target) => target.key === key,
+        )
+      )
+        throw new ToolFailure(
+          'asset_update_route',
+          '本轮插入关联的资料同步仍使用 book_generate_assets(update)。',
+        );
+      const changed = () =>
+        new ToolFailure('conflict', '资料已变化；请回读当前短文后重新登记，不重用旧补丁。');
+      const doc = await this.workspace.readDocument(this.bookId, ref).catch((error: unknown) => {
+        if (classified(error, ctx.signal) === 'missing') throw changed();
+        throw error;
+      });
+      if (doc.revision !== patch.revision) throw changed();
+      const { body, start, end } = patchAssetDescription(doc.body, patch);
+      if (!this.readCovers(doc, start, end))
+        throw new ToolFailure(
+          'context_required',
+          '请按资料类型和 ID 回读当前版本的完整短原文；搜索命中不是原文。',
+        );
+      ctx.signal.throwIfAborted();
+      const write = editWriteContext(
+        scope.track({ ...ctx, diagnostic: report }, [{ operation, id, assetPatch: patch }]),
+      );
+      const result = await this.workspace.writeChanges(
+        this.bookId,
+        [{ ...ref, fields: doc.fields, body, expect: patch.revision }],
+        ctx.signal,
+        [],
+        write.ctx.diagnostic,
+      );
+      if (result.reason === 'conflict') throw changed();
+      if (result.error) throw new ToolFailure(result.reason ?? 'unknown', result.error, result);
+      const revision = write.revisions([ref])[key];
+      report('asset.patch.finished', { docType: kind, outcome: 'ok', count: 1, revision });
+      return { kind, id, revision, patched: 1 };
+    } catch (error) {
+      const reason = classified(error, ctx.signal);
+      report('asset.patch.finished', {
+        docType: kind,
+        outcome: reason === 'cancelled' ? 'cancelled' : 'failed',
+        reason,
+      });
+      throw error;
+    }
+  }
   private async apply(operations: Mutation[], ctx: RunContext) {
     this.requireEditAction();
     if (this.edit)
@@ -1743,6 +1821,18 @@ export class NovelTools {
       );
     const target = this.requireGoal(ctx);
     const scope = this.input.scope;
+    if (
+      scope &&
+      !target &&
+      operations.some(
+        ({ type, action, id }) =>
+          (type === 'subject' || type === 'clue') && action === 'update' && isId(id),
+      )
+    )
+      throw new ToolFailure(
+        'asset_update_route',
+        '普通范围任务不能用 book_apply_changes 更新主体或伏笔：短文用 book_patch_asset，开放式说明用 book_generate_assets(update)，各自须有对应登记。',
+      );
     if (
       scope &&
       !target &&
@@ -1898,6 +1988,18 @@ export class NovelTools {
     this.requireEditAction();
     const taskScope = this.input.scope;
     const operation = `${input.kind}.${input.action}` as ScopeOperation;
+    if (
+      taskScope &&
+      input.action === 'update' &&
+      input.targets.some(({ id }) => {
+        const item = taskScope.item(operation, id);
+        return item?.assetPatch || item?.assetPending;
+      })
+    )
+      throw new ToolFailure(
+        'asset_update_route',
+        '定点登记或只待办不授权全文更新。仅匹配本轮精确登记的短文可用 book_patch_asset；其余暂留待办。',
+      );
     const permitted =
       !!taskScope && input.targets.every(({ id }) => taskScope.allows(operation, id, ctx));
     const whole = !!this.target && input.action !== 'update';
@@ -2557,7 +2659,7 @@ export class NovelTools {
       {
         name: 'book_apply_changes',
         description:
-          '提交小说资料及章节目录变更，不接受章节正文。局部修订用 book_patch_chapter。若用整书 Skill，先用 book_get_context 的 novelGoal 登记／续接。修改既有或已变化的故事资料前，显式用 book_get_context.includeBodies 读资料页，未完整提供的按 ID 分页补读。本轮已显式读到的资料未变化时无需重复取回。可批量提交；引用用真实 ID，可选关系字段用 null 清除。AI 生成或补齐主体／伏笔说明用 book_generate_assets；整书不能在这里新建或填写它们。',
+          '普通范围任务仅提交已登记的大纲或章节目录，不接受章节正文或主体／伏笔更新。正文定点用 book_patch_chapter；资料短文用 book_patch_asset，开放式更新用 book_generate_assets(update)。用整书 Skill 时先用 book_get_context.novelGoal 登记／续接；如需修改既有资料，显式用 book_get_context.includeBodies 读资料页，未完整提供的按 ID 分页补读；已读且未变化的无需重读。可批量提交；引用用真实 ID，可选关系字段用 null 清除。AI 生成或补齐主体／伏笔说明用 book_generate_assets；整书不能在这里新建或填写它们。',
         schema: object({
           operations: {
             type: 'array',
@@ -2577,10 +2679,26 @@ export class NovelTools {
         }),
         execute: async ({ operations }, ctx) => this.apply(operations, ctx),
       },
+      ...(this.input.scope
+        ? [
+            {
+              name: 'book_patch_asset',
+              description:
+                '普通范围任务定点修订已有主体或伏笔一处短说明。用 book_get_context 按类型和 ID 回读当前版；查找预览不是原文。用 book_task_scope 的 subject.update／clue.update.assetPatch 登记确切 revision、quote、replacement 后提交相同变更，不写其它字段或生成整份说明。无法定点时按授权用原全文更新或保留待办。',
+              schema: object({
+                kind: { type: 'string', enum: ['subject', 'clue'] },
+                id: idSchema,
+                ...assetPatchFields,
+              }),
+              execute: ({ kind, id, revision, quote, replacement }, ctx) =>
+                this.patchAsset(kind, id, { revision, quote, replacement }, ctx),
+            } satisfies LocalTool,
+          ]
+        : []),
       {
         name: 'book_generate_assets',
         description:
-          '生成或补齐一小批同类主体／伏笔的 Markdown 说明，适用于整书和单独任务。create 的新主体使用 targets:[{id, fields:{name,kind}, relatedSubjectIds}]，新伏笔使用 targets:[{id, fields:{title,subjectIds,setupChapterId,payoffChapterId}}]；不要混用两类 fields。fill 只补空或占位。关联增补后的 pendingSync 用 update，只传相应 ID，按实际片段同步。普通 update 需要明确授权指定已有资料。已有字段在 fill/update 时保留。用真实章节和主体 ID，不在参数里写说明正文。',
+          '生成或补齐一小批同类主体／伏笔的 Markdown 说明，适用于整书和单独任务。create 的新主体使用 targets:[{id, fields:{name,kind}, relatedSubjectIds}]，新伏笔使用 targets:[{id, fields:{title,subjectIds,setupChapterId,payoffChapterId}}]；不要混用两类 fields。fill 只补空或占位。关联增补后的 pendingSync 用 update，只传相应 ID，按实际片段同步。普通 update 用于明确授权的开放式说明更新，不接受只待办或定点登记；已定位的短文用 book_patch_asset。已有字段在 fill/update 时保留。用真实章节和主体 ID，不在参数里写说明正文。',
         schema: object(
           {
             kind: { type: 'string', enum: ['subject', 'clue'] },

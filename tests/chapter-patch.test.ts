@@ -12,7 +12,9 @@ import type { ProseEdit } from '../electron/agent/chapter-patch.js';
 import { runAgent } from '../electron/agent/loop.js';
 import { RunManager } from '../electron/agent/runs.js';
 import { Gate, ScriptedProvider, type Script } from '../electron/agent/scripted.js';
+import { MalformedMessagesArguments } from '../electron/agent/provider.js';
 import { SkillCatalog } from '../electron/agent/skills.js';
+import { DiagnosticFailure } from '../electron/diagnostics/trace.js';
 import { Journal } from '../electron/journal.js';
 import { WorkspaceService } from '../electron/workspace.js';
 import { collectDiagnostics } from './diagnostic-fixture.js';
@@ -36,6 +38,7 @@ const use = (name: string, args: object) => ({
   calls: [{ id: name, name, args: JSON.stringify(args) }],
 });
 const decision = (allowed: boolean) => use('submit_chapter_patch_review', { allowed });
+const reviewNote = 'REVIEW_VISIBLE_TEXT_MUST_NOT_ESCAPE';
 const read = (n: number, offset = 0, length = 6000) =>
   use('book_get_context', { type: 'chapter', documentId: ch(n).id, offset, length });
 const latest = (history: readonly unknown[]) => JSON.stringify(history.at(-1));
@@ -235,13 +238,24 @@ const moveScope = () =>
     ],
   });
 
-for (const variant of ['stepwise', 'batch', 'invalid-batch', 'delete-only', 'rename-only'] as const) {
+for (const variant of [
+  'stepwise',
+  'batch',
+  'invalid-batch',
+  'denied-batch',
+  'unknown-part',
+  'delete-only',
+  'rename-only',
+] as const) {
   test(`seventh chapter relocation: ${variant}`, async (t) => {
     const f = await fixture(t);
     assert.equal((await f.save(await f.load(seventh), beforeMove)).error, undefined);
     const initial = await f.load(seventh);
     const stepwise = variant === 'stepwise';
     const invalid = variant === 'invalid-batch';
+    const denied = variant === 'denied-batch';
+    const unknownPart = variant === 'unknown-part';
+    const rejected = invalid || denied || unknownPart;
     const deletionOnly = variant === 'delete-only';
     const renameOnly = variant === 'rename-only';
     const run = f.start(
@@ -270,9 +284,15 @@ for (const variant of ['stepwise', 'batch', 'invalid-batch', 'delete-only', 'ren
                 removeDialogue,
                 ...(stepwise || deletionOnly
                   ? []
-                  : [invalid ? { ...addDialogue, quote: '没有这个锚点' } : addDialogue]),
+                  : [
+                      invalid
+                        ? { ...addDialogue, quote: '没有这个锚点' }
+                        : unknownPart
+                          ? { ...addDialogue, part: 'outside' }
+                          : addDialogue,
+                    ]),
               ]),
-        ...(invalid || renameOnly ? [] : [() => decision(true)]),
+        ...(invalid || unknownPart || renameOnly ? [] : [() => decision(!denied)]),
         ...(!stepwise
           ? []
           : [
@@ -284,7 +304,17 @@ for (const variant of ['stepwise', 'batch', 'invalid-batch', 'delete-only', 'ren
               () => decision(true),
             ]),
         ({ history }) => {
-          assert.match(latest(history), invalid ? /patch_anchor/ : renameOnly ? /committed/ : /patched/);
+          assert.match(
+            latest(history),
+            invalid
+              ? /patch_anchor/
+              : denied || unknownPart
+                ? /patch_scope/
+                : renameOnly
+                  ? /committed/
+                  : /patched/,
+          );
+          if (denied) assert.match(latest(history), /不拆分须一并提交的改动/);
           return text('核对结果。');
         },
       ],
@@ -295,9 +325,9 @@ for (const variant of ['stepwise', 'batch', 'invalid-batch', 'delete-only', 'ren
     assert.equal(finished.status, 'completed', finished.error);
     assert.equal(
       finished.taskOutcome,
-      invalid || renameOnly ? 'incomplete' : deletionOnly ? 'partial' : 'fulfilled',
+      rejected || renameOnly ? 'incomplete' : deletionOnly ? 'partial' : 'fulfilled',
     );
-    assert.equal(finished.progress?.done, invalid || renameOnly ? 0 : deletionOnly ? 1 : 2);
+    assert.equal(finished.progress?.done, rejected || renameOnly ? 0 : deletionOnly ? 1 : 2);
     assert.equal(finished.progress?.total, 2);
     if (deletionOnly) {
       assert.match(finished.progress?.message ?? '', /补入车尾对话/);
@@ -305,7 +335,7 @@ for (const variant of ['stepwise', 'batch', 'invalid-batch', 'delete-only', 'ren
     }
     assert.equal(
       (await f.load(seventh)).body,
-      invalid || renameOnly
+      rejected || renameOnly
         ? beforeMove
         : deletionOnly
           ? beforeMove.replace(removeDialogue.quote, '')
@@ -316,7 +346,7 @@ for (const variant of ['stepwise', 'batch', 'invalid-batch', 'delete-only', 'ren
       .filter((r) => r?.tool === 'book_patch_chapter');
     assert.deepEqual(
       patches.map((r) => r.commitCount),
-      stepwise ? [1, 1] : invalid ? [0] : renameOnly ? [] : [1],
+      stepwise ? [1, 1] : rejected ? [0] : renameOnly ? [] : [1],
     );
     if (stepwise) assert.notEqual(patches[0].commits[0].revision, patches[1].commits[0].revision);
     const observed = run.trace.rows.filter((row) => row.event === 'chapter.patch.part');
@@ -529,7 +559,7 @@ for (const kind of ['reused', 'author-edited', 'resumed'] as const) {
   });
 }
 
-for (const variant of ['invalid-evidence', 'invalid-verdict', 'not-read'] as const) {
+for (const variant of ['invalid-evidence', 'invalid-verdict', 'companion-text', 'not-read'] as const) {
   test('an attempted new-draft correction fails closed: ' + variant, async (t) => {
     const f = await fixture(t, 9);
     const op = f.start(whole, [
@@ -545,7 +575,9 @@ for (const variant of ['invalid-evidence', 'invalid-verdict', 'not-read'] as con
       },
       ...(variant === 'invalid-verdict'
         ? [() => use('submit_chapter_patch_review', { allowed: 'yes' })]
-        : []),
+        : variant === 'companion-text'
+          ? [() => ({ ...decision(true), text: reviewNote })]
+          : []),
       ({ history }) => {
         assert.match(latest(history), /patch_evidence/);
         return text('勘误证据不足，没有写入。');
@@ -640,10 +672,11 @@ for (const prompt of ['解决未清理的问题', '把上面那几项处理掉']
         () => f.patch(original),
         ({ tools }) => {
           assert.equal(tools[0].name, 'submit_chapter_patch_review');
-          return decision(true);
+          return { ...decision(true), text: reviewNote };
         },
         ({ history }) => {
           assert.match(latest(history), /"patched":1/);
+          assert.doesNotMatch(JSON.stringify(history), new RegExp(reviewNote));
           return text('已核对并改正');
         },
       ],
@@ -654,9 +687,122 @@ for (const prompt of ['解决未清理的问题', '把上面那几项处理掉']
     assert.equal(run.status, 'completed', run.error);
     assert.equal(run.progress?.complete, true);
     assert.equal(run.progress?.done, 1);
-    assert.equal((await f.load(10)).body, original.body.replace(injury, correction));
+    const saved = await f.load(10);
+    assert.equal(saved.body, original.body.replace(injury, correction));
+    const receipt = (await f.history()).find(
+      ({ toolReceipt }) => toolReceipt?.tool === 'book_patch_chapter',
+    )?.toolReceipt;
+    assert.equal(receipt?.commits[0]?.revision, saved.revision);
+    const review = applied.trace.rows.find(({ event }) => event === 'chapter.patch.review');
+    const commit = applied.trace.rows.find(({ event }) => event === 'workspace.document.committed');
+    assert.equal(review?.fields.verdict, 'approved');
+    assert.equal(review?.fields.hasVisibleText, true);
+    assert.ok(review?.fields.spanId && commit?.fields.callId);
+    assert.equal(review.fields.callId, commit.fields.callId);
+    assert.equal(review.fields.runId, commit.fields.runId);
+    assert.doesNotMatch(JSON.stringify(applied.trace.rows), new RegExp(reviewNote));
     assert.deepEqual(applied.trace.rejected, []);
   });
+}
+
+const scopedReviewFailures: [string, Script, string, boolean | undefined][] = [
+  ['explicit denial with text', () => ({ ...decision(false), text: reviewNote }), 'denied', true],
+  ['explicit denial without text', () => decision(false), 'denied', false],
+  ['text only', () => text(reviewNote), 'invalid_verdict', true],
+  [
+    'two calls',
+    () => ({ ...text(''), calls: [...decision(true).calls, ...use('other', {}).calls] }),
+    'invalid_verdict',
+    false,
+  ],
+  ['wrong tool', () => use('other', { allowed: true }), 'invalid_verdict', false],
+  [
+    'invalid JSON',
+    () => ({ ...text(''), calls: [{ ...decision(true).calls[0], args: '{' }] }),
+    'invalid_verdict',
+    false,
+  ],
+  [
+    'closed Messages reply with malformed arguments',
+    ({ onText }) => {
+      onText(reviewNote);
+      throw new MalformedMessagesArguments();
+    },
+    'invalid_verdict',
+    true,
+  ],
+  [
+    'non-boolean',
+    () => use('submit_chapter_patch_review', { allowed: 'true' }),
+    'invalid_verdict',
+    false,
+  ],
+  [
+    'extra property',
+    () => use('submit_chapter_patch_review', { allowed: true, commentary: reviewNote }),
+    'invalid_verdict',
+    false,
+  ],
+  [
+    'interrupted stream',
+    () => {
+      throw new DiagnosticFailure('incomplete_stream', reviewNote);
+    },
+    'incomplete',
+    undefined,
+  ],
+  [
+    'timeout',
+    () => {
+      throw new DOMException(reviewNote, 'TimeoutError');
+    },
+    'incomplete',
+    undefined,
+  ],
+];
+
+for (const [variant, review, verdict, hasVisibleText] of scopedReviewFailures) {
+  test(
+    'a scoped chapter patch does not treat an unusable response as approval: ' + variant,
+    async (t) => {
+      const f = await fixture(t);
+      const original = await f.load(10);
+      const op = f.start(
+        semantic,
+        [
+          () => use('tool_search', { query: 'book_get_context book_patch_chapter' }),
+          () =>
+            use('book_task_scope', {
+              items: [{ operation: 'chapter.patch', id: original.id, purpose: '核对伤因' }],
+            }),
+          () => use('check_book_scope', { allowed: true }),
+          () => read(10),
+          () => f.patch(original),
+          review,
+          ({ history }) => {
+            assert.match(latest(history), /patch_scope/);
+            assert.doesNotMatch(latest(history), new RegExp(reviewNote));
+            return text('未修改。');
+          },
+        ],
+        undefined,
+        true,
+      );
+      const result = await op.wait();
+      assert.equal(result.status, 'completed', result.error);
+      assert.equal(result.taskOutcome, 'incomplete');
+      assert.deepEqual(await f.load(10), original);
+      assert.equal(op.asked.filter((name) => name === 'submit_chapter_patch_review').length, 1);
+      assert.ok(!op.trace.rows.some(({ event }) => event === 'workspace.document.committed'));
+      const logged = op.trace.rows.filter(({ event }) => event === 'chapter.patch.review');
+      assert.deepEqual(
+        logged.map(({ fields }) => [fields.verdict, fields.hasVisibleText]),
+        [[verdict, hasVisibleText]],
+      );
+      assert.doesNotMatch(JSON.stringify(op.trace.rows), new RegExp(reviewNote));
+      assert.deepEqual(op.trace.rejected, []);
+    },
+  );
 }
 
 test('a read-only current instruction with a real previous quote does not unlock patch', async (t) => {

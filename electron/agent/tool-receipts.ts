@@ -42,6 +42,7 @@ const reasons = new Set([
   'patch_scope',
   'patch_evidence',
   'chapter_body_not_supported',
+  'asset_update_route',
   'novel_goal_required',
   'novel_goal_conflict',
   'novel_incomplete',
