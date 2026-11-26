@@ -1,8 +1,14 @@
 # Fiction Writer
 
-Windows 优先的本地小说编辑器，附带按作品组织会话与记忆的 Agent Harness。不开启 Harness，也不配置模型，就能写作。
+Fiction Writer 是一个面向 Windows 的本地 Markdown 小说编辑器。不配置模型，也能离线写作。
 
-## Windows 启动
+## 主要功能
+
+- **小说书库**：管理多部作品，整理人物、物品、场景、伏笔和全书大纲。
+- **章节编辑**：按章编写 Markdown 正文，稿件以本地文件保存。
+- **可选的 AI 写作助手（Harness）**：讨论剧情、整理设定、起草章节或整本小说。会话和记忆按作品隔离。
+
+## 快速开始（Windows）
 
 安装 Node.js 24 后，在项目目录运行：
 
@@ -11,132 +17,31 @@ npm ci
 npm run dev
 ```
 
-`npm run dev` 构建并启动 Electron 桌面窗口，不需要另起 Web 服务。也可以先运行 `npm run build`，再用 `npm start` 打开已构建的应用。首次安装／启动可能需要联网获取 Electron；编辑小说不需要联网。
+这会构建并启动 Electron 桌面窗口，无需另起 Web 服务。在书库点「新建小说」，填写小说名和简介，再点「编辑」进入工作区。新建章节即可写作，按 `Ctrl+S` 保存。
 
-## 写作与协作
+**想试用 AI 助手？** 在「设置」添加模型配置，填写名称、API Key、供应商基地址和模型 ID。基地址不要包含具体请求路径（如 `/chat/completions`）。保存后，进入小说编辑页，按 `Ctrl+Alt+I` 打开 Harness，例如输入「根据大纲写第一章」。
 
-1. **书库**：新建小说填小说名和简介，题材与文风选填。「编辑」进入工作区，可以再修改这些字段。搜索匹配小说名及作品文件中已有的作者元数据，不搜索题材。
-2. **工作区**：左栏可管理人物、物品、场景、伏笔、全书大纲和章节。点中章节直接编辑 Markdown，使用「保存」或 `Ctrl+S`。基本信息和正文的未保存草稿在应用内切页时保留；收到同一文件的新版本时会提示冲突，可复制自己的文字或重载已保存文件。
-3. **设置**：可以新增多条模型配置，每条填写名称、API Key、基地址、一个模型 ID。高级选项选择 Chat Completions、Responses 或 Anthropic Messages。地址保留供应商的前缀，由应用追加 `/chat/completions`、`/responses` 或 `/messages`；例如官方 DeepSeek 可用 `https://api.deepseek.com`、`deepseek-v4-flash` 和 Chat Completions。不要填写已包含操作名的 URL。「测试连接与工具」只发合成数据，分别报告是否连通、能否完成工具往返。
-4. **Harness**：先进入一本小说的编辑页，再按 `Ctrl+Alt+I` 或点右上角按钮。书库和设置页不提供入口。侧栏只显示当前作品的 Session（同名小说也分开）；第一条已保存的作者输入会成为会话标题。离开编辑页会关闭侧栏，不会中断后台任务，回来可从历史选回该会话。发送前可选配置、思考等级和 UTF-8 参考文件；默认 `high`，无法映射时显示采用模型默认思考设置。 输入框内按 `Enter` 发送、`Shift+Enter` 换行；中文输入法选字时的回车不发送，也可以继续点发送按钮。
-5. **直接发送任务**：同一输入框可讨论剧情、维护资料、写一章或写整本，不必选模式。例如「将希腊神话故事奥德赛写成小说，大概写10章左右。记得生成主体，伏笔和大纲和章节正文」。Agent 会按意图找到写作 Skill，用作品工具逐章保存；预览标为「生成中 · 未保存」，取消、断流或输出触限不会写半章。中断后可在同一 Session 发送「接着写完」：先核对现稿，保留已有正文，不自动启动。可在新消息里明确变更创作方向；需要参考文件时请重新添加。
+作品保存在系统「文档」文件夹下的 `Fiction_Writer/library`。备份或迁移时，复制整个作品目录；模型配置和会话历史不随作品目录迁移。
 
-小说会话使用 `book_get_context`、`book_apply_changes`、`book_generate_assets`、`book_generate_chapter` 和 `skill_search`／`skill_load`。 如果先只问一个可执行的修改方案，Agent 可以用 `book_propose_edits` 登记并展示建议，作品此时不变。工具在应用内注册，不需要启动 MCP 服务。旧普通目录会话及其后台能力仍保留，但不在小说侧栏里列出或新建。
+开发、测试和排障约定见 [AGENTS.md](AGENTS.md)。
 
-- **接着执行一份方案：** 在同一本书、同一 Session 先看 Agent 展示的明确方案，再说「嗯，就按这个来改」，不必重列资料名或 ID。确认只适用于那份方案；直接下达明确修改指令不必先看方案。涉及多章时各处按当前版本插入，保留范围外内容。只完成一部分会指出已保存与待改位置；可在同一会话说「继续」，先核对现稿，不重复已提交的段落。
-- **补主体或伏笔：** 可直接说「只给守灯人补说明，按现稿，不改正文」。整书生成时空卡不算交付，已写章节不会因为补卡被重写。手工仍可保留占位；如果正在写的章确实需要这条说明，工具会先提示缺少哪一项。
-- **从中间插章或改旧章：** 可以先在目录中放好位置，再要求 Harness 写这一章。它会核对前章和已有后接章的开场，写作请求只拿必要的衔接条件，不把后章当成已经发生的前文。书已写完后，也可以要求在中期新增角色登场；Writer 会按当前章的唯一原文锚点插入新增段落，可同步增补该章对应的大纲，不覆盖原文或改动其他章。新伏笔说明分「可见线索」和「回收真相」两节；旧伏笔如果没有可单独取用的埋设说明，需要先补充或确认安全摘录。冲突时报告来源，不自动改相邻章节。
+<details>
+<summary>按诊断编号查找本地日志</summary>
 
-## 作品与应用数据
+日志只写本机，位于 Electron 的 `app.getPath('userData')` 下的 `logs` 目录（Windows 默认 `%APPDATA%\fiction-writer\logs`）。每天分别写入 `frontend-YYYY-MM-DD.jsonl` 和 `backend-YYYY-MM-DD.jsonl`，保留本地当天及之前 29 天（共 30 天）。应用关闭时不清理，硬崩溃可能丢失尚未写入的记录。
 
-Windows 的作品库在系统「文档」文件夹下的 `Fiction_Writer/library`。每个作品以稳定 ID 命名，其中包含 `book.md`、`outline.md`、`subjects/`、`foreshadowing/`、`chapters/`。资源名称与关联记录在 Markdown 的 YAML frontmatter 或链接里；编辑器可以单凭这些文件重建作品。备份或迁移作品时复制整个作品目录。外部编辑的保存会触发重读；不能解析的文件保留原样并显示诊断。
-
-模型配置、加密的 API Key 和 Session JSONL（包括未完成整书任务的续接信息）在当前用户的 Electron 应用数据目录下（Windows 通常是 `%APPDATA%\fiction-writer`），不在作品库中。**同一个已保存配置供所有小说使用，新建小说不需要重新输入 Key。**API Key 由操作系统保护，不随稿件导出。不要把真实 Key 放进项目文件、参考文件或命令。单独复制 `profiles.json` 不会迁移本地解密环境；更换 Windows 用户或应用数据目录后，如提示无法解密，请在新环境的设置里重新填写 API Key。这类错误发生在发送模型请求之前，不是服务端返回的鉴权失败。
-
-## 记忆与上下文
-
-- **作品记忆**：每本书的 `.fiction-writer/memory.json` 保存本书的定位索引和作者约定，首次使用时建立。故事依据仍是已保存的 Markdown；每次召回按当前版本取原文片段，外部修改或删除后不再引用旧证据。新会话可按人物、物件或关键语句找回早期线索；实际写章请求也使用本书证据。写早章时不把后章正文当成已发生事实；大纲和伏笔作为计划。未保存预览、临时聊天和其他书的记忆不参与召回。
-- **长期约定**：可对 Harness 说「请记住：全书一律用第三人称有限视角」，也可以要求列出、更正或忘掉某条约定。每本书最多 16 条、共 3,000 字符，本轮明确指令优先。备份约定时一起保留侧车文件；索引本身可从现稿重建。
-- **写作请求**：主 Agent 阅读和讨论资料时用自己的上下文；调用生成工具后，Writer 从现稿筛选资料，在本地拼装对应模板，再发送独立的模型请求，不继承完整聊天或启动子 Agent。拼装本身不调用模型；生成与按需补读仍使用供应商用量。外层通常只收到保存、缺项或冲突回执；显式读取仍占外层上下文。
-- **会话压缩**：模型请求用保守的输入预算（计入中文、工具参数与协议块并预留输出），优先保留当前作者要求、近期完整工具往返和任务进度。会话过长时，在该 Session JSONL 追加私有摘要及边界；摘要服务失败则使用有限历史摘录。原聊天不改写、不串到其他会话。工具回执记录实际执行及已确认的写入、版本或失败，不保留原始工具参数或输出、隐藏思考和附件，也不会在重启后重放。
-- **边界**：作品召回使用本地关键词与原文索引，不依赖额外模型、向量库或定时 Dreaming。含糊查询可能找不到相关段落，补充线索名称或请求按原句查找更可靠。未知兼容端点的预算是估算，不是精确 tokenizer。
-
-### 手动验证
-
-先关闭旧窗口，在已构建的项目目录运行 `npm start`。进一本书，在较早章节中段保存一个独特线索（例如「灰珍珠的三道裂纹拼成渡港图」），另开一个 Session，请 Agent 找出灰珍珠的线索，或用它续写后续章。切换到另一本同名小说重复查询，应看不到前一本的线索。也可更改原段落再查询，确认不再引用旧值。整个过程复用设置中同一个供应商配置，不用再填 Key。
-
-## 本地诊断日志
-
-日志默认开启，只写本机，不上传。实际目录是 Electron 的 `app.getPath('userData')` 下的 `logs`，Windows 默认是 **`%APPDATA%\fiction-writer\logs`**。应用启动过后，在 PowerShell 打开它：
-
-```powershell
-$logDir = Join-Path $env:APPDATA 'fiction-writer\logs'
-explorer.exe $logDir
-```
-
-- `frontend-YYYY-MM-DD.jsonl` 记录界面启动、关键操作、通知序号缺口、重读文档及显示新修订或保留草稿的结果。
-- `backend-YYYY-MM-DD.jsonl` 记录主进程和后台生命周期、模型请求、Agent 轮次、工具校验与实际执行、Skill 检索、加载及实际发往模型的结果、整书目标核对和文件提交。工具结果已回传指交给下一次请求的传输层，不代表模型确认；Skill 已采用不代表模型遵循了规则。`context.checkpoint` 和 `context.compacted` 分别记录会话检查点及本轮工具历史裁减，只含计数和结果类别，不含摘要或稿件。
-
-两份日志都是 UTF-8，每行一个 JSON 对象。按电脑的**本地日历日期**分文件，同日重启追加到原文件，跨午夜自动切换。启动时和运行中清理，保留今天和之前 29 天的应用日志。临时清理失败时，同一天最多再尝试两次，重试至少间隔一分钟；应用关闭期间不清理，下次启动再处理。日志异步写入，正常退出给日志最多 750 毫秒收尾；硬崩溃、磁盘写入失败或队列溢出可能缺记录。一份日志拒写时，其他可写文件继续写入；可在后台日志恢复可写后查 `diagnostics.loss`。崩溃留下的破损行可跳过，不影响读取后续记录。
-
-### 模型额度
-
-设置中的「保存配置」会查询匹配的官方 DeepSeek 模型额度；查询失败或端点未适配时显示兜底来源。额度随全局配置保存，新建小说或重启不会再次查询。「测试连接与工具」仍独立验证流式请求，不是保存额度的前提。
-
-排查触限时，用 `runId` 找到 `model.budget_dispatched`，再按 `spanId` 对照 `model.finished`。`capabilitySource` 区分供应商声明、厂商兜底和通用兜底；`contextWindow` 和 `maxOutputTokens` 是该配置用于规划的上限，`purpose` 是本次用途，`estimatedInput` 是最后的输入估算，`maxTokens` 是实际发出的输出限额。派发不证明上游收到，也不是服务器实际用量。首次携带整书指南时，按同一个 `spanId` 对照 `skill.applied` 与 `model.budget_dispatched` 中的 `budgetBasis=first-whole-skill`；后续已生效的整书请求用 `active-whole-skill`。必要上下文超预算可能在派发前以 `context_limit` 失败，此时没有对应派发记录。
-
-Messages 小说主 Agent 明确触限时，可用 `model.output_limit_recovery` 区分实际的拆小续接（`dispatched`）、不适用或不可拆、已用完尝试、无进展及再次触限。按 `runId`、`turn`、`originalSpanId` 和续接请求的 `spanId` 核对；续接不提额，只做一个未完成的合法小动作。同一 Run 最多续接一次，出错响应中的工具不会执行，也不会重做已保存的内容。只凭 `tool` 和文件提交回执判断哪些动作实际落盘，不把触限估算当作供应商计费记录。
-
-### 按 Harness 诊断编号排查
-
-复制 Harness 错误旁的诊断编号：**运行已开始**时是 `runId`，**尚未启动就被拒绝**时是 `requestId`。下面的命令跨日期查两类文件，并把 Run 对应的原始请求一并找出来：
+复制 Harness 错误旁的诊断编号（运行已开始用 `runId`，启动被拒用 `requestId`），在 PowerShell 搜索两类日文件：
 
 ```powershell
 $logDir = Join-Path $env:APPDATA 'fiction-writer\logs'
 $id = '粘贴诊断编号'
-$rows = @(Get-ChildItem -LiteralPath $logDir -File |
+Get-ChildItem -LiteralPath $logDir -File |
   Where-Object { $_.Name -match '^(frontend|backend)-\d{4}-\d{2}-\d{2}\.jsonl$' } |
-  ForEach-Object {
-    Get-Content -LiteralPath $_.FullName -Encoding UTF8 | ForEach-Object {
-      if ($_.Trim()) { try { $_ | ConvertFrom-Json -ErrorAction Stop } catch {} }
-    }
-  })
-$requestIds = @($id; $rows | Where-Object { $_.fields.runId -eq $id } |
-  ForEach-Object { if ($_.fields.requestId) { $_.fields.requestId } })
-$rows | Where-Object { $_.fields.runId -eq $id -or $requestIds -contains $_.fields.requestId } |
-  Sort-Object time, logSeq | Format-List time, bootId, logSeq, source, event, fields
+  Select-String -SimpleMatch $id
 ```
 
-追查工具时用 `callId` 和 `spanId` 看调用是哪一轮发起、是否执行以及结果进了哪次请求。追查界面没更新时，在同一个 `workerId` 下用 `changeId`、`journalSeq`、修订指纹对照后台落盘和前台重读；`via: snapshot` 表示快照比已收到的通知更新，并不单独证明掉包。整书续接可对照 `novel.goal` 的 `register`／`resume` 和同一 Session 的 Run，查看实际章数、`chapterIndex` 和 `novel.chapter.reused`。`incomplete_stream` 和 `output_limit` 分别表示没有完整结束与输出触限；新版不再重放旧工作流检查点。文档和普通路径的引用是同一次启动内可比对的短指纹，不是文件名。
+用 `runId` 找到 `run.started` 后，还可用同一行的 `requestId` 查启动前的记录。核对作品记忆时，按 `runId` 找 `memory.recall.finished`，再按 `recallId` 找 `memory.context.dispatched`，用 `spanId` 对照 `memory.context.source`（实际带上的来源）和 `model.http`。召回不等于派发；派发只表示交给传输层，不代表供应商收到或模型采用。日志也可能缺失，不要仅凭缺少记录判断请求未发送。
 
-日志不会保存 API Key、提示词、正文、附件、原始工具参数或输出、命令、隐藏推理和异常原文，也不替代作品备份或 Session 历史。排障优先提供诊断编号及核对过的必要事件，不要提交日志文件或粘贴密钥配置。
+排障时可提供诊断编号和核对过的必要事件，不要提交原始日志或粘贴密钥配置。
 
-### 排查生成请求有没有带到资料
-
-按上面的 `runId` 查 `writing.context.*`。`writing.context.blocked` 表示必需资料不足、超预算或衔接冲突，当次没有发出生成请求。`writing.context.prepared` 的存在不代表已发送；用同一 `spanId` 找 `writing.context.dispatched`，确认采用的模板和最终纳入／省略的块数。`writing.context.issue` 可分辨真实空说明、结构问题、已有说明但当前不可见、锚点及预算；`writing.context.rejected_result` 表示已经收到过模型结果、但候选无效或输出触限，不算提交。`writing.context.group` 分别显示主体、伏笔、前文等各组计数，`writing.context.source` 最多记录 12 条实际取用资料的脱敏文档／修订指纹。它们不会记录提示词或原文，派发也不证明供应商已收到或模型采纳。正文断流重试有不同的 `spanId`。
-
-### 排查方案续接和 Messages 参数恢复
-
-`writing.edit.scope` 的 `editMode` 区分直接指令、仅提案、承接确认及未形成范围。核对实际写入要看 `workspace.document.committed` 和工具回执，不能只看 Run 结束。若一处增补成功、另一处因版本变化未写，后者仍待处理；先核对现稿，不重写已保存段落。
-
-外层 Messages 收到正常结束但参数 JSON 无法解析时，原批次不会执行，Writer 只重取同一轮一次。按 `runId`、`turn` 查 `model.messages_arguments_invalid` 和有限的 `model.messages_argument_block`，再用 `model.arguments_retry` 的 `originalSpanId` 与新 `spanId` 关联两次尝试；有效工具执行只可能来自合法响应。仍失败时会显示诊断编号并保留已保存内容。结束标志、分片数和字节计数不证明坏分片来自哪一侧；断流、触限、鉴权和合法 JSON 的工具 Schema 错误不走这一恢复。
-
-### 排查作品记忆
-
-用上面命令读取 `$rows`，把 `$id` 设为本次 `runId`。成功运行未显示诊断编号时，可以在后台日志按时间找到对应的 `run.started`，取 `fields.runId`。只看本次记忆和模型响应：
-
-```powershell
-$rows | Where-Object { $_.fields.runId -eq $id -and
-  ($_.event -like 'memory.*' -or $_.event -eq 'model.http') } |
-  Sort-Object time, logSeq | Format-List time, bootId, event, fields
-```
-
-- **是否召回：** `memory.recall.finished` 的 `trigger` 区分明确目标章的写章取材 `draft` 和 Agent 主动调用 `tool`；首轮不预取。`outcome: ok` 且 `storyCount`、`planCount`、`referenceCount`、`conventionCount` 都为零是正常空结果，不是失败。显式 `book_memory_recall` 还可以用 `callId` 对照工具执行事件。
-- **索引是否刷新：** 用 `recallId` 找 `memory.index.finished`。`cacheAction` 为 `created`、`updated` 才表示实际写入；`unchanged` 表示未写，`degraded` 表示本次根据现稿在内存中处理，`cacheIssue` 可区分读失败、格式无效和写失败。降级仍可能正确召回。
-- **哪个请求带了证据：** 用 `recallId` 跟到 `memory.context.dispatched`，再用 `spanId` 对照 `memory.context.source` 和 `model.http`。正文重试使用新的 `spanId`。可以看证据类别、来源章序和文档／修订指纹；每次派发最多记录 8 个来源。同一 `bootId`、`workspaceRef` 下可以和文件提交事件比较指纹。派发只表示交给传输层，不代表上游收到或模型采纳；无对应的派发行也可能是本地日志缺失，不要把它当成模型没有收到的证明。
-
-## V1 边界
-
-- 书籍、资料、章节和 Session 的删除是硬删除，无撤销、归档或确认弹窗。删除运行中的 Session 或作品时先停止对应的后台任务；此前已经写成的其他内容不会回滚。
-- 切页、关闭侧栏或重载界面不打断任务。退出整个应用不继续执行；重启后可看历史，整书任务需作者在会话中明确要求继续。应用内批量修改不是数据库事务，遇到部分写入会报告已提交与未提交项。
-- 普通目录命令以当前 Windows 用户权限运行，没有额外沙箱或逐步审批。只在你信任的目录和任务上使用；不承诺撤回命令副作用。外部进程直接改稿时，应用只能核对磁盘并提示冲突，不能拦截它们。
-- 长篇优先给模型近期前文和相关素材，可在生成正文前补读有限的原文证据。记忆改善取材和续写，不保证模型推理出的剧情一致，仍需作者核对。
-
-## 验证
-
-```powershell
-npm run typecheck
-npm test
-npm run test:e2e
-openspec validate --all --strict
-```
-
-回归测试使用临时库和本地合成端点，覆盖三种协议在压缩后继续工具往返、应用重启和两本书共用一个密钥、同名书隔离、第 25 章跨会话取回第 2 章线索、源稿修改／删除、切页后接回预览，以及自然语言驱动的整书 Skill 在断流或输出触限后的重启续接。诊断测试用合成敏感值核对两份日志，并回溯工具拒绝、文件通知缺口和整书实际提交。Windows 上另用 `deepseek-v4-flash` 验证了真实的 Chat Completions 流式工具往返；Responses 和 Anthropic Messages 的验证是本地协议夹具，不代表每个兼容网关都能工作。
-
-隔离的 Electron 桌面测试默认在后台运行，不弹出窗口；仍通过真实渲染器和 IPC 操作。仅在需要观察界面时，运行前设置 `$env:FW_E2E_SHOW_WINDOW = '1'`。正常启动 Writer 不受影响。
-
-可选真实 DeepSeek 验证（读取已被 Git 忽略的 `design/ds_config.txt`，只向官方端点发少量合成请求，不读取作品，也不打印 Key）：
-
-```powershell
-npm run test:deepseek -- --live
-```
+</details>
