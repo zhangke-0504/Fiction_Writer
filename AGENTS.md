@@ -47,12 +47,26 @@ A backup provider configuration is available locally at `design/20261123/ds_conf
 
 ## Harness Diagnostics
 
-Use the [README](README.md) to locate logs and the [logging spec](openspec/specs/local-diagnostic-logging/spec.md) and [event contract](electron/diagnostics/contract.ts) to interpret events. Keep diagnostics local and allowlisted; never attach raw logs, credentials, or manuscript text.
+Search logs in the environment where the error occurred. Logs stay on the local machine, in `logs` under Electron's `app.getPath('userData')` (typically `%APPDATA%\fiction-writer\logs` on Windows). The app writes `frontend-YYYY-MM-DD.jsonl` and `backend-YYYY-MM-DD.jsonl` for each local day and keeps today plus the previous 29 days. It does not prune while closed; a hard crash can lose unflushed records.
 
-- Trace a rejected start by `requestId`, an accepted run by `runId`, a tool by `callId`, and a model request by `spanId`. A tool candidate or a finished run does not prove a write; verify the tool receipt and `workspace.document.committed`.
+Paste the diagnostic ID from the Harness error into this PowerShell query to search both daily log streams:
+
+```powershell
+$logDir = Join-Path $env:APPDATA 'fiction-writer\logs'
+$id = 'paste-diagnostic-id-here'
+Get-ChildItem -LiteralPath $logDir -File |
+  Where-Object { $_.Name -match '^(frontend|backend)-\d{4}-\d{2}-\d{2}\.jsonl$' } |
+  Select-String -SimpleMatch $id
+```
+
+Use the [logging spec](openspec/specs/local-diagnostic-logging/spec.md) and [event contract](electron/diagnostics/contract.ts) to interpret events. Share only the diagnostic ID and reviewed events needed for triage; do not post raw logs, credentials, provider configurations, or manuscript text.
+
+- **Runs and writes:** A rejected start has a `requestId`; an accepted run has a `runId`. Use the `requestId` in `run.started` to find events preceding the accepted run. Follow a tool by `callId` and a model request by `spanId`. A tool candidate or a finished run does not prove a write; verify the tool receipt and `workspace.document.committed`.
 - **Scoped follow-up:** Within the same `runId`, find the registration call and `writing.task_scope`. On each chapter patch `callId`, match `chapter.patch.review` and `model.finished` by review `spanId`; `hasVisibleText` describes the reply, not the verdict. No review event can mean the patch was blocked earlier. For asset writes, distinguish schema rejection (`tool.rejected`) from unsupported routing (`tool.finished` with `asset_update_route`) and inspect `asset.patch.finished` for scope, evidence, or revision failures. Compare same-call commit and result revision fingerprints, then check the tool receipt against the current document revision. `writing.task_result` can be `partial` even when the run ends normally.
-- For a stale editor view, match backend commits and frontend rereads within the same `workerId` using `changeId`, `journalSeq`, and revision fingerprints. A newer snapshot alone does not prove a dropped notification.
-- For missing writing context or output limits, compare `writing.context.*`, `model.budget_dispatched`, and `model.finished` as applicable. Use `model.arguments_retry` or `model.output_limit_recovery` to link retries to their original request; retries have distinct `spanId` values. Dispatch is not proof of upstream receipt or model adoption.
+- **Editor updates:** Match backend commits and frontend rereads within the same `workerId` using `changeId`, `journalSeq`, and revision fingerprints. A newer snapshot alone does not prove a dropped notification.
+- **Book memory:** Find `memory.recall.finished` by `runId`, then `memory.context.dispatched` by `recallId`. Use `spanId` to compare `memory.context.source` with `model.http`. A recall is not a dispatch; dispatch means handoff to transport, not provider receipt or model adoption. Missing logs do not prove there was no dispatch.
+- **Long manuscript reads:** Match `model.budget_dispatched` (estimated input and requested output limit) with `context.projected` (estimated reread size and projection counts for the current turn and retained history) by `runId` and `spanId`. The `delivery` field on `tool.result_sent` distinguishes full and projected results; `tool.result_omitted` means the result was not sent.
+- **Request failures:** For missing writing context or output limits, compare `writing.context.*`, `model.budget_dispatched`, and `model.finished` as applicable. On Chat, `model.finished` with `providerStop: output_limit` is an explicit length stop; `incomplete_stream` alone is not. Local timeouts and cancellation have separate reasons. Chat does not use the Messages continuation path. Use `model.arguments_retry` or `model.output_limit_recovery` to link retries to the original request; each retry has a distinct `spanId`.
 
 ## Commits and Pull Requests
 

@@ -122,12 +122,12 @@
 - **WHEN** 应用正常退出时日志队列未空，分别模拟健康磁盘和卡住的写入
 - **THEN** 健康情况下在受限收尾中写到退出事件；写入故障时应用不会无限等待或试图同步写入全部缓冲
 
-### Requirement: README explains local troubleshooting
-README SHALL 写明实际日志目录的来源、Windows 默认路径、两种日文件、30 天边界、关闭期间与硬崩溃的限制及如何按诊断编号查找两份文件。Harness 中适用的失败 SHALL 给出可复制的编号：已开始的运行使用 `runId`，启动拒绝使用 `requestId`。文档须说明不要为了排查提交外部日志或复制原始密钥配置。
+### Requirement: Maintainer documentation explains local troubleshooting
+维护者排障文档 SHALL 写明实际日志目录的来源、Windows 默认路径、两类日文件、30 天留存边界、应用关闭及硬崩溃时的限制，并说明如何按诊断编号查找两类文件。Harness 中适用的失败 SHALL 给出可复制的编号：已开始的运行使用 `runId`，启动拒绝使用 `requestId`。文档须说明不要为了排查上传原始日志或复制原始密钥配置。
 
-#### Scenario: Locate and correlate files without developer tools
-- **WHEN** 用户看到 Harness 运行失败或启动请求拒绝并打开 README
-- **THEN** 可用界面的编号和 README 的 Windows 路径与命令，在本地两份日文件查找相关记录，不需要本地或远端日志平台
+#### Scenario: Locate and correlate files without a log platform
+- **WHEN** 维护者拿到 Harness 运行失败或启动拒绝的诊断编号，并且能访问产生该编号的本机日志
+- **THEN** 维护者可按排障文档中的 Windows 路径和命令，在两类日文件中查找相关记录，无需本地或远端日志平台
 
 ### Requirement: Book memory recall and index outcomes are traceable
 后台 SHALL 为 写章工具按明确目标章取材和主 Agent 显式调用的 `book_memory_recall` 写入可区分来源的诊断终态，关联同一运行、已绑定作品和本次召回；显式工具另可关联调用。成功时 SHALL 记录已存正文证据、计划、参考资料及作者约定各自的条数，区分空结果、失败和取消。处理索引时 SHALL 区分复用、首次建立、实际持久化刷新和内存降级；读异常、格式无效和写失败 SHALL 可区分。诊断本身不得改变召回结果、写章或作者约定的提交行为。
@@ -145,7 +145,7 @@ README SHALL 写明实际日志目录的来源、Windows 默认路径、两种�
 - **THEN** 日志分别显示读取、格式或写入降级，仍可报告从现稿召回的正确计数；不记录成刷新成功、不阻止读取或正常写章，也不把显式约定保存失败记成成功
 
 ### Requirement: Dispatched model context identifies the book memory it carried
-后台 SHALL 仅在携带非空召回结果的模型请求实际交给传输层后记录该次携带事实，区分 Agent 已调用工具后携带的工具结果与正文生成请求按明确目标章携带的取材。显式调用可复用工具结果派发与召回诊断的调用关联，不需要另建首轮自动召回事迹。事件 SHALL 关联召回与本次模型 `spanId`，有界地记录发送的类别计数、唯一来源的安全文档及修订指纹、已知的来源章序。诊断 MUST NOT 将计划、命中、开始构建请求或实际派发当作模型采用。新增事件 SHALL 沿用仅本地、worker 白名单、非阻塞写入和原有留存规则。README SHALL 说明如何按 `runId`、`recallId`、`spanId` 核对这些证据及其边界。
+后台 SHALL 仅在携带非空召回结果的模型请求实际交给传输层后记录该次携带事实，区分 Agent 已调用工具后携带的工具结果与正文生成请求按明确目标章携带的取材。显式调用可复用工具结果派发与召回诊断的调用关联，不需要另建首轮自动召回事迹。事件 SHALL 关联召回与本次模型 `spanId`，有界地记录发送的类别计数、唯一来源的安全文档及修订指纹、已知的来源章序。诊断 MUST NOT 将计划、命中、开始构建请求或实际派发当作模型采用。新增事件 SHALL 沿用仅本地、worker 白名单、非阻塞写入和原有留存规则。维护者排障文档 SHALL 说明如何按 `runId`、`recallId`、`spanId` 核对这些证据及其边界。
 
 #### Scenario: Correlate early chapter evidence with the actual prose request
 - **WHEN** 受控测试让第 25 章的新会话经显式记忆工具取得第 2 章证据并交给后续 Agent 请求，独立正文请求按目标章取材时也实际携带该证据
