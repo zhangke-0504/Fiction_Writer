@@ -66,6 +66,8 @@ const reasons = new Set([
   'partial_write',
   'io_failure',
   'result_limit',
+  'task_budget',
+  'task_capacity',
   'tool_failed',
 ]);
 const docTypes = ['book', 'outline', 'subject', 'clue', 'chapter'];

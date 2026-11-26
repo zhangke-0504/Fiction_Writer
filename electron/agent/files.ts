@@ -16,7 +16,7 @@ import {
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { WorkspaceService } from '../workspace.js';
 import { runCommand, CommandStopError } from './commands.js';
-import { object, str, type LocalTool } from './loop.js';
+import { object, str, type LocalTool, type ReadToolContext } from './local-tool.js';
 import type { RunContext } from './runs.js';
 
 function inside(root: string, path: string) {
@@ -61,6 +61,7 @@ async function readText(path: string, signal: AbortSignal, max = MAX_FILE) {
       if (!read.bytesRead) break;
       bytesRead += read.bytesRead;
     }
+    signal.throwIfAborted();
     if (bytesRead > max) throw new Error('文本文件超出大小限制');
     if (data.subarray(0, bytesRead).includes(0)) throw new Error('只支持 UTF-8 文本文件');
     return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
@@ -76,6 +77,7 @@ async function* walk(
   budget = { left: 4000 },
   depth = 0,
 ): AsyncGenerator<string> {
+  signal.throwIfAborted();
   if (depth > 12 || budget.left <= 0) return;
   for await (const entry of await opendir(root)) {
     signal.throwIfAborted();
@@ -85,6 +87,15 @@ async function* walk(
     if (entry.isDirectory()) yield* walk(path, signal, budget, depth + 1);
     else if (entry.isFile()) yield path;
   }
+  signal.throwIfAborted();
+}
+function fileTool<Context extends ReadToolContext>(
+  name: string,
+  description: string,
+  schema: Record<string, unknown>,
+  execute: LocalTool<Context>['execute'],
+): LocalTool<Context> {
+  return { name, description, schema, execute };
 }
 
 export class FileTools {
@@ -163,21 +174,16 @@ export class FileTools {
     }
     return { path: relative(ctx.session.cwd, path) };
   }
-  tools(): LocalTool[] {
+  readTools(): LocalTool<ReadToolContext>[] {
     const field = str('相对工作目录的路径', 4096);
-    const content = { type: 'string', maxLength: MAX_FILE };
-    const deliver = (
-      name: string,
-      description: string,
-      schema: Record<string, unknown>,
-      execute: LocalTool['execute'],
-    ): LocalTool => ({ name, description, schema, execute });
+    const deliver = fileTool<ReadToolContext>;
     return [
       deliver(
         'list_files',
         '列出工作目录中的文件。',
         object({ path: field }, []),
         async ({ path = '.' }, ctx) => {
+          ctx.signal.throwIfAborted();
           const root = await this.path(ctx.session.cwd, path, false),
             files: string[] = [];
           for await (const file of walk(root, ctx.signal)) {
@@ -199,6 +205,7 @@ export class FileTools {
         '在 UTF-8 文件中查找文本，返回文件、行号和截短的匹配行。',
         object({ query: str(undefined, 1000), path: field }, ['query']),
         async ({ query, path = '.' }, ctx) => {
+          ctx.signal.throwIfAborted();
           const root = await this.path(ctx.session.cwd, path, false),
             found: { path: string; line: number; text: string }[] = [];
           const needle = String(query).toLowerCase();
@@ -247,6 +254,7 @@ export class FileTools {
           ['path'],
         ),
         async ({ path, start = 1, lines = 500 }, ctx) => {
+          ctx.signal.throwIfAborted();
           const file = await this.path(ctx.session.cwd, path, false);
           if (!(await stat(file)).isFile()) throw new Error('不是普通文件');
           const text = await readText(file, ctx.signal);
@@ -267,6 +275,14 @@ export class FileTools {
           };
         },
       ),
+    ];
+  }
+  tools(): LocalTool[] {
+    const field = str('相对工作目录的路径', 4096);
+    const content = { type: 'string', maxLength: MAX_FILE };
+    const deliver = fileTool<RunContext>;
+    return [
+      ...this.readTools(),
       deliver(
         'write_file',
         '创建或覆盖 UTF-8 文件；小说资产应优先使用小说专用工具。',

@@ -4,6 +4,7 @@ import { contextOverflow, excerpt, inputEstimate } from './context-budget.js';
 import type { AssistantTurn, ToolSpec, Turn } from './model.js';
 import { recentReceiptLimit, type ToolReceipt } from './tool-receipts.js';
 import { projectReadResult, readIdentity, readResultBudget } from './tool-context.js';
+import { projectTaskReports, taskReportBudget, type TaskWaitResult } from './task-result.js';
 
 type ResultTurn = Extract<Turn, { role: 'tool' }>;
 export type ProtectedResult = Pick<ResultTurn, 'id' | 'result'>;
@@ -139,8 +140,11 @@ export class ActiveContext {
     let newReadEstimate = 0,
       historicalReadEstimate = 0,
       projectedResults = 0;
+    let newTaskEstimate = 0,
+      historicalTaskEstimate = 0;
     const selections: ResultTurn[][] = [];
     const seen = new Set<string>();
+    const seenTasks = new Set<string>();
     const latest = this.cycles.length - 1;
     for (let c = latest; c >= 0; c--) {
       const cycle = this.cycles[c];
@@ -152,6 +156,21 @@ export class ActiveContext {
       );
       selections[c] = cycle.results.map((row, i) => {
         const tool = cycle.assistant.calls[i].name;
+        if (tool === 'wait_tasks' && row.result.ok) {
+          const remaining = historical
+            ? taskReportBudget.history - historicalTaskEstimate
+            : taskReportBudget.batch - newTaskEstimate;
+          const reports = projectTaskReports(
+            row.result.value as TaskWaitResult,
+            Math.min(remaining, allowance),
+            seenTasks,
+          );
+          allowance -= reports.cost;
+          if (historical) historicalTaskEstimate += reports.cost;
+          else newTaskEstimate += reports.cost;
+          if (reports.value === row.result.value) return row;
+          return { ...row, result: { ...row.result, value: reports.value } };
+        }
         const lane = historical
           ? readResultBudget.history - historicalReadEstimate
           : readResultBudget.batch - newReadEstimate;
@@ -173,7 +192,14 @@ export class ActiveContext {
         return { ...row, result: { ...row.result, value: projected.value } };
       });
     }
-    return { selections, newReadEstimate, historicalReadEstimate, projectedResults };
+    return {
+      selections,
+      newReadEstimate,
+      historicalReadEstimate,
+      projectedResults,
+      newTaskEstimate,
+      historicalTaskEstimate,
+    };
   }
 
   fit(limit: number, keep?: ProtectedResult, notice?: string, tools = this.tools) {
@@ -229,6 +255,10 @@ export class ActiveContext {
         newReadEstimate: selection.newReadEstimate,
         historicalReadEstimate: selection.historicalReadEstimate,
         projectedResults: selection.projectedResults,
+        ...(selection.newTaskEstimate && { newTaskEstimate: selection.newTaskEstimate }),
+        ...(selection.historicalTaskEstimate && {
+          historicalTaskEstimate: selection.historicalTaskEstimate,
+        }),
       },
     };
   }

@@ -1,4 +1,4 @@
-import type { LocalTool } from './loop.js';
+import type { LocalTool, ReadToolContext } from './local-tool.js';
 
 const readTools = new Set([
   'list_files',
@@ -8,7 +8,8 @@ const readTools = new Set([
   'book_search_text',
   'book_memory_recall',
 ]);
-const controlTools = new Set(['skill_search', 'skill_load', 'book_task_scope']);
+const defaultControlTools = ['skill_search', 'skill_load', 'book_task_scope'];
+const controlTools = new Set([...defaultControlTools, 'start_task', 'wait_tasks', 'task_report']);
 const normalized = (text: string) => text.normalize('NFKC').toLowerCase().trim();
 
 function terms(text: string) {
@@ -20,21 +21,21 @@ function terms(text: string) {
 }
 
 /** Operates on one session-filtered catalog; only a new model request sees the selected schemas. */
-export function discoverTools(
-  tools: LocalTool[],
+export function discoverTools<Context extends ReadToolContext>(
+  tools: LocalTool<Context>[],
   bootstrap: readonly string[] = [],
 ): {
-  registry: LocalTool[];
-  visible: () => LocalTool[];
+  registry: LocalTool<Context>[];
+  visible: () => LocalTool<Context>[];
 } {
-  const exposed = new Set([...controlTools, ...bootstrap]);
+  const exposed = new Set([...defaultControlTools, ...bootstrap]);
   const indexed = tools.map((tool) => ({
     tool,
     corpus: normalized(
       `${tool.name} ${tool.description} ${Object.keys(tool.schema.properties ?? {}).join(' ')}`,
     ),
   }));
-  const search: LocalTool = {
+  const search: LocalTool<Context> = {
     name: 'tool_search',
     description:
       '在此会话检索可用工具。传简短的需求关键词或工具 ID。结果只是候选，不授权或执行；选中的 schema 从下一轮开始可用。',
@@ -64,11 +65,7 @@ export function discoverTools(
         candidates: selected.map(({ tool }) => ({
           id: tool.name,
           purpose: tool.description.slice(0, 480),
-          access: readTools.has(tool.name)
-            ? 'read'
-            : exposed.has(tool.name) && controlTools.has(tool.name)
-              ? 'control'
-              : 'write',
+          access: readTools.has(tool.name) ? 'read' : controlTools.has(tool.name) ? 'control' : 'write',
           parameters: Object.keys(tool.schema.properties ?? {}).slice(0, 20),
           required: tool.schema.required,
         })),

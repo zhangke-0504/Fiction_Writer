@@ -15,6 +15,8 @@ import { SkillCatalog } from './agent/skills.js';
 import { isId } from './documents.js';
 import { NovelTools } from './agent/novel-tools.js';
 import { BookTaskScope } from './agent/task-scope.js';
+import { taskReadTools } from './agent/task-read-tools.js';
+import { createTaskTools } from './agent/task-tools.js';
 import { bookMemoryTools } from './agent/book-memory.js';
 import {
   diagnosticScope,
@@ -129,8 +131,12 @@ async function startSession(args: StartRun, report: ReportDiagnostic, requestId?
     id,
     prompt,
     async (ctx) => {
+      const delegation = !test || process.env.FW_TEST_DISABLE_DELEGATION !== '1';
       let system =
         '你是 Fiction Writer 的本地 Agent。根据当前用户消息和同会话历史理解请求。只读或讨论时不修改；明确指向上文的执行请求可直接处理。需要新能力时用 tool_search 检索，候选不是授权。只在绑定目录工作。根据工具结果核对实际产物；不声称未完成的工作已保存。';
+      if (delegation)
+        system +=
+          '\n较大的独立只读调查可用 tool_search 发现 start_task、wait_tasks；只传必要约束和引用。启动后可推进独立工作，需要结果时再等；子报告不算你已读原文或已获得写入范围。';
       let tools = files.tools();
       let novel: NovelTools | undefined;
       if (selectedChapterId) system += `\n本轮开始时作者选中的章节 ID：${selectedChapterId}。`;
@@ -140,7 +146,8 @@ async function startSession(args: StartRun, report: ReportDiagnostic, requestId?
         const bookId = ctx.session.bookId;
         system += `\n当前绑定小说 ID：${bookId}。修改正文、大纲或故事资料前用 book_task_scope 登记当前作者允许的有界动作；同会话局部续办可用 sourceQuote 指向可见回复，读现稿并登记仍有依据的待办。同章搬移的旧处删除与新处补入分别登记 part，尽量同批保存；分步则每次读新版本后继续。跟进实际提交及必要的大纲、资料同步，不把一次提交当成全部完成。只读不用登记。按需用 skill_search / skill_load。整书由你理解本轮指向；加载 generate-novel，用 book_task_scope 的 novel.register 或 novel.resume 登记整书动作，再调用 book_get_context.novelGoal 激活完整目标。不要用逐章登记代替，不覆盖已有正文。保留作者的关联数量和实际剧情先后；迹象、出场、埋设和计划回收并不等同。`;
         if (ctx.continuation)
-          system += '\n当前会话有可续接的整书记录；只有本轮作者要求续接才可承接，使用 novel.resume / novelGoal.resume。';
+          system +=
+            '\n当前会话有可续接的整书记录；只有本轮作者要求续接才可承接，使用 novel.resume / novelGoal.resume。';
         const scope = new BookTaskScope(ctx, prompt, provider);
         novel = new NovelTools(workspace, bookId, provider, skills, {
           authorPrompt: prompt,
@@ -162,10 +169,30 @@ async function startSession(args: StartRun, report: ReportDiagnostic, requestId?
           ...bookMemoryTools(workspace, bookId),
         ];
       }
+      const fixtureTaskMs = test ? Number(process.env.FW_TEST_TASK_TIMEOUT_MS) : NaN;
+      const tasks = delegation
+        ? createTaskTools(
+            ctx,
+            provider,
+            taskReadTools(workspace, files, ctx.session),
+            Number.isSafeInteger(fixtureTaskMs) && fixtureTaskMs > 0 && fixtureTaskMs < 180_000
+              ? { taskMs: fixtureTaskMs }
+              : undefined,
+          )
+        : undefined;
       try {
-        await runAgent(ctx, provider, system, [], prompt, tools, novel, {
-          bootstrap: ['book_task_scope'],
-        });
+        await runAgent(
+          ctx,
+          provider,
+          system,
+          [],
+          prompt,
+          tasks ? [...tools, ...tasks.tools] : tools,
+          novel,
+          {
+            bootstrap: ['book_task_scope'],
+          },
+        ).finally(tasks?.close);
       } catch (error) {
         await novel?.reportInterruptedTask(ctx).catch(() => {});
         if (classified(error, ctx.signal) === 'iteration_limit') novel?.restorePrimaryFailure();

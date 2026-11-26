@@ -106,6 +106,10 @@ const reason = one(
   'batch_invalid',
   'invalid_call',
   'result_limit',
+  'task_budget',
+  'task_capacity',
+  'task_deadline',
+  'task_no_report',
   'context_limit',
   'invalid_memory',
   'memory_limit',
@@ -143,7 +147,8 @@ const reason = one(
   'user',
   'unknown',
 );
-const lane = one('agent', 'asset', 'draft', 'readback', 'probe', 'compaction');
+const lane = one('agent', 'asset', 'draft', 'readback', 'probe', 'compaction', 'task');
+const taskStatus = one('running', 'completed', 'partial', 'failed', 'timed_out', 'cancelled');
 const tool = one(
   'list_files',
   'search_text',
@@ -167,6 +172,9 @@ const tool = one(
   'book_memory_forget',
   'tool_search',
   'book_task_scope',
+  'start_task',
+  'wait_tasks',
+  'task_report',
   'skill_search',
   'skill_load',
   'fixture_value',
@@ -275,6 +283,7 @@ const core: Schema = {
   changeId: uuid,
   turn: count,
   callId: uuid,
+  taskId: uuid,
   lane,
 };
 const final: Schema = { outcome, reason, elapsedMs: duration };
@@ -482,6 +491,8 @@ const diag = new Map<string, Definition>(
       newReadEstimate: count,
       historicalReadEstimate: count,
       projectedResults: count,
+      newTaskEstimate: count,
+      historicalTaskEstimate: count,
     }),
     'context.compacted': worker({ count, omittedCount: count }),
     'context.checkpoint': worker({ count, source: one('model', 'excerpt') }),
@@ -535,6 +546,31 @@ const diag = new Map<string, Definition>(
     }),
     'loop.round.started': worker({}),
     'loop.round.finished': worker({ ...final, toolCount: count }),
+    'task.accepted': worker({ activeCount: count }, undefined, ['runId', 'taskId', 'callId']),
+    'task.finished': worker(
+      {
+        taskStatus,
+        reason,
+        hasReport: bool,
+        attemptedRequests: count,
+        readCount: count,
+        elapsedMs: duration,
+      },
+      undefined,
+      ['runId', 'taskId', 'taskStatus'],
+    ),
+    'task.wait_finished': worker({ count, activeCount: count, timedOut: bool, elapsedMs: duration }),
+    'task.wait_status': worker({ taskStatus, hasReport: bool }, undefined, [
+      'runId',
+      'taskId',
+      'callId',
+    ]),
+    'task.report_dispatch': worker({ delivery: one('full', 'projected') }, undefined, [
+      'runId',
+      'taskId',
+      'spanId',
+      'callId',
+    ]),
     'tool.batch_rejected': worker({ count, omitted: count, reason }, 'warn'),
     'tool.requested': worker({ tool, fieldCount: count, unknownFieldCount: count }),
     'tool.validated': worker({ tool, fieldCount: count }),

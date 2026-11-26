@@ -31,7 +31,7 @@ export class MessagesOutputLimit extends ProviderError {
   }
 }
 // A diagnostic distinction only: Chat deliberately keeps its existing failure/recovery behavior.
-class ChatOutputLimit extends ProviderError {
+export class ChatOutputLimit extends ProviderError {
   constructor() {
     super('模型达到输出上限，未提交响应', 'protocol', 'incomplete_stream');
   }

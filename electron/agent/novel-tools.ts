@@ -9,14 +9,7 @@ import type {
   WriteReport,
 } from '../../shared/contracts.js';
 import type { WorkspaceService, Guard } from '../workspace.js';
-import {
-  chapterPlacementFingerprint,
-  digest,
-  docKey,
-  isId,
-  renderDocument,
-  storyBeats,
-} from '../documents.js';
+import { chapterPlacementFingerprint, digest, docKey, isId, renderDocument } from '../documents.js';
 import { draftChapter, DraftCommitFailure, InsertionQualityFailure } from './draft.js';
 import type { ChapterPlan } from './chapter-boundary.js';
 import {
@@ -75,16 +68,18 @@ import {
   type NarrowedWritingStep,
 } from './loop.js';
 import { hasStoryDescription } from './story-notes.js';
+import { type DocumentPage, type ReadDocument } from './tool-context.js';
 import {
-  charBoundary,
-  documentRef,
-  documentRow,
-  fitBookPage,
-  type BookHit,
-  type DocumentPage,
-  type ReadDocument,
-  type ReadPage,
-} from './tool-context.js';
+  bookContextDescription,
+  bookContextProperties,
+  bookDocumentIdSchema as idSchema,
+  bookIndexReadKey,
+  bookRevisionSchema as revisionSchema,
+  bookSearchTool,
+  readBookContext,
+  type BookContextArgs,
+  type ReferenceIndex,
+} from './book-read-tools.js';
 import type { ModelProvider } from './model.js';
 import type { SkillCatalog, SkillName } from './skills.js';
 import type { RunContext } from './runs.js';
@@ -141,10 +136,6 @@ type Mutation = {
   fields?: Record<string, unknown>;
   body?: string;
 };
-const typeSchema = { type: 'string', enum: ['book', ...activeTypes] };
-const idSchema = str('使用文件的稳定 ID，而不是名称', 128);
-const page = { type: 'integer', minimum: 0 };
-const revisionSchema = { type: 'string', pattern: '^[a-f0-9]{64}$' };
 const editIdList = { type: 'array', maxItems: maxEditTargets, uniqueItems: true, items: idSchema };
 const editPlanSchema = object({
   summary: str('简短、可展示的修改目的；不写正文或整份说明', 800),
@@ -192,30 +183,6 @@ const editPlanSchema = object({
     ),
   },
 });
-const indexes = ['chapters', 'subjects', 'beats'] as const;
-type ReferenceIndex = (typeof indexes)[number];
-const indexPageSize = 60;
-function referenceIndex(documents: Manuscript[], index: ReferenceIndex, offset: number) {
-  const rows =
-    index === 'beats'
-      ? [...new Set(storyBeats(documents.find((doc) => doc.type === 'outline')?.body ?? ''))].map(
-          (id) => ({ id }),
-        )
-      : documents
-          .filter((doc) => doc.type === (index === 'chapters' ? 'chapter' : 'subject'))
-          .map(({ id, fields, body }) =>
-            index === 'chapters'
-              ? { id, title: fields.title?.slice(0, 120), order: fields.order, hasBody: !!body.trim() }
-              : { id, name: fields.name?.slice(0, 120), kind: fields.kind },
-          );
-  return {
-    index,
-    offset,
-    rows: rows.slice(offset, offset + indexPageSize),
-    nextOffset: offset + indexPageSize < rows.length ? offset + indexPageSize : null,
-    pageState: offset + indexPageSize < rows.length ? 'partial' : 'complete',
-  };
-}
 const fieldSchema = object(
   {
     title: str(undefined, 500),
@@ -262,14 +229,6 @@ function editWriteContext(ctx: RunContext) {
     },
   };
 }
-
-const priority: Record<Manuscript['type'], number> = {
-  book: 0,
-  outline: 1,
-  subject: 2,
-  clue: 3,
-  chapter: 4,
-};
 
 type BookReads = {
   readSet: Map<string, Guard>;
@@ -564,7 +523,7 @@ export class NovelTools {
       );
     };
     const readIndex = (index: ReferenceIndex) => {
-      if (reads.targetedReads.has(this.indexReadKey(docs, index, 0))) return;
+      if (reads.targetedReads.has(bookIndexReadKey(docs, index, 0))) return;
       add(
         'book_get_context',
         `核对 ${index} 索引首页`,
@@ -883,9 +842,6 @@ export class NovelTools {
   private documentReadKey(doc: Guard, offset: number) {
     return `${docKey(doc)}:${doc.revision}:${offset}`;
   }
-  private indexReadKey(docs: Manuscript[], index: ReferenceIndex, offset: number) {
-    return `index:${index}:${offset}:${digest(JSON.stringify(referenceIndex(docs, index, offset)))}`;
-  }
   restorePrimaryFailure() {
     const last = [...this.chapterFailures.values()].at(-1);
     if (this.wholeSkill && last) throw last;
@@ -1180,20 +1136,7 @@ export class NovelTools {
   private remember(doc: Guard, reads = this.reads) {
     reads.readSet.set(docKey(doc), { type: doc.type, id: doc.id, revision: doc.revision });
   }
-  private async context(
-    args: {
-      type?: Manuscript['type'];
-      documentId?: string;
-      offset?: number;
-      length?: number;
-      index?: ReferenceIndex;
-      includeBodies?: boolean;
-      revision?: string;
-      novelGoal?: GoalRequest;
-    },
-    ctx: RunContext,
-  ) {
-    const view = await this.workspace.readAll(this.bookId);
+  private async context(args: BookContextArgs & { novelGoal?: GoalRequest }, ctx: RunContext) {
     if (args.novelGoal && this.editMode !== 'direct')
       throw new ToolFailure('invalid_options', '本轮不是整书请求，不登记或续接整书目标。');
     if (args.novelGoal) {
@@ -1209,107 +1152,21 @@ export class NovelTools {
         if (this.wholeWork) throw this.missingGoal(ctx);
         throw new ToolFailure('invalid_options', '当前没有此作品的有效整书目标范围。');
       }
-      return this.goalView(args.novelGoal, view, ctx);
+      return this.goalView(args.novelGoal, await this.workspace.readAll(this.bookId), ctx);
     }
-    const offset = Math.min(Number.MAX_SAFE_INTEGER, args.offset ?? 0);
-    if (args.index) {
-      const key = this.indexReadKey(view.documents, args.index, offset);
-      ctx.onToolResultDispatch?.((_report, result) => {
+    const { value, indexKey, requestedOffset } = await readBookContext(
+      this.workspace,
+      this.bookId,
+      args,
+      ctx.signal,
+    );
+    ctx.onToolResultDispatch?.((_report, result) => {
+      if (indexKey) {
         if ((result.value as { pageState?: string })?.pageState !== 'deferred')
-          this.reads.targetedReads.add(key);
-      });
-      return fitBookPage('book_get_context', referenceIndex(view.documents, args.index, offset));
-    }
-    const documents = view.documents
-      .filter((d) => !args.type || d.type === args.type)
-      .sort((a, b) => priority[a.type] - priority[b.type]);
-    if (args.documentId) {
-      const matches = documents.filter((d) => d.id === args.documentId);
-      if (matches.length !== 1) throw new Error('文档不存在或 ID 不唯一，请同时指定 type');
-      const doc = matches[0];
-      const row = documentRow(doc, false);
-      if (args.revision && args.revision !== doc.revision)
-        return {
-          document: documentRef(row),
-          range: [0, 0],
-          nextOffset: 0,
-          pageState: 'changed',
-          hint: '修订已变化，请按现版重新定位原文，不与旧页合并。',
-        };
-      const start = charBoundary(doc.body, Math.min(offset, doc.body.length));
-      let end = charBoundary(doc.body, Math.min(doc.body.length, start + (args.length ?? 6_000)));
-      if (end === start && start < doc.body.length) end += doc.body.codePointAt(start)! > 0xffff ? 2 : 1;
-      const value: DocumentPage = {
-        document: { ...row, body: doc.body.slice(start, end) },
-        range: [start, end],
-        nextOffset: end < doc.body.length ? end : null,
-        pageState: end < doc.body.length ? 'partial' : 'complete',
-      };
-      ctx.onToolResultDispatch?.((_report, result) => this.observeRead(result, this.reads, offset));
-      return fitBookPage('book_get_context', value);
-    }
-    const rows = documents
-      .slice(offset, offset + 45)
-      .map((doc) =>
-        documentRow(doc, !!args.includeBodies && doc.type !== 'chapter' && doc.body.length <= 6_000),
-      );
-    const nextOffset = offset + rows.length < documents.length ? offset + rows.length : null;
-    const value: ReadPage<ReadDocument, 'documents'> & { hint: string } = {
-      offset,
-      documents: rows,
-      nextOffset,
-      pageState: nextOffset === null ? 'complete' : 'partial',
-      hint: '按 type/documentId 定向读取缺少正文的文档。目录默认仅元数据；需要成批读取短资料时使用 includeBodies。',
-    };
-    ctx.onToolResultDispatch?.((_report, result) => this.observeRead(result, this.reads));
-    return fitBookPage('book_get_context', value);
-  }
-  private async search(
-    args: { query: string; type?: Manuscript['type']; documentId?: string; offset?: number },
-    ctx: RunContext,
-  ) {
-    if (typeof args.query !== 'string' || !args.query.length)
-      throw new ToolFailure('invalid_arguments', '请提供要搜索的非空文字。');
-    const { documents, diagnostics } = await this.workspace.readAll(this.bookId);
-    const offset = Math.min(Number.MAX_SAFE_INTEGER, args.offset ?? 0);
-    const matches: BookHit[] = [];
-    let seen = 0,
-      more = false;
-    for (const doc of documents) {
-      ctx.signal.throwIfAborted();
-      if ((args.type && doc.type !== args.type) || (args.documentId && doc.id !== args.documentId))
-        continue;
-      for (
-        let at = doc.body.indexOf(args.query);
-        at !== -1;
-        at = doc.body.indexOf(args.query, at + args.query.length)
-      ) {
-        if (seen++ < offset) continue;
-        if (matches.length === 20) {
-          more = true;
-          break;
-        }
-        const end = at + args.query.length;
-        const left = charBoundary(doc.body, Math.max(0, at - 56));
-        const right = charBoundary(doc.body, Math.min(doc.body.length, end + 56));
-        matches.push({
-          type: doc.type,
-          id: doc.id,
-          revision: doc.revision,
-          range: [at, end],
-          preview: doc.body.slice(left, right),
-        });
-      }
-      if (more) break;
-    }
-    return fitBookPage('book_search_text', {
-      offset,
-      matches,
-      nextOffset: more ? offset + matches.length : null,
-      pageState: more ? 'partial' : 'complete',
-      ...(diagnostics.length && { incomplete: true }),
-      hint: '命中仅用于定位；需精确依据时在同一修订按范围回读。',
+          this.reads.targetedReads.add(indexKey);
+      } else this.observeRead(result, this.reads, requestedOffset);
     });
+    return value;
   }
   private observeRead(result: ToolResult, reads: BookReads, requestedOffset?: number) {
     if (!result.ok || !asRecord(result.value)?.pageState) return;
@@ -2582,25 +2439,10 @@ export class NovelTools {
       ...(this.input.scope || this.editMode === 'proposal' ? [proposalTool] : []),
       {
         name: 'book_get_context',
-        description:
-          '读取当前作品。按 type/documentId 定向读取；index=chapters/subjects/beats 查真实 ID；offset/length 只读有界原文；按实际 nextOffset 和 revision 续页。目录默认仅元数据，includeBodies 可请求完整短资料，长资料按 ID 翻页。按写入要求核对有关现稿，不反复读取未变化的同版资料。整书先登记 book_task_scope 的 novel.register 或 novel.resume，再用 novelGoal 激活完整目标；check 只核对活动目标。',
+        description: `${bookContextDescription}按写入要求核对有关现稿，不反复读取未变化的同版资料。整书先登记 book_task_scope 的 novel.register 或 novel.resume，再用 novelGoal 激活完整目标；check 只核对活动目标。`,
         schema: object(
           {
-            type: typeSchema,
-            documentId: idSchema,
-            offset: page,
-            length: {
-              type: 'integer',
-              minimum: 1,
-              maximum: 6000,
-              description: '定向读取原文时可选；兼用于取修订所需的精确短句',
-            },
-            includeBodies: {
-              type: 'boolean',
-              description: '显式请求目录页中能装下的完整短资料；章节正文仍按 ID 读。',
-            },
-            revision: revisionSchema,
-            index: { type: 'string', enum: indexes },
+            ...bookContextProperties,
             novelGoal: object(
               {
                 action: {
@@ -2637,25 +2479,7 @@ export class NovelTools {
         ),
         execute: async (args, ctx) => this.context(args, ctx),
       },
-      {
-        name: 'book_search_text',
-        description:
-          '在当前作品按字面搜索正文或资料，按可选类型和文档 ID 缩小范围；返回修订、位置和预览，不是写入原文证据。按 nextOffset 翻页。',
-        schema: object(
-          {
-            query: str('要查的原文字面词句', 120),
-            type: typeSchema,
-            documentId: idSchema,
-            offset: page,
-          },
-          ['query'],
-        ),
-        execute: (args, ctx) =>
-          this.search(
-            { query: args.query, type: args.type, documentId: args.documentId, offset: args.offset },
-            ctx,
-          ),
-      },
+      bookSearchTool(this.workspace, this.bookId),
       {
         name: 'book_apply_changes',
         description:

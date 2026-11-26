@@ -9,8 +9,9 @@ import {
   type JsonObject,
   type UserMessage,
 } from '@earendil-works/pi-ai';
-import type { AssistantTurn, ModelProvider, ModelRequest, ToolSpec, Turn } from './model.js';
-import { MalformedMessagesArguments, MessagesOutputLimit } from './provider.js';
+import type { AssistantTurn, ModelProvider, ModelRequest, Turn } from './model.js';
+import { ToolFailure, type LocalTool, type ReadToolContext } from './local-tool.js';
+import { ChatOutputLimit, MalformedMessagesArguments, MessagesOutputLimit } from './provider.js';
 import type { RunContext } from './runs.js';
 import type { ToolResult } from '../../shared/contracts.js';
 import { ActiveContext } from './active-context.js';
@@ -30,33 +31,7 @@ import {
   type ToolReceipt,
 } from './tool-receipts.js';
 
-export interface LocalTool extends ToolSpec {
-  execute: (args: Record<string, any>, ctx: RunContext) => Promise<unknown>;
-  isWholeSkillResult?: (result: ToolResult) => boolean;
-  onResultSent?: (result: ToolResult, report: ReportDiagnostic) => void;
-}
-/** A domain failure can carry a bounded tool result, without forwarding it to diagnostics. */
-export class ToolFailure extends DiagnosticFailure {
-  constructor(
-    reason: string,
-    message: string,
-    readonly value?: unknown,
-  ) {
-    super(reason, message);
-  }
-}
-export const object = (properties: Record<string, unknown>, required = Object.keys(properties)) => ({
-  type: 'object',
-  properties,
-  required,
-  additionalProperties: false,
-});
-export const str = (description?: string, maxLength = 200_000) => ({
-  type: 'string',
-  minLength: 1,
-  maxLength,
-  ...(description && { description }),
-});
+export { object, str, ToolFailure, type LocalTool } from './local-tool.js';
 const model: Model<'openai-completions'> = {
   id: 'fw',
   name: 'Fiction Writer',
@@ -146,6 +121,11 @@ interface AgentBudget {
     prospective?: readonly ToolResult[],
   ) => Promise<NarrowedWritingStep | undefined>;
 }
+type Discovery = { bootstrap?: string[] };
+interface TaskLoopOptions {
+  beforeRequest: () => void;
+  finished: () => boolean;
+}
 
 export async function runAgent(
   ctx: RunContext,
@@ -155,18 +135,72 @@ export async function runAgent(
   prompt: string,
   tools: LocalTool[],
   budget: number | AgentBudget = defaultRoundLimit,
-  discovery?: { bootstrap?: string[] },
+  discovery?: Discovery,
+) {
+  return runLoop(ctx, provider, system, previous, prompt, tools, {
+    runId: ctx.id,
+    parent: ctx,
+    budget,
+    discovery,
+  });
+}
+
+export async function runTaskAgent(
+  ctx: ReadToolContext,
+  runId: string,
+  provider: ModelProvider,
+  system: string,
+  prompt: string,
+  tools: LocalTool<ReadToolContext>[],
+  task: TaskLoopOptions,
+  bootstrap: string[] = [],
+) {
+  const {
+    signal,
+    diagnostic,
+    session: { cwd, bookId },
+  } = ctx;
+  await runLoop({ session: { cwd, bookId }, signal, diagnostic }, provider, system, [], prompt, tools, {
+    runId,
+    budget: Infinity,
+    task,
+    discovery: { bootstrap },
+  });
+}
+
+async function runLoop<Context extends ReadToolContext>(
+  ctx: Context,
+  provider: ModelProvider,
+  system: string,
+  previous: Turn[],
+  prompt: string,
+  tools: LocalTool<Context>[],
+  {
+    runId,
+    parent,
+    budget,
+    discovery,
+    task,
+  }: {
+    runId: string;
+    parent?: RunContext;
+    budget: number | AgentBudget;
+    discovery?: Discovery;
+    task?: TaskLoopOptions;
+  },
 ) {
   const catalog = discovery && discoverTools(tools, discovery.bootstrap);
   const registry = catalog?.registry ?? tools;
   const initialTools = catalog?.visible() ?? tools;
-  const trace = diagnosticScope(safeReporter(ctx.diagnostic ?? noDiagnostic), { lane: 'agent' });
+  const trace = diagnosticScope(safeReporter(ctx.diagnostic ?? noDiagnostic), {
+    lane: task ? 'task' : 'agent',
+  });
   const purpose = () => (typeof budget === 'number' ? undefined : budget.budgetPurpose());
   const { inputTokens, capabilities } = planModelBudget(provider, purpose());
   const spare = inputTokens - inputEstimate(system, [{ role: 'user', text: prompt }], initialTools);
   if (spare < 0) throw contextOverflow();
   const session = await prepareSessionHistory(
-    ctx.history,
+    parent?.history,
     provider,
     { inputTokens, capabilitySource: capabilities.source, spare },
     ctx.signal,
@@ -186,7 +220,8 @@ export async function runAgent(
   let projectionFailure: DiagnosticFailure | undefined;
   let previousCompaction = 0;
   const registered = new Map(registry.map((tool) => [tool.name, tool]));
-  const outbound: { id: string; candidate: Candidate; result: ToolResult; tool?: LocalTool }[] = [];
+  const outbound: { id: string; candidate: Candidate; result: ToolResult; tool?: LocalTool<Context> }[] =
+    [];
   let narrowed = false;
   let recoveryOrigin: string | undefined;
   const recovery = (
@@ -203,9 +238,9 @@ export async function runAgent(
       spanId: span,
     });
   const stepFor = (prospective?: readonly ToolResult[]) =>
-    typeof budget === 'number' || !ctx.session.bookId
+    typeof budget === 'number' || !parent?.session.bookId
       ? undefined
-      : budget.narrowedWritingStep?.(ctx, prospective);
+      : budget.narrowedWritingStep?.(parent, prospective);
   const stopped = (why: string, step?: NarrowedWritingStep, reason = 'output_limit') =>
     new DiagnosticFailure(
       reason,
@@ -245,7 +280,7 @@ export async function runAgent(
       const call = round?.candidates.get(id);
       const started = performance.now();
       const receipt: ToolReceipt = {
-        runId: ctx.id,
+        runId,
         round: round?.number ?? rounds,
         callRef: callRef(id),
         tool: tool.name,
@@ -261,14 +296,18 @@ export async function runAgent(
       try {
         const value = await tool.execute(params as Record<string, unknown>, {
           ...ctx,
-          narrowedWriting: narrowed,
-          onToolResultDispatch(observe) {
-            if (call) call.observeDispatch = observe;
-          },
-          progress(value) {
-            context.setProgress(value);
-            ctx.progress(value);
-          },
+          ...(parent && {
+            narrowedWriting: narrowed,
+            onToolResultDispatch(
+              observe: Parameters<NonNullable<RunContext['onToolResultDispatch']>>[0],
+            ) {
+              if (call) call.observeDispatch = observe;
+            },
+            progress(value: Parameters<RunContext['progress']>[0]) {
+              context.setProgress(value);
+              parent.progress(value);
+            },
+          }),
           diagnostic(event, fields) {
             if (event === 'workspace.document.committed') {
               const commit = observedCommit(fields);
@@ -345,7 +384,7 @@ export async function runAgent(
       } finally {
         round?.receipts.push(receipt);
         try {
-          await ctx.recordTool?.(receipt);
+          await parent?.recordTool?.(receipt);
         } catch {
           // The original action may have committed; do not let the loop retry it.
           receiptFailure = true;
@@ -457,6 +496,8 @@ export async function runAgent(
         } else wire = fit();
         let answeredSpanId = spanId;
         const send = (attemptId: string, attempt: 1 | 2, replan = false) => {
+          ctx.signal.throwIfAborted();
+          task?.beforeRequest();
           const requestTrace = diagnosticScope(report, {
             spanId: attemptId,
             attempt,
@@ -473,7 +514,7 @@ export async function runAgent(
                 ? 'active-whole-skill'
                 : undefined,
             signal: ctx.signal,
-            onText: ctx.text,
+            onText: parent?.text ?? (() => {}),
             diagnostic: requestTrace,
             spanId: attemptId,
             onDispatch(nextSpanId) {
@@ -509,8 +550,9 @@ export async function runAgent(
         try {
           answer = await send(spanId, 1);
         } catch (error) {
+          if (!parent) throw error;
           if (error instanceof MessagesOutputLimit) {
-            ctx.resetText?.();
+            parent.resetText?.();
             ctx.signal.throwIfAborted();
             if (narrowed) {
               recovery(report, 'repeat_limit', 'output_limit', recoveryOrigin);
@@ -538,7 +580,7 @@ export async function runAgent(
               answer = await send(retryId, 2, true);
               answeredSpanId = retryId;
             } catch (retryError) {
-              ctx.resetText?.();
+              parent.resetText?.();
               ctx.signal.throwIfAborted();
               recovery(
                 report,
@@ -558,7 +600,7 @@ export async function runAgent(
           } else {
             if (!(error instanceof MalformedMessagesArguments)) throw error;
             // Up to this boundary no native reply or tool candidate from this round entered Pi.
-            ctx.resetText?.();
+            parent.resetText?.();
             ctx.signal.throwIfAborted();
             const retryId = randomUUID();
             report('model.arguments_retry', {
@@ -571,7 +613,7 @@ export async function runAgent(
               answer = await send(retryId, 2);
               answeredSpanId = retryId;
             } catch (retryError) {
-              ctx.resetText?.();
+              parent.resetText?.();
               ctx.signal.throwIfAborted();
               if (retryError instanceof MessagesOutputLimit) {
                 recovery(report, 'attempt_used', 'output_limit', spanId, retryId);
@@ -606,7 +648,7 @@ export async function runAgent(
                 }
               })();
           if (!valid) {
-            ctx.resetText?.();
+            parent?.resetText?.();
             for (const rejected of answer.calls.slice(0, 16)) {
               diagnosticScope(report, { spanId: answeredSpanId, callId: randomUUID() })(
                 'tool.rejected',
@@ -667,7 +709,10 @@ export async function runAgent(
         if (answer.text) base.content.unshift({ type: 'text', text: answer.text });
         base.stopReason = answer.calls.length ? 'toolUse' : 'stop';
       } catch (e) {
-        round.failure = classified(e, ctx.signal);
+        round.failure =
+          task && !ctx.signal.aborted && e instanceof ChatOutputLimit
+            ? 'output_limit'
+            : classified(e, ctx.signal);
         if (ctx.signal.aborted && recoveryOrigin)
           recovery(report, 'cancelled', 'cancelled', recoveryOrigin, round.narrowSpanId);
         base.stopReason = ctx.signal.aborted ? 'aborted' : 'error';
@@ -689,6 +734,7 @@ export async function runAgent(
         toolExecution: 'sequential',
         convertToLlm: (messages) => messages,
         async beforeToolCall({ toolCall }) {
+          if (task?.finished()) return { block: true, reason: '子任务已结束' };
           if (receiptFailure) return { block: true, reason: '回执未保存；本轮不再执行工具' };
           const candidate = active?.candidates.get(toolCall.id);
           if (candidate?.notDispatched)
@@ -732,6 +778,9 @@ export async function runAgent(
             finish('failed', failure);
           } else if (receiptFailure) {
             finish('failed', 'io_failure', toolResults.length);
+            return { action: 'end' };
+          } else if (task?.finished()) {
+            finish('ok', 'complete', toolResults.length);
             return { action: 'end' };
           } else if (
             active?.narrowStep &&
@@ -780,6 +829,7 @@ export async function runAgent(
         },
       },
       async (event) => {
+        if (!parent) return;
         if (
           event.type === 'message_end' &&
           event.message.role === 'assistant' &&
@@ -789,12 +839,12 @@ export async function runAgent(
           const text = event.message.content
             .flatMap((c) => (c.type === 'text' ? [c.text] : []))
             .join('');
-          if (text) await ctx.line({ role: 'assistant', text });
+          if (text) await parent.line({ role: 'assistant', text });
         }
         if (event.type === 'tool_execution_start')
-          await ctx.line({ role: 'tool', text: `运行 ${event.toolName}` });
+          await parent.line({ role: 'tool', text: `运行 ${event.toolName}` });
         if (event.type === 'tool_execution_end')
-          await ctx.line({
+          await parent.line({
             role: 'tool',
             text: `${event.toolName} · ${event.isError ? '未完成' : '已完成'}`,
           });

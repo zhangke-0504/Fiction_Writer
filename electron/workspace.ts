@@ -124,21 +124,45 @@ export class WorkspaceService {
     }
     if (!beneath(root, await fs.realpath(dir))) throw new WorkspaceError('资产目录不在作品内');
   }
-  private async readBytes(root: string, path: string) {
+  private async readBytes(root: string, path: string, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     await this.checkFileParent(root, path);
     const info = await fs.lstat(path);
     if (!info.isFile() || info.isSymbolicLink()) throw new WorkspaceError('不是普通 Markdown 文件');
     if (info.size > maxDocBytes + 24_000) throw new WorkspaceError('文档超过大小限制');
-    return fs.readFile(path);
+    return fs.readFile(path, { signal });
   }
-  private async readAt(root: string, bookId: string, ref: DocRef): Promise<Manuscript> {
-    return parseDocument(refOf(ref), await this.readBytes(root, docPath(root, bookId, ref)));
+  private async readAt(
+    root: string,
+    bookId: string,
+    ref: DocRef,
+    signal?: AbortSignal,
+  ): Promise<Manuscript> {
+    const bytes = await this.readBytes(root, docPath(root, bookId, ref), signal);
+    signal?.throwIfAborted();
+    return parseDocument(refOf(ref), bytes);
   }
-  async readDocument(bookId: string, ref: DocRef) {
-    await this.writes.get(bookId);
-    return this.readAt(await this.checkedRoot(bookId), bookId, ref);
+  private async waitForWrites(bookId: string, signal?: AbortSignal) {
+    signal?.throwIfAborted();
+    const pending = this.writes.get(bookId);
+    if (!pending || !signal) return pending;
+    // Cancellation can leave the wait, not a read we already started.
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => reject(signal.reason);
+      signal.addEventListener('abort', abort, { once: true });
+      void pending.then(() => {
+        signal.removeEventListener('abort', abort);
+        resolve();
+      });
+    });
+    signal.throwIfAborted();
   }
-  private async load(root: string, bookId: string) {
+  async readDocument(bookId: string, ref: DocRef, signal?: AbortSignal) {
+    await this.waitForWrites(bookId, signal);
+    signal?.throwIfAborted();
+    return this.readAt(await this.checkedRoot(bookId), bookId, ref, signal);
+  }
+  private async load(root: string, bookId: string, signal?: AbortSignal) {
     const documents: Manuscript[] = [],
       diagnostics: string[] = [];
     const refs: DocRef[] = [
@@ -146,6 +170,7 @@ export class WorkspaceService {
       { type: 'outline', id: 'outline' },
     ];
     for (const type of itemTypes) {
+      signal?.throwIfAborted();
       const dir = join(root, itemFolders[type]);
       try {
         await this.checkFileParent(root, join(dir, '_'));
@@ -154,13 +179,16 @@ export class WorkspaceService {
           if (entry.isFile() && entry.name.endsWith('.md'))
             refs.push({ type, id: entry.name.slice(0, -3) });
       } catch (e) {
+        signal?.throwIfAborted();
         if (!absent(e)) diagnostics.push(`${itemFolders[type]}: 无法读取目录`);
       }
     }
     for (const ref of refs) {
+      signal?.throwIfAborted();
       try {
-        documents.push(await this.readAt(root, bookId, ref));
+        documents.push(await this.readAt(root, bookId, ref, signal));
       } catch (e) {
+        signal?.throwIfAborted();
         diagnostics.push(
           `${docKey(ref)}: ${e instanceof WorkspaceError ? e.message : '无法读取 Markdown 文件'}`,
         );
@@ -169,9 +197,11 @@ export class WorkspaceService {
     documents.sort(compare);
     return { documents, diagnostics };
   }
-  async readAll(bookId: string) {
-    await this.writes.get(bookId);
-    const { documents, diagnostics } = await this.load(await this.checkedRoot(bookId), bookId);
+  async readAll(bookId: string, signal?: AbortSignal) {
+    await this.waitForWrites(bookId, signal);
+    signal?.throwIfAborted();
+    const { documents, diagnostics } = await this.load(await this.checkedRoot(bookId), bookId, signal);
+    signal?.throwIfAborted();
     const keys = new Set(documents.map(docKey)),
       beats = storyBeats(documents.find((d) => d.type === 'outline')?.body ?? '');
     const beatIds = new Set(beats);

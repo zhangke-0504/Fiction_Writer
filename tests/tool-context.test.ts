@@ -5,15 +5,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { ActiveContext } from '../electron/agent/active-context.js';
+import { readBookContext } from '../electron/agent/book-read-tools.js';
 import {
   recallBookMemory,
   type BookRecall,
   type ReportMemoryDispatch,
 } from '../electron/agent/book-memory.js';
 import { NovelTools } from '../electron/agent/novel-tools.js';
+import { FileTools } from '../electron/agent/files.js';
 import type { RunContext } from '../electron/agent/runs.js';
 import { ScriptedProvider } from '../electron/agent/scripted.js';
 import { SkillCatalog } from '../electron/agent/skills.js';
+import { taskReadTools } from '../electron/agent/task-read-tools.js';
 import { projectReadResult, type DocumentPage } from '../electron/agent/tool-context.js';
 import { discoverTools } from '../electron/agent/tool-discovery.js';
 import { WorkspaceService } from '../electron/workspace.js';
@@ -35,10 +38,10 @@ const stringCall = (name: string, args: object) => ({
   args: JSON.stringify(args),
 });
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, beforeReplace?: () => void | Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), 'fw-tool-context-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const ws = new WorkspaceService({ libraryRoot: root });
+  const ws = new WorkspaceService({ libraryRoot: root, beforeReplace });
   await ws.init();
   const book = await ws.createBook({ title: '旧港', summary: '只读夹具。' });
   const other = await ws.createBook({ title: '他书', summary: '只读夹具。' });
@@ -109,6 +112,86 @@ async function fixture(t: TestContext) {
   };
   return { ws, bookId: book.id, ctx, tools, execute };
 }
+
+test('typed document pages use only the target read', async (t) => {
+  const { ws, execute } = await fixture(t);
+  const all = t.mock.method(ws, 'readAll');
+  const single = t.mock.method(ws, 'readDocument');
+  const page = await execute<DocumentPage>('book_get_context', {
+    type: first.type,
+    documentId: first.id,
+  });
+  assert.equal(page.value.document.id, first.id);
+  assert.equal(single.mock.callCount(), 1);
+  assert.equal(all.mock.callCount(), 0);
+});
+
+test('delegated tool catalogs are scoped to pure queries from the bound session', async (t) => {
+  const { ws, ctx, bookId } = await fixture(t);
+  const files = new FileTools(ws, join(ws.libraryRoot, 'state'));
+  const book = taskReadTools(ws, files, ctx.session);
+  assert.deepEqual(
+    book.map(({ name }) => name),
+    ['book_get_context', 'book_search_text'],
+  );
+  assert.ok(!Object.hasOwn(book[0].schema.properties as object, 'novelGoal'));
+  const before = await ws.readDocument(bookId, first);
+  const page = await book[0].execute(
+    { type: first.type, documentId: first.id, novelGoal: { action: 'register' } },
+    ctx,
+  );
+  assert.equal((page as DocumentPage).document.revision, before.revision);
+  assert.equal((await ws.readDocument(bookId, first)).revision, before.revision);
+  const session = { cwd: ctx.session.cwd };
+  const ordinary = taskReadTools(ws, files, session);
+  assert.deepEqual(
+    ordinary.map(({ name }) => name),
+    ['list_files', 'search_text', 'read_file'],
+  );
+  await assert.rejects(ordinary[2].execute({ path: '../outside.txt' }, { ...ctx, session }));
+  for (const tool of ordinary)
+    await assert.rejects(
+      tool.execute({ path: 'book.md', query: '测试' }, { session, signal: AbortSignal.abort() }),
+      {
+        name: 'AbortError',
+      },
+    );
+});
+
+test('cancelling a page or scan waiting for a write does not start a later read', async (t) => {
+  const held = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  let hold = false;
+  const { ws, bookId, execute } = await fixture(t, () => {
+    if (!hold) return;
+    entered.resolve();
+    return held.promise;
+  });
+  const original = await ws.readDocument(bookId, first);
+  hold = true;
+  const write = ws.writeChanges(bookId, [
+    { ...original, expect: original.revision, body: '仍在保存。' },
+  ]);
+  try {
+    await entered.promise;
+    const controller = new AbortController();
+    const attempts = [
+      readBookContext(ws, bookId, { type: first.type, documentId: first.id }, controller.signal),
+      ws.readAll(bookId, controller.signal),
+    ];
+    const rejected = attempts.map((pending) => assert.rejects(pending, { name: 'AbortError' }));
+    controller.abort();
+    await Promise.all(rejected);
+  } finally {
+    held.resolve();
+    await write;
+  }
+  const current = await execute<DocumentPage>('book_get_context', {
+    type: first.type,
+    documentId: first.id,
+  });
+  assert.equal(current.value.document.body, '仍在保存。');
+});
 
 test('bound search uses current-book references, bounded previews and distinct incomplete coverage', async (t) => {
   const { ws, bookId, tools, ctx, execute } = await fixture(t);
@@ -258,6 +341,42 @@ test('undispatched, previewed and clipped originals do not satisfy the existing 
   const updated = await ws.readDocument(bookId, first);
   assert.equal(updated.body, original.body.replace(quote, replacement));
   await assert.rejects(tryPatch, { diagnosticReason: 'conflict' });
+});
+
+test('child evidence and changed references never populate the parent read set', async (t) => {
+  const { ws, bookId, ctx, execute } = await fixture(t);
+  const original = await ws.readDocument(bookId, first);
+  const offset = original.body.indexOf(quote);
+  const args = { type: first.type, documentId: first.id, offset, length: quote.length };
+  const child = taskReadTools(ws, new FileTools(ws, join(ws.libraryRoot, 'state')), ctx.session)[0];
+  const read = (revision: string) => child.execute({ ...args, revision }, ctx) as Promise<DocumentPage>;
+  const patch = (revision: string) =>
+    execute('book_patch_chapter', {
+      chapterId: first.id,
+      revision,
+      edits: [{ quote, replacement }],
+    });
+  const firstPage = await read(original.revision);
+  assert.equal(firstPage.document.body, quote);
+  await assert.rejects(() => patch(original.revision), { diagnosticReason: 'context_required' });
+  const unrelated = await ws.readDocument(bookId, second);
+  const updated = await ws.writeChanges(bookId, [
+    { ...original, expect: original.revision, body: original.body + '\n作者补充。' },
+  ]);
+  assert.equal(updated.error, undefined);
+  const stale = await read(original.revision);
+  assert.equal(stale.pageState, 'changed');
+  assert.equal(stale.document.body, undefined);
+  await assert.rejects(() => patch(original.revision), { diagnosticReason: 'conflict' });
+  await assert.rejects(() => patch(stale.document.revision), { diagnosticReason: 'context_required' });
+  const parentPage = await execute<DocumentPage>('book_get_context', {
+    ...args,
+    revision: stale.document.revision,
+  });
+  parentPage.dispatch();
+  await patch(stale.document.revision);
+  assert.match((await ws.readDocument(bookId, first)).body, /作者补充/u);
+  assert.equal((await ws.readDocument(bookId, second)).revision, unrelated.revision);
 });
 
 test('projected memory counts and sources report only included evidence', async (t) => {
