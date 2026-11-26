@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { parser } from '@lezer/markdown';
 import { diagnosticScope, noDiagnostic } from '../../shared/diagnostics.js';
 import { inputEstimate, planModelBudget } from './context-budget.js';
 import type { ModelProvider, ToolSpec, Turn } from './model.js';
@@ -11,6 +12,11 @@ export const patchFragmentLimit = 600;
 const patchTotalLimit = 1200;
 
 export type ProseEdit = { quote: string; replacement: string; part?: string };
+export type ParagraphGapEdit = {
+  paragraphGap: { leftQuote: string; rightQuote: string; blankLines: 1 };
+  part?: string;
+};
+type ParagraphGapLineBreaks = { beforeLf: number; afterLf: number };
 export type PatchEvidence = { chapterId: string; revision: string; quote: string };
 
 export function exactRange(body: string, quote: string, reason = 'patch_anchor') {
@@ -18,6 +24,47 @@ export function exactRange(body: string, quote: string, reason = 'patch_anchor')
   if (start < 0 || body.indexOf(quote, start + 1) >= 0)
     throw new DiagnosticFailure(reason, '短原文找不到或出现不止一次，请读取当前版本后补充唯一原文。');
   return { start, end: start + quote.length };
+}
+
+/** Resolve the original separator without asking the model to reproduce it. */
+export function expandParagraphGap(
+  body: string,
+  { paragraphGap: { leftQuote, rightQuote }, part }: ParagraphGapEdit,
+): { edit: ProseEdit; lineBreaks: ParagraphGapLineBreaks } {
+  let match: [from: number, to: number] | undefined;
+  for (let left = parser.parse(body).topNode.firstChild; left; left = left.nextSibling) {
+    const right = left.nextSibling;
+    if (left.name !== 'Paragraph' || right?.name !== 'Paragraph') continue;
+    // Lezer can include the CR of a CRLF separator in the preceding paragraph.
+    const end = body[left.to - 1] === '\r' && body[left.to] === '\n' ? left.to - 1 : left.to;
+    const quoteStart = end - leftQuote.length;
+    if (
+      quoteStart < left.from ||
+      right.from + rightQuote.length > right.to ||
+      !body.startsWith(leftQuote, quoteStart) ||
+      !body.startsWith(rightQuote, right.from)
+    )
+      continue;
+    if (match)
+      throw new DiagnosticFailure('patch_anchor', '两侧短文命中多处相邻段落，请补充唯一的段尾或段首。');
+    match = [end, right.from];
+  }
+  if (!match)
+    throw new DiagnosticFailure('patch_anchor', '找不到对应的相邻正文段落，请回读原样的段尾和段首。');
+  const separator = body.slice(...match);
+  if (!/^\n{2,}$/u.test(separator))
+    throw new DiagnosticFailure(
+      'patch_scope',
+      '段间空白收尾只支持连续的 LF，不改含 CR、空格或 Tab 的分隔。',
+    );
+  return {
+    edit: {
+      quote: leftQuote + separator + rightQuote,
+      replacement: `${leftQuote}\n\n${rightQuote}`,
+      part,
+    },
+    lineBreaks: { beforeLf: separator.length, afterLf: 2 },
+  };
 }
 
 /** Validate every range against one unmodified snapshot before composing the new body. */
@@ -76,6 +123,7 @@ export async function reviewProsePatch(
         author: string;
         chapter: { id: string; order?: number; title?: string };
         edits: readonly ProseEdit[];
+        paragraphGap?: ParagraphGapLineBreaks;
       }
     | { evidence: readonly PatchEvidence[]; edits: readonly ProseEdit[] },
   registered = false,
@@ -88,6 +136,9 @@ export async function reviewProsePatch(
     factual
       ? '逐项对照证据。仅当旧文与前章明确描写的同一人物、同一事件直接矛盾，且新文只纠正这项事实而不添加其他未证实事实、经过或收尾时，给 allowed=true。未经确定的情节补写、仅叙述方式不同、证据不完整，均给 false。每处都须独立有据。'
       : '只核对作者在本轮明确指定要改的片段或事实。任何超出目标、扩大到另外一句无关内容、未被要求的剧情、超出作者指定的替换或删除、含糊情况，均给 false。',
+    ...('paragraphGap' in input && input.paragraphGap
+      ? ['paragraphGap 是从实际候选计算的段间 LF 数，两侧文字保留；仍须核对作者是否允许改动这一处。']
+      : []),
     '只调用 submit_chapter_patch_review 返回 allowed。不得自行授权或另提修订。',
   ].join('\n');
   const history: Turn[] = [{ role: 'user', text: JSON.stringify(input) }];

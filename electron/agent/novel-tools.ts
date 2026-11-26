@@ -37,12 +37,14 @@ import {
 } from './edit-proposal.js';
 import {
   exactRange,
+  expandParagraphGap,
   patchBody,
   patchEntryLimit,
   patchFragmentLimit,
   reviewProsePatch,
-  type ProseEdit,
+  type ParagraphGapEdit,
   type PatchEvidence,
+  type ProseEdit,
 } from './chapter-patch.js';
 import { chapterAssetRequirements } from './chapter-context.js';
 import {
@@ -200,6 +202,12 @@ const fieldSchema = object(
   },
   [],
 );
+const patchPart = str('如已登记同章子目标，填对应 part。删除与补入各用自己的 part。', 64);
+const paragraphQuote = (description: string) => ({
+  ...str(description, patchFragmentLimit),
+  pattern: '^[^\\r\\n\\u2028\\u2029]*\\S[^\\r\\n\\u2028\\u2029]*$',
+});
+
 function editWriteContext(ctx: RunContext) {
   const saved = new Map<string, string>();
   return {
@@ -1474,17 +1482,25 @@ export class NovelTools {
   private async patchChapter(
     chapterId: string,
     revision: string,
-    edits: ProseEdit[],
+    requestedEdits: (ProseEdit | ParagraphGapEdit)[],
     evidence: PatchEvidence[] = [],
     ctx: RunContext,
   ) {
     const ref = { type: 'chapter' as const, id: chapterId };
     const taskScope = this.input.scope;
     const reportPatch = diagnosticScope(ctx.diagnostic ?? noDiagnostic, { documentRef: docKey(ref) });
-    const parts = new Set(edits.map(({ part }) => part).filter((part): part is string => !!part));
+    const parts = new Set(
+      requestedEdits.map(({ part }) => part).filter((part): part is string => !!part),
+    );
     try {
       ctx.signal.throwIfAborted();
-      const targets = taskScope?.patchTargets(chapterId, edits, ctx);
+      const requestedGap = requestedEdits.find((edit) => 'paragraphGap' in edit);
+      if (requestedGap && (requestedEdits.length !== 1 || evidence.length))
+        throw new ToolFailure(
+          'invalid_arguments',
+          '段间空白收尾只接受一处，不和其他补丁或来源章证据混用。',
+        );
+      const targets = taskScope?.patchTargets(chapterId, requestedEdits, ctx);
       const explicitScope =
         !!targets?.length &&
         targets.every(({ operation, id, part }) => taskScope!.allows(operation, id, ctx, part));
@@ -1496,6 +1512,8 @@ export class NovelTools {
         (!taskScope && (proposalOnly(author) || blocksProsePatch(author)))
       )
         throw new ToolFailure('patch_not_authorized', '当前请求不授权修改章节原文。');
+      if (requestedGap && !explicitScope)
+        throw new ToolFailure('patch_not_authorized', '段间空白收尾需要本轮已登记的章节补丁范围。');
       const { documents } = await this.workspace.readAll(this.bookId);
       const chapters = documents.filter((d) => d.type === 'chapter');
       const intent = !taskScope
@@ -1516,6 +1534,14 @@ export class NovelTools {
       if (!doc) throw new ToolFailure('missing', '目标章不存在。');
       if (doc.revision !== revision || (owned && revision !== owned))
         throw new ToolFailure('conflict', '目标章修订已变化；不会用旧补丁覆盖当前正文。');
+      const gap = requestedGap && expandParagraphGap(doc.body, requestedGap);
+      const edits = gap
+        ? [gap.edit]
+        : requestedEdits.filter((edit): edit is ProseEdit => !('paragraphGap' in edit));
+      if (gap && gap.edit.quote === gap.edit.replacement) {
+        this.requirePatchQuote(doc, gap.edit.quote);
+        throw new ToolFailure('patch_scope', '该处段间已有 1 个空行，无需改动。', { chapterId });
+      }
       const body = patchBody(doc.body, edits);
       for (const { quote } of edits) this.requirePatchQuote(doc, quote);
       if (!explicit && !evidence.length)
@@ -1551,7 +1577,12 @@ export class NovelTools {
         await reviewProsePatch(
           this.provider,
           { ...ctx, diagnostic: reportPatch },
-          { author, chapter: { id: doc.id, title: doc.fields.title, order: doc.fields.order }, edits },
+          {
+            author,
+            chapter: { id: doc.id, title: doc.fields.title, order: doc.fields.order },
+            edits,
+            ...(gap && { paragraphGap: gap.lineBreaks }),
+          },
           explicitScope,
         );
       } else await reviewProsePatch(this.provider, ctx, { evidence, edits });
@@ -2583,7 +2614,7 @@ export class NovelTools {
       {
         name: 'book_patch_chapter',
         description:
-          '按当前作者明确授权定点修改一章的少量原文，不用于插入新场景或整章重写。先用 book_get_context 读取精确短文与当前版本。章内搬移优先同一批删除旧段并在新锚点补入；任一项不成立则整批不写。还需修订时重读新版本后继续，不重发旧补丁。只有本轮从空白生成并保持原提交版本的整书新稿，才可另凭已读取的前章原文证据做明确事实勘误。',
+          '按当前作者明确授权定点修改一章的少量原文，不用于插入新场景或整章重写。先用 book_get_context 按章节 ID 读取当前版本与完整短原文。只需把一处段间空白缩为 1 个空行时，edits 只填一个 paragraphGap：用前段原样短尾和后段原样短首定位，不抄中间换行，不提交替换正文或 evidence。章内搬移优先同一批删除旧段并在新锚点补入；任一项不成立则整批不写。还需修订时重读新版本后继续，不重发旧补丁。只有本轮从空白生成并保持原提交版本的整书新稿，才可另凭已读取的前章原文证据做明确事实勘误。',
         schema: object(
           {
             chapterId: idSchema,
@@ -2592,18 +2623,40 @@ export class NovelTools {
               type: 'array',
               minItems: 1,
               maxItems: patchEntryLimit,
-              items: object(
-                {
-                  quote: str('已读取的当前版中唯一的完整短原文，不得截断或归一化', patchFragmentLimit),
-                  replacement: {
-                    type: 'string',
-                    maxLength: patchFragmentLimit,
-                    description: '替换后的局部正文；空字符串表示定点删除',
-                  },
-                  part: str('如已登记同章子目标，填对应 part。删除与补入各用自己的 part。', 64),
-                },
-                ['quote', 'replacement'],
-              ),
+              items: {
+                anyOf: [
+                  object(
+                    {
+                      quote: str(
+                        '已读取的当前版中唯一的完整短原文，不得截断或归一化',
+                        patchFragmentLimit,
+                      ),
+                      replacement: {
+                        type: 'string',
+                        maxLength: patchFragmentLimit,
+                        description: '替换后的局部正文；空字符串表示定点删除',
+                      },
+                      part: patchPart,
+                    },
+                    ['quote', 'replacement'],
+                  ),
+                  object(
+                    {
+                      paragraphGap: object({
+                        leftQuote: paragraphQuote('前段原样结尾的单行短文，不含分隔换行'),
+                        rightQuote: paragraphQuote('后段原样开头的单行短文，不含分隔换行'),
+                        blankLines: {
+                          type: 'integer',
+                          enum: [1],
+                          description: '保留 1 个空行（2 个 LF）',
+                        },
+                      }),
+                      part: patchPart,
+                    },
+                    ['paragraphGap'],
+                  ),
+                ],
+              },
             },
             evidence: {
               type: 'array',

@@ -8,7 +8,7 @@ import type { DocRef, Manuscript } from '../shared/contracts.js';
 import { NovelTools } from '../electron/agent/novel-tools.js';
 import { BookTaskScope } from '../electron/agent/task-scope.js';
 import { prosePatchIntent } from '../electron/agent/chapter-intent.js';
-import type { ProseEdit } from '../electron/agent/chapter-patch.js';
+import type { ParagraphGapEdit, ProseEdit } from '../electron/agent/chapter-patch.js';
 import { runAgent } from '../electron/agent/loop.js';
 import { RunManager } from '../electron/agent/runs.js';
 import { Gate, ScriptedProvider, type Script } from '../electron/agent/scripted.js';
@@ -103,7 +103,7 @@ async function fixture(t: TestContext, authored = 10) {
       .map((s) => JSON.parse(s));
   const patch = (
     doc: Manuscript,
-    edits: ProseEdit[] = [{ quote: injury, replacement: correction }],
+    edits: (ProseEdit | ParagraphGapEdit)[] = [{ quote: injury, replacement: correction }],
     evidence?: object[],
   ) => use('book_patch_chapter', { chapterId: doc.id, revision: doc.revision, edits, evidence });
   const start = (prompt: string, script: Script[], selectedChapterId?: string, scoped = false) => {
@@ -1009,3 +1009,249 @@ test('cancelling a scoped continuation does not commit or replay the candidate',
   assert.equal((await next.wait()).status, 'completed');
   assert.equal((await f.load(10)).revision, baseline.revision);
 });
+
+const gapLeft = '段尾_GAP_LEFT：他合上了日记。';
+const gapRight = '段首_GAP_RIGHT：钟声响起。';
+const sixLf = '\n'.repeat(6);
+const gapPart = 'spacing';
+const gapEdit: ParagraphGapEdit = {
+  paragraphGap: { leftQuote: gapLeft, rightQuote: gapRight, blankLines: 1 },
+  part: gapPart,
+};
+const gapPrompt = '请把第十章日记结尾和钟声开头之间的空白缩为一个空行，只改这处。';
+const findGapTools = () =>
+  use('tool_search', { query: 'book_get_context book_search_text book_patch_chapter' });
+const registerGap = (id: string) =>
+  use('book_task_scope', {
+    items: [{ operation: 'chapter.patch', id, part: gapPart, purpose: gapPrompt }],
+  });
+const approveScope = () => use('check_book_scope', { allowed: true });
+
+async function gapFixture(f: Awaited<ReturnType<typeof fixture>>, separator = sixLf) {
+  const current = await f.load(10);
+  const body = `${prefix}\n\n${gapLeft}${separator}${gapRight}\n\n${suffix}${sixLf}${missing}`;
+  assert.equal((await f.save(current, body)).error, undefined);
+  return f.load(10);
+}
+
+test('a paragraph gap needs the whole delivered range, not a preview or just its two anchors', async (t) => {
+  const f = await fixture(t);
+  const doc = await gapFixture(f);
+  const leftAt = doc.body.indexOf(gapLeft);
+  const gapAt = leftAt + gapLeft.length;
+  const rightAt = gapAt + sixLf.length;
+  const attempt = () => f.patch(doc, [gapEdit]);
+  const op = f.start(
+    gapPrompt,
+    [
+      findGapTools,
+      () => registerGap(doc.id),
+      approveScope,
+      () => use('book_search_text', { type: 'chapter', documentId: doc.id, query: gapLeft }),
+      ({ history }) => {
+        assert.ok(latest(history).includes(gapRight));
+        return attempt();
+      },
+      ({ history }) => {
+        assert.match(latest(history), /context_required/);
+        return read(10, leftAt, gapLeft.length);
+      },
+      () => read(10, rightAt, gapRight.length),
+      attempt,
+      ({ history }) => {
+        assert.match(latest(history), /context_required/);
+        return read(10, gapAt, sixLf.length);
+      },
+      attempt,
+      ({ tools, history }) => {
+        assert.deepEqual(
+          tools.map(({ name }) => name),
+          ['submit_chapter_patch_review'],
+        );
+        const request = history.at(-1);
+        assert.ok(request?.role === 'user');
+        const candidate = JSON.parse(request.text);
+        assert.deepEqual(candidate.paragraphGap, { beforeLf: 6, afterLf: 2 });
+        assert.deepEqual(candidate.edits, [
+          { quote: gapLeft + sixLf + gapRight, replacement: `${gapLeft}\n\n${gapRight}`, part: gapPart },
+        ]);
+        return decision(true);
+      },
+      ({ history }) => {
+        assert.match(latest(history), /"patched":1/);
+        return text('只缩短了指定空白。');
+      },
+    ],
+    undefined,
+    true,
+  );
+  const result = await op.wait();
+  assert.equal(result.status, 'completed', result.error);
+  assert.equal(result.taskOutcome, 'fulfilled');
+  const saved = await f.load(10);
+  assert.equal(saved.body, doc.body.slice(0, gapAt) + '\n\n' + doc.body.slice(rightAt));
+  assert.deepEqual(saved.fields, doc.fields);
+  assert.equal(op.asked.filter((name) => name === 'submit_chapter_patch_review').length, 1);
+  const receipts = (await f.history()).flatMap(({ toolReceipt }) =>
+    toolReceipt?.tool === 'book_patch_chapter' ? [toolReceipt] : [],
+  );
+  assert.deepEqual(
+    receipts.map(({ commitCount, reason }) => [commitCount, reason]),
+    [
+      [0, 'context_required'],
+      [0, 'context_required'],
+      [1, undefined],
+    ],
+  );
+  assert.equal(receipts.at(-1)?.commits[0]?.revision, saved.revision);
+  assert.doesNotMatch(JSON.stringify(op.trace.rows), /_GAP_LEFT|_GAP_RIGHT/);
+});
+
+for (const [name, reason] of [
+  ['unregistered', 'patch_not_authorized'],
+  ['wrong part', 'patch_scope'],
+  ['mixed batch', 'invalid_arguments'],
+  ['mixed fields', 'invalid_arguments'],
+  ['source evidence', 'invalid_arguments'],
+  ['not one blank line', 'invalid_arguments'],
+  ['blank anchor', 'invalid_arguments'],
+  ['multiline anchor', 'invalid_arguments'],
+] as const) {
+  test(`a paragraph gap does not write before the existing patch review: ${name}`, async (t) => {
+    const f = await fixture(t);
+    const doc = await gapFixture(f);
+    const regular = { quote: gapLeft, replacement: invented, part: gapPart };
+    const editsByCase: Partial<Record<typeof name, object[]>> = {
+      unregistered: [{ paragraphGap: gapEdit.paragraphGap }],
+      'wrong part': [{ ...gapEdit, part: 'another' }],
+      'mixed batch': [gapEdit, regular],
+      'mixed fields': [{ ...gapEdit, ...regular }],
+      'not one blank line': [{ ...gapEdit, paragraphGap: { ...gapEdit.paragraphGap, blankLines: 0 } }],
+      'blank anchor': [{ ...gapEdit, paragraphGap: { ...gapEdit.paragraphGap, leftQuote: ' \t' } }],
+      'multiline anchor': [
+        { ...gapEdit, paragraphGap: { ...gapEdit.paragraphGap, leftQuote: gapLeft + '\n' } },
+      ],
+    };
+    const edits = editsByCase[name] ?? [gapEdit];
+    const evidence =
+      name === 'source evidence'
+        ? [{ chapterId: ch(8).id, revision: (await f.load(8)).revision, quote: source }]
+        : undefined;
+    const op = f.start(
+      gapPrompt,
+      [
+        findGapTools,
+        ...(name === 'unregistered' ? [] : [() => registerGap(doc.id), approveScope]),
+        () => read(10),
+        () => use('book_patch_chapter', { chapterId: doc.id, revision: doc.revision, edits, evidence }),
+        () => text('没有写入。'),
+      ],
+      undefined,
+      true,
+    );
+    const result = await op.wait();
+    assert.equal(result.status, 'completed', result.error);
+    assert.notEqual(result.taskOutcome, 'fulfilled');
+    assert.deepEqual(await f.load(10), doc);
+    assert.ok(!op.asked.includes('submit_chapter_patch_review'));
+    assert.ok(!op.trace.rows.some(({ event }) => event === 'workspace.document.committed'));
+    assert.ok(
+      op.trace.rows.some(
+        ({ event, fields }) =>
+          (event === 'tool.rejected' || event === 'chapter.patch.finished') && fields.reason === reason,
+      ),
+    );
+  });
+}
+
+test('an already-correct paragraph gap is not a commit or fulfillment', async (t) => {
+  const f = await fixture(t);
+  const doc = await gapFixture(f, '\n\n');
+  const op = f.start(
+    gapPrompt,
+    [
+      findGapTools,
+      () => registerGap(doc.id),
+      approveScope,
+      () => f.patch(doc, [gapEdit]),
+      ({ history }) => {
+        assert.match(latest(history), /context_required/);
+        return read(10);
+      },
+      () => f.patch(doc, [gapEdit]),
+      ({ history }) => {
+        assert.match(latest(history), /已有 1 个空行，无需改动/);
+        assert.doesNotMatch(latest(history), /"patched"/);
+        return text('现有空行无需改动。');
+      },
+    ],
+    undefined,
+    true,
+  );
+  const result = await op.wait();
+  assert.equal(result.status, 'completed', result.error);
+  assert.equal(result.taskOutcome, 'incomplete');
+  assert.deepEqual(await f.load(10), doc);
+  assert.ok(!op.asked.includes('submit_chapter_patch_review'));
+  assert.ok(!op.trace.rows.some(({ event }) => event === 'workspace.document.committed'));
+  const receipts = (await f.history()).flatMap(({ toolReceipt }) =>
+    toolReceipt?.tool === 'book_patch_chapter' ? [toolReceipt.commitCount] : [],
+  );
+  assert.deepEqual(receipts, [0, 0]);
+});
+
+for (const outcome of ['denied', 'invalid_verdict', 'conflict', 'cancelled'] as const) {
+  test(`a reviewed paragraph gap keeps zero commits on ${outcome}`, async (t) => {
+    const f = await fixture(t);
+    const doc = await gapFixture(f);
+    const ready = new Gate(),
+      next = new Gate();
+    const manual = doc.body + '\n\n作者并发保存的内容。';
+    const op = f.start(
+      gapPrompt,
+      [
+        findGapTools,
+        () => registerGap(doc.id),
+        approveScope,
+        () => read(10),
+        () => f.patch(doc, [gapEdit]),
+        async ({ signal }) => {
+          if (outcome === 'denied') return decision(false);
+          if (outcome === 'invalid_verdict') return text(reviewNote);
+          ready.release();
+          await next.wait(signal);
+          return decision(true);
+        },
+        ({ history }) => {
+          assert.match(latest(history), outcome === 'conflict' ? /conflict/ : /patch_scope/);
+          return text('没写入。');
+        },
+      ],
+      undefined,
+      true,
+    );
+    if (outcome === 'conflict' || outcome === 'cancelled') {
+      await ready.wait(AbortSignal.timeout(5000));
+      if (outcome === 'cancelled') await op.stop();
+      else assert.equal((await f.save(doc, manual)).error, undefined);
+      next.release();
+    }
+    const result = await op.wait();
+    assert.equal(result.status, outcome === 'cancelled' ? 'cancelled' : 'completed', result.error);
+    assert.notEqual(result.taskOutcome, 'fulfilled');
+    const saved = await f.load(10);
+    if (outcome === 'conflict') assert.equal(saved.body, manual);
+    else assert.deepEqual(saved, doc);
+    assert.equal(op.asked.filter((name) => name === 'submit_chapter_patch_review').length, 1);
+    assert.ok(!op.trace.rows.some(({ event }) => event === 'workspace.document.committed'));
+    const review = op.trace.rows.find(({ event }) => event === 'chapter.patch.review');
+    assert.equal(
+      review?.fields.verdict,
+      outcome === 'conflict' ? 'approved' : outcome === 'cancelled' ? 'incomplete' : outcome,
+    );
+    const receipts = (await f.history()).flatMap(({ toolReceipt }) =>
+      toolReceipt?.tool === 'book_patch_chapter' ? [toolReceipt.commitCount] : [],
+    );
+    assert.deepEqual(receipts, [0]);
+  });
+}

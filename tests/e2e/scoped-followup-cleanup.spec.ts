@@ -462,3 +462,215 @@ for (const mode of ['saved', 'wrong-anchor', 'pending'] as const) {
     }
   });
 }
+
+test('same-session paragraph spacing commits only the chosen separator', async ({}, info) => {
+  const root = info.outputPath('app');
+  const leftQuote = '他收好了航海日志。';
+  const rightQuote = '雾里的钟声响起。';
+  const left = `GAP_LEFT_FIXTURE：他在离开石阶前停了一下。${leftQuote}`;
+  const right = `${rightQuote}守灯人走到栏杆边，仍没有看见那艘铜船。GAP_RIGHT_FIXTURE。`;
+  const gap = '\n'.repeat(6);
+  const rest = `\n\n${anchor}${gap}${ending}`;
+  const beforeBody = `${left}${gap}${right}${rest}`;
+  const afterBody = `${left}\n\n${right}${rest}`;
+  const part = 'logbook-gap';
+  const purpose = '只把航海日志段和钟声段之间多余的空行缩为一个空行。';
+  const pending = `还有一项待办：${purpose}同章另一处空白保留。`;
+  const inspect = '只列出第十章仍待处理的问题，不要改稿。';
+  const follow = '按上面那项待办处理，不改其他地方。';
+  const errors: unknown[] = [];
+  let baseRevision: string;
+  let toolRevision: string;
+  let reviewCount = 0;
+  const server = createServer(async (req, res) => {
+    try {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      const wire = JSON.parse(raw) as Wire;
+      const tools = wire.tools?.map(({ name }) => name) ?? [];
+      const last = wire.messages.at(-1)?.content.at(-1);
+      const call = (id: string, name: string, input: object) => {
+        expect(tools).toContain(name);
+        reply(res, { type: 'tool_use', id, name, input });
+      };
+      if (tools.length === 1 && last?.type === 'text') {
+        const [tool] = tools;
+        if (tool === 'check_book_scope') {
+          expect(JSON.parse(last.text)).toMatchObject({
+            currentAuthor: follow,
+            referencedAssistant: pending,
+            candidates: [{ operation: 'chapter.patch', id: chapter.id, part, purpose }],
+          });
+          return call('scope-verdict', tool, { allowed: true });
+        }
+        if (tool === 'submit_chapter_patch_review') {
+          reviewCount++;
+          expect(JSON.parse(last.text)).toMatchObject({
+            chapter: { id: chapter.id },
+            edits: [
+              {
+                quote: leftQuote + gap + rightQuote,
+                replacement: `${leftQuote}\n\n${rightQuote}`,
+                part,
+              },
+            ],
+            paragraphGap: { beforeLf: 6, afterLf: 2 },
+          });
+          return call('patch-verdict', tool, { allowed: true });
+        }
+      }
+      if (last?.type === 'text') {
+        if (last.text === inspect) return reply(res, text(pending));
+        expect(last.text).toBe(follow);
+        return call('find-gap-tools', 'tool_search', { query: 'book_get_context book_patch_chapter' });
+      }
+      if (last?.type !== 'tool_result') throw new Error('Expected a tool result');
+      const result = JSON.parse(last.content);
+      expect(result.ok, result.error).toBe(true);
+      switch (last.tool_use_id) {
+        case 'find-gap-tools':
+          return call('read-gap', 'book_get_context', target(chapter));
+        case 'read-gap': {
+          const { document } = result.value as ReadSlice;
+          expect(document.body).toBe(beforeBody);
+          baseRevision = document.revision;
+          return call('gap-scope', 'book_task_scope', {
+            sourceQuote: purpose,
+            items: [{ operation: 'chapter.patch', id: chapter.id, part, purpose }],
+          });
+        }
+        case 'gap-scope':
+          return call('gap-patch', 'book_patch_chapter', {
+            chapterId: chapter.id,
+            revision: baseRevision,
+            edits: [{ paragraphGap: { leftQuote, rightQuote, blankLines: 1 }, part }],
+          });
+        case 'gap-patch':
+          expect(result.value).toMatchObject({ chapterId: chapter.id, patched: 1, parts: [part] });
+          toolRevision = result.value.revision;
+          return reply(res, text('已只缩短指定的段间空白。'));
+      }
+      throw new Error('Unexpected tool result: ' + last.tool_use_id);
+    } catch (error) {
+      errors.push(error);
+      if (!res.headersSent) res.writeHead(500);
+      res.end();
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as AddressInfo).port;
+  const app = await electron.launch({
+    args: ['.'],
+    env: { ...process.env, FW_E2E: '1', FW_TEST_ROOT: root, FW_E2E_SHOW_WINDOW: '0' },
+  });
+  try {
+    const page = await app.firstWindow();
+    const profile = await rpc<ModelProfile>(page, 'profiles.save', {
+      name: 'Paragraph gap fixture',
+      model: 'fixture',
+      apiKey: 'not-a-real-key',
+      protocol: 'messages',
+      baseUrl: `http://127.0.0.1:${port}/v1`,
+    });
+    const { id: bookId } = await rpc<{ id: string }>(page, 'book.create', {
+      title: '雾里的钟声',
+      summary: '只有回归测试的占位文本。',
+    });
+    const doc = (ref: DocRef) => rpc<Manuscript>(page, 'book.doc.read', { bookId, doc: ref });
+    const other = { type: 'chapter', id: 'other' } as const;
+    const seeded = await rpc<WriteReport>(page, 'book.changes.write', {
+      bookId,
+      changes: [
+        { ...chapter, expect: null, fields: { title: '航海日志', order: 10 }, body: beforeBody },
+        {
+          ...other,
+          expect: null,
+          fields: { title: '下一章', order: 11 },
+          body: `${anchor}${gap}${ending}`,
+        },
+      ],
+    });
+    expect(seeded.error).toBeUndefined();
+    const session = await rpc<Session>(page, 'session.create', { bookId });
+    const submit = async (prompt: string) => {
+      const { runId } = await rpc<{ runId: string }>(page, 'session.start', {
+        id: session.id,
+        profileId: profile.id,
+        prompt,
+      });
+      await expect
+        .poll(async () =>
+          (await readDiagnostics(root, 'backend')).some(
+            ({ event, fields }) => event === 'run.finished' && fields.runId === runId,
+          ),
+        )
+        .toBe(true);
+      expect(errors).toEqual([]);
+      const view = await rpc<RuntimeView>(page, 'runtime.snapshot', { bookId });
+      const run = view.sessions.find((row) => row.session.id === session.id)?.run;
+      expect(run?.status, run?.error).toBe('completed');
+      return { run, runId };
+    };
+    await submit(inspect);
+    const before = await doc(chapter);
+    const untouched = await Promise.all([other, outline].map(doc));
+    const path = join(root, 'library', bookId, 'chapters', `${chapter.id}.md`);
+    const originalFile = await readFile(path, 'utf8');
+    await page.evaluate((id) => {
+      const changes: unknown[] = [];
+      Reflect.set(window, 'paragraphGapChanges', changes);
+      window.fw.subscribe((event) => {
+        if (event.type === 'book-change' && event.bookId === id) changes.push(event.documents);
+      });
+    }, bookId);
+
+    const { run, runId } = await submit(follow);
+    expect(run?.taskOutcome).toBe('fulfilled');
+    expect(run?.progress).toMatchObject({ complete: true, total: 1, done: 1 });
+    expect(reviewCount).toBe(1);
+    await expect
+      .poll(() => page.evaluate(() => Reflect.get(window, 'paragraphGapChanges')))
+      .toEqual([[chapter]]);
+    const saved = await doc(chapter);
+    const savedFile = await readFile(path, 'utf8');
+    expect(saved.fields).toEqual(before.fields);
+    expect(saved.body).toBe(afterBody);
+    expect(originalFile).toContain(beforeBody);
+    expect(savedFile).toBe(originalFile.replace(beforeBody, afterBody));
+    expect(originalFile.length - savedFile.length).toBe(4);
+    expect(saved.revision).not.toBe(before.revision);
+    expect(saved.revision).toBe(createHash('sha256').update(savedFile).digest('hex'));
+    expect(saved.revision).toBe(toolRevision!);
+    expect(await Promise.all([other, outline].map(doc))).toEqual(untouched);
+
+    const receipts = (await readFile(join(root, 'state', 'sessions', `${session.id}.jsonl`), 'utf8'))
+      .split(/\r?\n/u)
+      .filter(Boolean)
+      .map((row) => (JSON.parse(row) as { toolReceipt?: ToolReceipt }).toolReceipt)
+      .filter((receipt) => receipt?.commitCount);
+    expect(receipts).toEqual([
+      expect.objectContaining({
+        runId,
+        tool: 'book_patch_chapter',
+        commitCount: 1,
+        commits: [{ ...chapter, operation: 'write', revision: saved.revision }],
+      }),
+    ]);
+    const trace = (await readDiagnostics(root, 'backend')).filter(
+      ({ fields }) => fields.runId === runId,
+    );
+    const reviews = trace.filter(({ event }) => event === 'chapter.patch.review');
+    const commits = trace.filter(({ event }) => event === 'workspace.document.committed');
+    expect(reviews).toHaveLength(1);
+    expect(commits).toHaveLength(1);
+    expect(reviews[0].fields).toMatchObject({ verdict: 'approved', callId: commits[0].fields.callId });
+    expect(commits[0].fields.revision).toBe(
+      trace.find(({ event }) => event === 'chapter.patch.finished')?.fields.revision,
+    );
+    expect(await diagnosticText(root, 'backend')).not.toMatch(/GAP_LEFT_FIXTURE|GAP_RIGHT_FIXTURE/);
+  } finally {
+    await app.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});

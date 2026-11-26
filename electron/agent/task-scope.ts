@@ -2,7 +2,6 @@ import type { Manuscript } from '../../shared/contracts.js';
 import { diagnosticScope } from '../../shared/diagnostics.js';
 import { isId } from '../documents.js';
 import { assetPatchFields, sameAssetPatch, type AssetPatch } from './asset-patch.js';
-import type { ProseEdit } from './chapter-patch.js';
 import { inputEstimate, planModelBudget } from './context-budget.js';
 import { object, str, ToolFailure, type LocalTool } from './loop.js';
 import type { ModelProvider, Turn } from './model.js';
@@ -94,7 +93,7 @@ export class BookTaskScope {
     );
   }
 
-  patchTargets(id: string, edits: readonly ProseEdit[], ctx: RunContext): ScopeTarget[] {
+  patchTargets(id: string, edits: readonly { part?: string }[], ctx: RunContext): ScopeTarget[] {
     const parts = this.patchParts(id);
     if (!parts.length && edits.every(({ part }) => part === undefined))
       return [{ operation: 'chapter.patch', id }];
