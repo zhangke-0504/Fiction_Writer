@@ -5,6 +5,7 @@ const readTools = new Set([
   'search_text',
   'read_file',
   'book_get_context',
+  'book_search_text',
   'book_memory_recall',
 ]);
 const controlTools = new Set(['skill_search', 'skill_load', 'book_task_scope']);

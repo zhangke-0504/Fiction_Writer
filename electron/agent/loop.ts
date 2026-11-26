@@ -94,7 +94,7 @@ interface Candidate {
   notDispatched?: boolean;
   rejected?: boolean;
   executed?: boolean;
-  observeDispatch?: (report: ReportDiagnostic) => void;
+  observeDispatch?: (report: ReportDiagnostic, result: ToolResult) => void;
 }
 interface Round {
   number: number;
@@ -141,7 +141,10 @@ interface AgentBudget {
   roundLimit: () => number;
   budgetPurpose: () => ModelRequest['budgetPurpose'];
   canDeliverWholeSkill?: () => boolean;
-  narrowedWritingStep?: (ctx: RunContext) => Promise<NarrowedWritingStep | undefined>;
+  narrowedWritingStep?: (
+    ctx: RunContext,
+    prospective?: readonly ToolResult[],
+  ) => Promise<NarrowedWritingStep | undefined>;
 }
 
 export async function runAgent(
@@ -199,8 +202,10 @@ export async function runAgent(
       originalSpanId: original,
       spanId: span,
     });
-  const stepFor = () =>
-    typeof budget === 'number' || !ctx.session.bookId ? undefined : budget.narrowedWritingStep?.(ctx);
+  const stepFor = (prospective?: readonly ToolResult[]) =>
+    typeof budget === 'number' || !ctx.session.bookId
+      ? undefined
+      : budget.narrowedWritingStep?.(ctx, prospective);
   const stopped = (why: string, step?: NarrowedWritingStep, reason = 'output_limit') =>
     new DiagnosticFailure(
       reason,
@@ -390,6 +395,7 @@ export async function runAgent(
         const visibleTools = catalog?.visible() ?? tools;
         let dispatchedTools = visibleTools;
         const fit = (step?: NarrowedWritingStep) => {
+          dispatchedTools = visibleTools;
           // A verified step may need an existing schema the Agent has not discovered yet.
           if (step?.toolNames) {
             const visible = new Set(visibleTools.map(({ name }) => name));
@@ -413,15 +419,42 @@ export async function runAgent(
           }
           return wire;
         };
+        const nextReadResults = (wire: ReturnType<typeof fit>) =>
+          outbound.flatMap(({ id, tool }) => {
+            const result = wire.latest.get(id);
+            return tool?.name === 'book_get_context' && result?.ok ? [result] : [];
+          });
+        const sameStep = (a: NarrowedWritingStep, b: NarrowedWritingStep) =>
+          a.complete === b.complete &&
+          a.canAdvance === b.canAdvance &&
+          a.status === b.status &&
+          a.instructions === b.instructions &&
+          JSON.stringify(a.toolNames) === JSON.stringify(b.toolNames);
+        let wire: ReturnType<typeof fit>;
         if (narrowed) {
-          round.narrowStep = await stepFor();
-          ctx.signal.throwIfAborted();
-          if (!round.narrowStep || (!round.narrowStep.complete && !round.narrowStep.canAdvance)) {
-            recovery(report, 'no_safe_step', 'output_limit', recoveryOrigin);
-            throw stopped('已不能安全选出下一项，停止自动续接', round.narrowStep);
+          const readsPending = outbound.some(
+            ({ tool, result }) => tool?.name === 'book_get_context' && result.ok,
+          );
+          let step = await stepFor(readsPending ? nextReadResults(fit()) : undefined);
+          for (let i = 0; ; i++) {
+            ctx.signal.throwIfAborted();
+            if (!step || (!step.complete && !step.canAdvance)) {
+              recovery(report, 'no_safe_step', 'output_limit', recoveryOrigin);
+              throw stopped('已不能安全选出下一项，停止自动续接', step);
+            }
+            wire = fit(step);
+            if (!readsPending) break;
+            // Candidate schemas/notice have their own cost. Recheck against what will really be sent.
+            const actual = await stepFor(nextReadResults(wire));
+            if (actual && sameStep(step, actual)) {
+              step = actual;
+              break;
+            }
+            if (i >= 2) throw contextOverflow();
+            step = actual;
           }
-        }
-        let wire = fit(round.narrowStep);
+          round.narrowStep = step;
+        } else wire = fit();
         let answeredSpanId = spanId;
         const send = (attemptId: string, attempt: 1 | 2, replan = false) => {
           const requestTrace = diagnosticScope(report, {
@@ -430,7 +463,8 @@ export async function runAgent(
             ...(attempt === 2 && { originalSpanId: spanId }),
           });
           return provider.turn({
-            ...wire,
+            system: wire.system,
+            history: wire.history,
             tools: dispatchedTools,
             budgetPurpose,
             budgetBasis: pendingWholeSkill
@@ -445,18 +479,28 @@ export async function runAgent(
             onDispatch(nextSpanId) {
               if (round.narrowStep) round.narrowSpanId = nextSpanId;
               if (replan) recovery(requestTrace, 'dispatched', 'output_limit', spanId, nextSpanId);
-              // Dispatch metadata and business receipts for already executed tools stay unique.
+              diagnosticScope(requestTrace, { spanId: nextSpanId })(
+                'context.projected',
+                wire.projection,
+              );
+              // A transport handoff, not an acknowledgement or model adoption.
               for (const { id, candidate, result, tool } of outbound.splice(0)) {
-                candidate.report('tool.result_sent', { spanId: nextSpanId, nextTurn: number });
+                const actual = wire.latest.get(id);
+                if (!actual) {
+                  candidate.report('tool.result_omitted', {
+                    spanId: nextSpanId,
+                    reason: 'context_limit',
+                  });
+                  continue;
+                }
+                candidate.report('tool.result_sent', {
+                  spanId: nextSpanId,
+                  nextTurn: number,
+                  delivery: actual === result ? 'full' : 'projected',
+                });
                 const sent = diagnosticScope(candidate.context, { spanId: nextSpanId, turn: number });
-                tool?.onResultSent?.(result, sent);
-                if (
-                  result.ok &&
-                  wire.history.some(
-                    (row) => row.role === 'tool' && row.id === id && row.result === result,
-                  )
-                )
-                  candidate.observeDispatch?.(sent);
+                tool?.onResultSent?.(actual, sent);
+                if (actual.ok) candidate.observeDispatch?.(sent, actual);
               }
             },
           });
@@ -763,6 +807,8 @@ export async function runAgent(
     for (const candidate of active?.candidates.values() ?? []) reject(candidate, reason);
     finish(reason === 'cancelled' ? 'cancelled' : 'failed', reason);
     throw error;
+  } finally {
+    for (const { candidate } of outbound.splice(0)) candidate.report('tool.result_omitted');
   }
   ctx.signal.throwIfAborted();
   if (receiptFailure)

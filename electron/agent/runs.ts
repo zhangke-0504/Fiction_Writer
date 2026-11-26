@@ -10,6 +10,7 @@ import type {
   Session,
   SessionView,
   Target,
+  ToolResult,
   WorkProgress,
 } from '../../shared/contracts.js';
 import { Journal } from '../journal.js';
@@ -58,8 +59,8 @@ export interface RunContext {
   narrowedWriting?: boolean;
   history?: SessionHistory;
   recordTool?: (receipt: ToolReceipt) => Promise<void>;
-  /** Observe a complete tool result only if it is actually sent to the model. */
-  onToolResultDispatch?: (observe: (report: ReportDiagnostic) => void) => void;
+  /** Observe only the tool result actually sent, after handoff to transport. */
+  onToolResultDispatch?: (observe: (report: ReportDiagnostic, result: ToolResult) => void) => void;
   continuation?: NovelContinuation;
   bookEdit?: BookEdit;
   stageEditProposal?: (value: EditPlan, basis: EditBasis) => void;

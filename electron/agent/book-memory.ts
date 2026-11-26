@@ -449,7 +449,10 @@ export function bookMemoryTools(workspace: WorkspaceService, bookId: string): Lo
           diagnostic: {
             trigger: 'tool',
             report: ctx.diagnostic,
-            captureDispatch: ctx.onToolResultDispatch,
+            captureDispatch: (observe) =>
+              ctx.onToolResultDispatch?.((report, result) =>
+                observe(report, result.value as BookRecall),
+              ),
           },
         }),
     },

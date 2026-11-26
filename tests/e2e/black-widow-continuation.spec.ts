@@ -104,7 +104,7 @@ for (const mode of ['original', 'paraphrase', 'missing', 'stale-after-catalog'] 
           });
         if (last.tool_call_id === 'scope-duel') {
           expect(result.ok, result.error).toBe(true);
-          return use('read-setup', 'book_get_context', {});
+          return use('read-setup', 'book_get_context', { includeBodies: true });
         }
         if (last.tool_call_id === 'read-setup')
           return use('read-ninth', 'book_get_context', { type: 'chapter', documentId: ch09.id });

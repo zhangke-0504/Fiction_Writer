@@ -30,6 +30,12 @@ export class MessagesOutputLimit extends ProviderError {
     super('Messages 输出达到模型长度上限，未取得完整结果', 'protocol', 'output_limit');
   }
 }
+// A diagnostic distinction only: Chat deliberately keeps its existing failure/recovery behavior.
+class ChatOutputLimit extends ProviderError {
+  constructor() {
+    super('模型达到输出上限，未提交响应', 'protocol', 'incomplete_stream');
+  }
+}
 const error = (message: string, detail?: ProviderError['detail']) =>
   new ProviderError(message, 'protocol', detail);
 function reply(text: string, calls: ToolCall[], native?: unknown): AssistantTurn {
@@ -259,10 +265,8 @@ async function parseChat(
   const ordered = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
   if (!['stop', 'tool_calls'].includes(stop)) {
     rejectCalls(ordered, request, report, 'incomplete_stream');
-    throw error(
-      stop === 'length' ? '模型达到输出上限，未提交响应' : '流式回复中断或未正常结束',
-      'incomplete_stream',
-    );
+    if (stop === 'length') throw new ChatOutputLimit();
+    throw error('流式回复中断或未正常结束', 'incomplete_stream');
   }
   if (stop === 'tool_calls' && !ordered.length) throw error('模型未传回工具调用', 'incomplete_stream');
   assertCalls(ordered, request, report);
@@ -587,6 +591,7 @@ export function createProvider(
         report('model.finished', {
           outcome: reason === 'cancelled' || reason === 'timeout' ? reason : 'failed',
           reason,
+          ...(cause instanceof ChatOutputLimit && { providerStop: 'output_limit' }),
           elapsedMs: elapsed(started),
           httpStatus,
         });

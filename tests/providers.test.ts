@@ -878,6 +878,7 @@ function eventResponse(events: unknown[]) {
 
 for (const variant of [
   'first-delivery',
+  'read-pressure',
   'clamped',
   'ineligible',
   'candidates',
@@ -921,6 +922,16 @@ for (const variant of [
                 },
               },
               { type: 'content_block_stop', index: 0 },
+              ...(variant === 'read-pressure' && name === 'skill_load'
+                ? Array.from({ length: 4 }, (_, i) => [
+                    {
+                      type: 'content_block_start',
+                      index: i + 1,
+                      content_block: { type: 'tool_use', id: 'read-' + i, name: 'read_file', input: {} },
+                    },
+                    { type: 'content_block_stop', index: i + 1 },
+                  ]).flat()
+                : []),
               { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
               { type: 'message_stop' },
             ]
@@ -966,6 +977,16 @@ for (const variant of [
         ...catalog.tools((name) => {
           if (eligible && name === 'generate-novel') applied = true;
         }),
+        ...(variant === 'read-pressure'
+          ? [
+              {
+                name: 'read_file',
+                description: 'long read',
+                schema: object({}, []),
+                execute: async () => '潮'.repeat(6000),
+              },
+            ]
+          : []),
         {
           name: 'fixture_step',
           description: 'fixture',
@@ -986,13 +1007,17 @@ for (const variant of [
         [8_192],
       );
       assert.ok(!applied);
-      assert.ok(!trace.rows.some((row) => row.event === 'skill.applied'));
+      assert.ok(
+        !trace.rows.some((row) => row.event === 'skill.applied' || row.event === 'tool.result_sent'),
+      );
+      assert.ok(trace.rows.some((row) => row.event === 'tool.result_omitted'));
       if (variant === 'blocked')
         assert.ok(trace.rows.some((row) => row.fields.reason === 'context_limit'));
       return;
     }
     await result;
-    const wantsLong = variant === 'first-delivery' || variant === 'clamped';
+    const wantsLong =
+      variant === 'first-delivery' || variant === 'read-pressure' || variant === 'clamped';
     const long = variant === 'clamped' ? 12_000 : 65_536;
     assert.deepEqual(
       bodies.map((row) => row.max_tokens),
@@ -1012,6 +1037,15 @@ for (const variant of [
         .flatMap((row) => row.content)
         .filter((block) => block.type === 'tool_result');
       assert.equal(results[0].tool_use_id, 'call_skill_load');
+      if (variant === 'read-pressure') {
+        assert.equal(results.length, 5);
+        assert.equal(
+          trace.rows.filter(
+            ({ event, fields }) => event === 'tool.result_sent' && fields.delivery === 'projected',
+          ).length,
+          4,
+        );
+      }
       assert.deepEqual(JSON.parse(results[0].content).value, {
         name: 'generate-novel',
         instructions: guide,
@@ -1503,3 +1537,214 @@ for (const protocol of ['chat', 'responses', 'messages'] as const)
     assert.match(JSON.stringify(body.input ?? body.messages), /补铜铃的说明/);
     assert.doesNotMatch(JSON.stringify(body), /book_apply_changes|book_get_context/);
   });
+
+for (const stop of ['length', 'dropped', 'timeout', 'cancelled'] as const) {
+  test(`Chat distinguishes ${stop} without executing or retrying a partial tool call`, async (t) => {
+    const marker = 'CHAT_STOP_PRIVATE_FIXTURE';
+    const cancel = new AbortController();
+    const { profile, requests } = await fixture(t, 'chat', (_body, res) => {
+      const blocks = [
+        chat({ content: marker }),
+        chat({
+          tool_calls: [
+            {
+              index: 0,
+              id: 'hidden-call',
+              function: { name: 'read_file', arguments: `{"fixture":"${marker}` },
+            },
+          ],
+        }),
+      ];
+      if (stop === 'length' || stop === 'dropped')
+        return sse(res, ...blocks, ...(stop === 'length' ? [chat({}, 'length')] : []));
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(blocks.map((block) => `data: ${JSON.stringify(block)}\n\n`).join(''));
+    });
+    const trace = collectDiagnostics();
+    let executions = 0,
+      stepChecks = 0;
+    const context = harnessFixture(trace, {
+      signal: cancel.signal,
+      text() {
+        if (stop === 'cancelled') cancel.abort();
+      },
+    });
+    context.session.bookId = 'fixture-book';
+    await assert.rejects(
+      runAgent(
+        context,
+        createProvider(profile, key, 'high', 1_000),
+        '',
+        [],
+        'test',
+        [
+          {
+            name: 'read_file',
+            description: 'fixture',
+            schema: object({}, []),
+            async execute() {
+              executions++;
+            },
+          },
+        ],
+        {
+          roundLimit: () => 10,
+          budgetPurpose: () => 'standard',
+          async narrowedWritingStep() {
+            stepChecks++;
+            return undefined;
+          },
+        },
+      ),
+    );
+    assert.equal(executions, 0);
+    assert.equal(stepChecks, 0);
+    assert.equal(requests.length, 1);
+    assert.ok(
+      !trace.rows.some(
+        ({ event }) => event === 'tool.started' || event === 'model.output_limit_recovery',
+      ),
+    );
+    const result = trace.rows.find(({ event }) => event === 'model.finished')!.fields;
+    assert.equal(result.reason, stop === 'length' || stop === 'dropped' ? 'incomplete_stream' : stop);
+    assert.equal(result.providerStop, stop === 'length' ? 'output_limit' : undefined);
+    assert.doesNotMatch(JSON.stringify(trace.rows), /CHAT_STOP_PRIVATE_FIXTURE|hidden-call/);
+    assert.deepEqual(trace.rejected, []);
+  });
+}
+
+for (const protocol of ['chat', 'responses', 'messages'] as const) {
+  test(`${protocol} bounds new read batches and old read history under a large input limit`, async (t) => {
+    const trace = collectDiagnostics();
+    let round = 0;
+    const batches = 4;
+    const readMarker = 'READ_PAYLOAD_MUST_NOT_BE_LOGGED';
+    const { profile, requests } = await fixture(t, protocol, (_body, res) => {
+      const n = round++;
+      const ids = Array.from({ length: 4 }, (_, i) => `batch-${n}-${i}`);
+      if (n === batches) {
+        if (protocol === 'chat') return sse(res, chat({}, 'stop'));
+        if (protocol === 'responses')
+          return sse(res, { type: 'response.completed', response: { output: [] } });
+        return sse(
+          res,
+          { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+          { type: 'message_stop' },
+        );
+      }
+      if (protocol === 'chat')
+        return sse(
+          res,
+          chat(
+            {
+              reasoning_content: `native-${n}`,
+              tool_calls: ids.map((id, index) => ({
+                id,
+                index,
+                function: { name: 'read_file', arguments: '{}' },
+              })),
+            },
+            'tool_calls',
+          ),
+        );
+      if (protocol === 'responses')
+        return sse(res, {
+          type: 'response.completed',
+          response: {
+            output: [
+              { type: 'reasoning', id: `rs-${n}`, encrypted_content: `native-${n}` },
+              ...ids.map((id) => ({
+                type: 'function_call',
+                call_id: id,
+                name: 'read_file',
+                arguments: '{}',
+              })),
+            ],
+          },
+        });
+      return sse(
+        res,
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'thinking', thinking: `native-${n}`, signature: `sig-${n}` },
+        },
+        { type: 'content_block_stop', index: 0 },
+        ...ids.flatMap((id, i) => [
+          {
+            type: 'content_block_start',
+            index: i + 1,
+            content_block: { type: 'tool_use', id, name: 'read_file', input: {} },
+          },
+          { type: 'content_block_stop', index: i + 1 },
+        ]),
+        { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+        { type: 'message_stop' },
+      );
+    });
+    let counter = 0;
+    const provider = Object.assign(createProvider(profile, key), { inputTokenBudget: 80_000 });
+    await runAgent(harnessFixture(trace), provider, '', [], 'tool batch fixture', [
+      {
+        name: 'read_file',
+        description: 'fixture',
+        schema: object({}, []),
+        async execute() {
+          return { start: 1, total: 6, text: `${readMarker}${counter++}${'潮'.repeat(4000)}` };
+        },
+      },
+    ]);
+    assert.equal(counter, 4 * batches);
+    const estimates = trace.rows.filter(({ event }) => event === 'context.projected');
+    assert.equal(estimates.length, batches + 1);
+    assert.ok(
+      estimates.every(
+        ({ fields }) =>
+          Number(fields.newReadEstimate) <= 6144 && Number(fields.historicalReadEstimate) <= 8192,
+      ),
+    );
+    assert.ok(
+      estimates.some(
+        ({ fields }) => Number(fields.newReadEstimate) > 0 && Number(fields.projectedResults) >= 4,
+      ),
+    );
+    assert.ok(estimates.some(({ fields }) => Number(fields.historicalReadEstimate) > 0));
+    assert.ok(
+      trace.rows.some(
+        ({ event, fields }) => event === 'tool.result_sent' && fields.delivery === 'projected',
+      ),
+    );
+    assert.ok(
+      !trace.rows.some(({ event }) => event === 'context.compacted') ||
+        trace.rows
+          .filter(({ event }) => event === 'context.compacted')
+          .every(({ fields }) => fields.count === 0),
+    );
+    requests.slice(1).forEach(({ body }, i) => {
+      assert.match(JSON.stringify(body), new RegExp(`native-${i}`));
+      let calls: string[], results: string[];
+      if (protocol === 'chat') {
+        calls = body.messages.flatMap((row: any) => (row.tool_calls ?? []).map((call: any) => call.id));
+        results = body.messages
+          .filter((row: any) => row.role === 'tool')
+          .map((row: any) => row.tool_call_id);
+      } else {
+        const rows =
+          protocol === 'responses' ? body.input : body.messages.flatMap((row: any) => row.content);
+        calls = rows
+          .filter((row: any) => row.type === (protocol === 'responses' ? 'function_call' : 'tool_use'))
+          .map((row: any) => row.call_id ?? row.id);
+        results = rows
+          .filter(
+            (row: any) =>
+              row.type === (protocol === 'responses' ? 'function_call_output' : 'tool_result'),
+          )
+          .map((row: any) => row.call_id ?? row.tool_use_id);
+      }
+      assert.deepEqual(results, calls);
+      assert.equal(calls.length, 4 * (i + 1));
+    });
+    assert.doesNotMatch(JSON.stringify(trace.rows), /READ_PAYLOAD_MUST_NOT_BE_LOGGED|native-0|batch-0/);
+    assert.deepEqual(trace.rejected, []);
+  });
+}

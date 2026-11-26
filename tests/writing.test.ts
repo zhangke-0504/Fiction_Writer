@@ -181,7 +181,7 @@ test('an invalid foreshadowing reference returns concrete repairs without writin
     },
   };
   const provider = new ScriptedProvider([
-    () => call('read', 'book_get_context', {}),
+    () => call('read', 'book_get_context', { includeBodies: true }),
     () => call('invalid', 'book_apply_changes', { operations: [invalid] }),
     async ({ history }) => {
       const last = history.at(-1)!;
@@ -265,7 +265,7 @@ test('story consistency requires the current read set and applies only affected 
       }),
     ({ history }) => {
       assert.match(JSON.stringify(history.at(-1)), /先用 book_get_context/);
-      return call('context1', 'book_get_context', {});
+      return call('context1', 'book_get_context', { includeBodies: true });
     },
     ({ history, system }) => {
       const read = JSON.stringify(history.at(-1));
@@ -310,7 +310,7 @@ test('story consistency requires the current read set and applies only affected 
   assert.equal(after.documents.find((d) => d.id === 'two')!.body, '她推开小门。');
 
   const reverse = new ScriptedProvider([
-    () => call('context2', 'book_get_context', {}),
+    () => call('context2', 'book_get_context', { includeBodies: true }),
     ({ history }) => {
       assert.match(JSON.stringify(history.at(-1)), /母亲留下/);
       return call('apply2', 'book_apply_changes', {
@@ -362,7 +362,7 @@ test('an exact in-run commit can be reused, but a subsequent external edit still
       ],
     });
   const provider = new ScriptedProvider([
-    () => call('read', 'book_get_context', {}),
+    () => call('read', 'book_get_context', { includeBodies: true }),
     () => mutation('create', 'create', '初稿'),
     ({ history }) => {
       assert.match(JSON.stringify(history.at(-1)), /"ok":true/);

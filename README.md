@@ -42,6 +42,8 @@ Get-ChildItem -LiteralPath $logDir -File |
 
 用 `runId` 找到 `run.started` 后，还可用同一行的 `requestId` 查启动前的记录。核对作品记忆时，按 `runId` 找 `memory.recall.finished`，再按 `recallId` 找 `memory.context.dispatched`，用 `spanId` 对照 `memory.context.source`（实际带上的来源）和 `model.http`。召回不等于派发；派发只表示交给传输层，不代表供应商收到或模型采用。日志也可能缺失，不要仅凭缺少记录判断请求未发送。
 
+检查长读稿时，用相同的 `runId` 和 `spanId` 对照 `model.budget_dispatched`（本地输入估算与实发输出上限）和 `context.projected`（本轮与历史保留的可重读体积估算、投影条数）。`tool.result_sent.delivery` 区分完整结果和投影，`tool.result_omitted` 表示未发送；派发不证明供应商已接收或模型已采用。Chat 的 `model.finished.providerStop: output_limit` 表示显式长度终态，未标记的 `incomplete_stream` 不据此推断触限。本地超时、取消另有原因，Chat 不因此进入 Messages 的续接路径。
+
 排障时可提供诊断编号和核对过的必要事件，不要提交原始日志或粘贴密钥配置。
 
 </details>

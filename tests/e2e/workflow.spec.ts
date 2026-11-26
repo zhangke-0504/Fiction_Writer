@@ -291,7 +291,8 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
         expect(result.ok).toBe(true);
         return generate(3);
       }
-      if (marker === 'entry-discover') return use('book_get_context', 'entry-context', {});
+      if (marker === 'entry-discover')
+        return use('book_get_context', 'entry-context', { includeBodies: true });
       if (marker === 'entry-context') {
         expect(result.ok).toBe(true);
         expect(result.value.documents.filter((d: Manuscript) => d.type === 'subject')).toHaveLength(3);
@@ -412,7 +413,7 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
                   assetRefs: [{ type: 'subject', id: repairId }],
                 },
               })
-            : use('book_get_context', 'initial-read', {});
+            : use('book_get_context', 'initial-read', { includeBodies: true });
       }
       if (marker === 'repair-register') {
         expect(result.value).toMatchObject({

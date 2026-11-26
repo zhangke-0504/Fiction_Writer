@@ -1,6 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { classified, DiagnosticFailure } from '../diagnostics/trace.js';
-import type { Change, DocRef, Fields, Manuscript, WriteReport } from '../../shared/contracts.js';
+import type {
+  Change,
+  DocRef,
+  Fields,
+  Manuscript,
+  ToolResult,
+  WriteReport,
+} from '../../shared/contracts.js';
 import type { WorkspaceService, Guard } from '../workspace.js';
 import {
   chapterPlacementFingerprint,
@@ -67,6 +74,16 @@ import {
   type NarrowedWritingStep,
 } from './loop.js';
 import { hasStoryDescription } from './story-notes.js';
+import {
+  charBoundary,
+  documentRef,
+  documentRow,
+  fitBookPage,
+  type BookHit,
+  type DocumentPage,
+  type ReadDocument,
+  type ReadPage,
+} from './tool-context.js';
 import type { ModelProvider } from './model.js';
 import type { SkillCatalog, SkillName } from './skills.js';
 import type { RunContext } from './runs.js';
@@ -192,8 +209,10 @@ function referenceIndex(documents: Manuscript[], index: ReferenceIndex, offset: 
           );
   return {
     index,
+    offset,
     rows: rows.slice(offset, offset + indexPageSize),
     nextOffset: offset + indexPageSize < rows.length ? offset + indexPageSize : null,
+    pageState: offset + indexPageSize < rows.length ? 'partial' : 'complete',
   };
 }
 const fieldSchema = object(
@@ -213,10 +232,6 @@ const fieldSchema = object(
   },
   [],
 );
-function projection(doc: Manuscript, include = true) {
-  const { body, ...row } = doc;
-  return include ? { ...row, body } : { ...row, bodyLength: body.length };
-}
 function editWriteContext(ctx: RunContext) {
   const saved = new Map<string, string>();
   return {
@@ -255,6 +270,13 @@ const priority: Record<Manuscript['type'], number> = {
   chapter: 4,
 };
 
+type BookReads = {
+  readSet: Map<string, Guard>;
+  sourceReads: Map<string, { revision: string; ranges: [number, number][] }>;
+  offsets: Map<string, { revision: string; next: number }>;
+  targetedReads: Set<string>;
+};
+
 /** The per-run read set prevents edits based on stale story data. It is never persisted as story content. */
 export class NovelTools {
   private wholeSkill = false;
@@ -267,12 +289,14 @@ export class NovelTools {
   private readonly chapterFailures = new Map<string, ToolFailure>();
   private readonly insertionFailures = new Map<string, ToolFailure>();
   private readonly currentInsertions = new Map<string, CurrentInsertion>();
-  private readonly targetedReads = new Set<string>();
-  private readonly readSet = new Map<string, Guard>();
-  private readonly chapterReads = new Map<string, { revision: string; ranges: [number, number][] }>();
+  private readonly reads: BookReads = {
+    readSet: new Map(),
+    sourceReads: new Map(),
+    offsets: new Map(),
+    targetedReads: new Set(),
+  };
   private populatedAtStart?: Set<string>;
   private readonly draftedHere = new Map<string, string>();
-  private readonly offsets = new Map<string, { revision: string; next: number }>();
   private readonly createdHere = new Set<string>();
   private readonly directCommits: EditCommit[] = [];
   private readonly directPassages = new Map<
@@ -481,7 +505,10 @@ export class NovelTools {
   roundLimit = () => defaultRoundLimit;
   budgetPurpose = () => (this.wholeSkill ? ('long-writing' as const) : undefined);
   /** Recovery uses current targets and receipts, never the truncated model output. */
-  narrowedWritingStep = async (ctx: RunContext): Promise<NarrowedWritingStep | undefined> => {
+  narrowedWritingStep = async (
+    ctx: RunContext,
+    prospective: readonly ToolResult[] = [],
+  ): Promise<NarrowedWritingStep | undefined> => {
     const edit = this.editMode === 'confirmed' && this.edit?.hasTargets ? this.edit : undefined;
     const scope = this.input.scope;
     const scoped = !!scope?.items.length && !this.wholeWork;
@@ -494,6 +521,16 @@ export class NovelTools {
     ctx.signal.throwIfAborted();
     if (view.diagnostics.length) return;
     const docs = view.documents;
+    // For next-step selection only. No provisional page updates the real read set.
+    const reads = prospective.length
+      ? {
+          readSet: new Map(this.reads.readSet),
+          sourceReads: new Map(this.reads.sourceReads),
+          offsets: new Map(this.reads.offsets),
+          targetedReads: new Set(this.reads.targetedReads),
+        }
+      : this.reads;
+    for (const result of prospective) this.observeRead(result, reads);
     const byKey = new Map(docs.map((doc) => [docKey(doc), doc]));
     const options: {
       name: string;
@@ -507,11 +544,11 @@ export class NovelTools {
       const doc = byKey.get(key);
       if (!doc || readKeys.has(key)) return;
       readKeys.add(key);
-      const cursor = this.offsets.get(key);
+      const cursor = reads.offsets.get(key);
       const offset = cursor?.revision === doc.revision ? cursor.next : 0;
       if (
-        this.targetedReads.has(this.documentReadKey(doc, offset)) ||
-        (doc.type !== 'chapter' && this.readSet.get(key)?.revision === doc.revision)
+        reads.targetedReads.has(this.documentReadKey(doc, offset)) ||
+        (doc.type !== 'chapter' && reads.readSet.get(key)?.revision === doc.revision)
       )
         return;
       add(
@@ -526,7 +563,7 @@ export class NovelTools {
       );
     };
     const readIndex = (index: ReferenceIndex) => {
-      if (this.targetedReads.has(this.indexReadKey(docs, index, 0))) return;
+      if (reads.targetedReads.has(this.indexReadKey(docs, index, 0))) return;
       add(
         'book_get_context',
         `核对 ${index} 索引首页`,
@@ -575,7 +612,7 @@ export class NovelTools {
       }`;
       if (!remaining.length && !sync.length) return plan(status, true);
 
-      const unread = (doc: Manuscript) => this.readSet.get(docKey(doc))?.revision !== doc.revision;
+      const unread = (doc: Manuscript) => reads.readSet.get(docKey(doc))?.revision !== doc.revision;
       const syncKeys = new Set(sync.map(({ key }) => key));
       for (const { key, ready } of sync) {
         const [kind, id] = key.split('/');
@@ -625,8 +662,8 @@ export class NovelTools {
         }
         if (!doc || kind !== 'chapter') continue;
         if (operation === 'chapter.patch') {
-          const hasProse = this.chapterReads.get(id)?.revision === doc.revision;
-          if (!hasProse || this.offsets.has(key)) readDoc(key);
+          const hasProse = reads.sourceReads.get(key)?.revision === doc.revision;
+          if (!hasProse || reads.offsets.has(key)) readDoc(key);
           if (hasProse)
             add(
               'book_patch_chapter',
@@ -797,7 +834,7 @@ export class NovelTools {
       ? docs.filter(
           (doc) =>
             ['outline', 'subject', 'clue'].includes(doc.type) &&
-            this.readSet.get(docKey(doc))?.revision !== doc.revision,
+            reads.readSet.get(docKey(doc))?.revision !== doc.revision,
         )
       : [];
     if (needsOutline && !outlineBasis.length) {
@@ -842,7 +879,7 @@ export class NovelTools {
     for (const d of outlineBasis) readDoc(docKey(d));
     return plan(status);
   };
-  private documentReadKey(doc: Manuscript, offset: number) {
+  private documentReadKey(doc: Guard, offset: number) {
     return `${docKey(doc)}:${doc.revision}:${offset}`;
   }
   private indexReadKey(docs: Manuscript[], index: ReferenceIndex, offset: number) {
@@ -1139,8 +1176,8 @@ export class NovelTools {
     for (const key of new Set(invalid))
       this.referenceFailures.set(key, (this.referenceFailures.get(key) ?? 0) + 1);
   }
-  private remember(doc: Manuscript) {
-    this.readSet.set(docKey(doc), { type: doc.type, id: doc.id, revision: doc.revision });
+  private remember(doc: Guard, reads = this.reads) {
+    reads.readSet.set(docKey(doc), { type: doc.type, id: doc.id, revision: doc.revision });
   }
   private async context(
     args: {
@@ -1149,6 +1186,8 @@ export class NovelTools {
       offset?: number;
       length?: number;
       index?: ReferenceIndex;
+      includeBodies?: boolean;
+      revision?: string;
       novelGoal?: GoalRequest;
     },
     ctx: RunContext,
@@ -1171,10 +1210,14 @@ export class NovelTools {
       }
       return this.goalView(args.novelGoal, view, ctx);
     }
-    const offset = args.offset ?? 0;
+    const offset = Math.min(Number.MAX_SAFE_INTEGER, args.offset ?? 0);
     if (args.index) {
-      this.targetedReads.add(this.indexReadKey(view.documents, args.index, offset));
-      return referenceIndex(view.documents, args.index, offset);
+      const key = this.indexReadKey(view.documents, args.index, offset);
+      ctx.onToolResultDispatch?.((_report, result) => {
+        if ((result.value as { pageState?: string })?.pageState !== 'deferred')
+          this.reads.targetedReads.add(key);
+      });
+      return fitBookPage('book_get_context', referenceIndex(view.documents, args.index, offset));
     }
     const documents = view.documents
       .filter((d) => !args.type || d.type === args.type)
@@ -1182,52 +1225,108 @@ export class NovelTools {
     if (args.documentId) {
       const matches = documents.filter((d) => d.id === args.documentId);
       if (matches.length !== 1) throw new Error('文档不存在或 ID 不唯一，请同时指定 type');
-      const doc = matches[0],
-        key = docKey(doc),
-        end = Math.min(doc.body.length, offset + (args.length ?? 44_000)),
-        continued = this.offsets.get(key);
-      if (offset === 0 || (continued?.revision === doc.revision && continued.next === offset)) {
-        this.targetedReads.add(this.documentReadKey(doc, offset));
-        if (end === doc.body.length) {
-          this.remember(doc);
-          this.offsets.delete(key);
-        } else this.offsets.set(key, { revision: doc.revision, next: end });
-      }
-      const result = {
-        document: { ...projection(doc, false), body: doc.body.slice(offset, end) },
+      const doc = matches[0];
+      const row = documentRow(doc, false);
+      if (args.revision && args.revision !== doc.revision)
+        return {
+          document: documentRef(row),
+          range: [0, 0],
+          nextOffset: 0,
+          pageState: 'changed',
+          hint: '修订已变化，请按现版重新定位原文，不与旧页合并。',
+        };
+      const start = charBoundary(doc.body, Math.min(offset, doc.body.length));
+      let end = charBoundary(doc.body, Math.min(doc.body.length, start + (args.length ?? 6_000)));
+      if (end === start && start < doc.body.length) end += doc.body.codePointAt(start)! > 0xffff ? 2 : 1;
+      const value: DocumentPage = {
+        document: { ...row, body: doc.body.slice(start, end) },
+        range: [start, end],
         nextOffset: end < doc.body.length ? end : null,
-        diagnostics: view.diagnostics.slice(0, 25),
+        pageState: end < doc.body.length ? 'partial' : 'complete',
       };
-      if (
-        doc.type === 'chapter' &&
-        offset < end &&
-        JSON.stringify({ ok: true, value: result }).length <= 120_000
-      )
-        this.rememberChapterRange(doc, offset, end);
-      return result;
+      ctx.onToolResultDispatch?.((_report, result) => this.observeRead(result, this.reads, offset));
+      return fitBookPage('book_get_context', value);
     }
-    const rows: unknown[] = [];
-    let i = offset,
-      bytes = 0;
-    for (; i < documents.length && rows.length < 45; i++) {
-      const doc = documents[i],
-        bodyIncluded = doc.type !== 'chapter' && doc.body.length <= 36_000;
-      const result = projection(doc, bodyIncluded),
-        size = JSON.stringify(result).length;
-      if (rows.length && bytes + size > 86_000) break;
-      rows.push(result);
-      bytes += size;
-      if (bodyIncluded || doc.type === 'chapter') this.remember(doc);
-    }
-    return {
+    const rows = documents
+      .slice(offset, offset + 45)
+      .map((doc) =>
+        documentRow(doc, !!args.includeBodies && doc.type !== 'chapter' && doc.body.length <= 6_000),
+      );
+    const nextOffset = offset + rows.length < documents.length ? offset + rows.length : null;
+    const value: ReadPage<ReadDocument, 'documents'> & { hint: string } = {
+      offset,
       documents: rows,
-      nextOffset: i < documents.length ? i : null,
-      diagnostics: view.diagnostics.slice(0, 25),
-      hint: '仅给出章节元数据；需要独立正文或超长故事资料，传 type/documentId，并用 offset 读完全文。',
+      nextOffset,
+      pageState: nextOffset === null ? 'complete' : 'partial',
+      hint: '按 type/documentId 定向读取缺少正文的文档。目录默认仅元数据；需要成批读取短资料时使用 includeBodies。',
     };
+    ctx.onToolResultDispatch?.((_report, result) => this.observeRead(result, this.reads));
+    return fitBookPage('book_get_context', value);
   }
-  private rememberChapterRange(doc: Manuscript, start: number, end: number) {
-    const current = this.chapterReads.get(doc.id);
+  private async search(
+    args: { query: string; type?: Manuscript['type']; documentId?: string; offset?: number },
+    ctx: RunContext,
+  ) {
+    if (typeof args.query !== 'string' || !args.query.length)
+      throw new ToolFailure('invalid_arguments', '请提供要搜索的非空文字。');
+    const { documents, diagnostics } = await this.workspace.readAll(this.bookId);
+    const offset = Math.min(Number.MAX_SAFE_INTEGER, args.offset ?? 0);
+    const matches: BookHit[] = [];
+    let seen = 0,
+      more = false;
+    for (const doc of documents) {
+      ctx.signal.throwIfAborted();
+      if ((args.type && doc.type !== args.type) || (args.documentId && doc.id !== args.documentId))
+        continue;
+      for (
+        let at = doc.body.indexOf(args.query);
+        at !== -1;
+        at = doc.body.indexOf(args.query, at + args.query.length)
+      ) {
+        if (seen++ < offset) continue;
+        if (matches.length === 20) {
+          more = true;
+          break;
+        }
+        const end = at + args.query.length;
+        const left = charBoundary(doc.body, Math.max(0, at - 56));
+        const right = charBoundary(doc.body, Math.min(doc.body.length, end + 56));
+        matches.push({
+          type: doc.type,
+          id: doc.id,
+          revision: doc.revision,
+          range: [at, end],
+          preview: doc.body.slice(left, right),
+        });
+      }
+      if (more) break;
+    }
+    return fitBookPage('book_search_text', {
+      offset,
+      matches,
+      nextOffset: more ? offset + matches.length : null,
+      pageState: more ? 'partial' : 'complete',
+      ...(diagnostics.length && { incomplete: true }),
+      hint: '命中仅用于定位；需精确依据时在同一修订按范围回读。',
+    });
+  }
+  private observeRead(result: ToolResult, reads: BookReads, requestedOffset?: number) {
+    if (!result.ok || !asRecord(result.value)?.pageState) return;
+    const page = result.value as Partial<DocumentPage> & { documents?: ReadDocument[] };
+    if (page.range && typeof page.document?.body === 'string') {
+      reads.targetedReads.add(this.documentReadKey(page.document, requestedOffset ?? page.range[0]));
+      this.rememberRange(page.document, ...page.range, reads);
+    }
+    for (const row of page.documents ?? []) {
+      if (typeof row.body === 'string') this.rememberRange(row, 0, row.bodyLength, reads);
+      else if (row.type === 'chapter') this.remember(row, reads);
+    }
+  }
+  private rememberRange(doc: ReadDocument, start: number, end: number, reads: BookReads) {
+    const key = docKey(doc);
+    if (doc.type === 'chapter' || doc.bodyLength === 0) this.remember(doc, reads);
+    if (start >= end) return;
+    const current = reads.sourceReads.get(key);
     const earlier = current?.revision === doc.revision ? current.ranges : [];
     const next: [number, number][] = [...earlier, [start, end] as [number, number]].sort(
       (a, b) => a[0] - b[0],
@@ -1238,11 +1337,16 @@ export class NovelTools {
       if (last && last[1] >= from) last[1] = Math.max(last[1], to);
       else merged.push([from, to]);
     }
-    this.chapterReads.set(doc.id, { revision: doc.revision, ranges: merged.slice(0, 64) });
+    reads.sourceReads.set(key, { revision: doc.revision, ranges: merged });
+    const first = merged[0];
+    if (first[0] === 0 && first[1] >= doc.bodyLength) {
+      this.remember(doc, reads);
+      reads.offsets.delete(key);
+    } else if (first[0] === 0) reads.offsets.set(key, { revision: doc.revision, next: first[1] });
   }
   private requirePatchQuote(doc: Manuscript, quote: string, evidence = false) {
     const { start, end } = exactRange(doc.body, quote, evidence ? 'patch_evidence' : 'patch_anchor');
-    const read = this.chapterReads.get(doc.id);
+    const read = this.reads.sourceReads.get(docKey(doc));
     if (read?.revision !== doc.revision || !read.ranges.some(([from, to]) => from <= start && end <= to))
       throw new ToolFailure(
         evidence ? 'patch_evidence' : 'context_required',
@@ -1706,14 +1810,14 @@ export class NovelTools {
       const unread: DocRef[] = [];
       for (const doc of documents) {
         if (!['outline', 'subject', 'clue'].includes(doc.type)) continue;
-        const read = this.readSet.get(docKey(doc));
+        const read = this.reads.readSet.get(docKey(doc));
         if (read?.revision === doc.revision) guards.push(read);
         else unread.push({ type: doc.type, id: doc.id });
       }
       if (unread.length)
         throw new ToolFailure(
           'context_required',
-          `请先用 book_get_context 读取大纲及相关故事资产：有 ${unread.length} 项未读或已变化。不要用 index 代替全文；用空参数读取并翻完各页，或按返回的 ID 读。`,
+          `请先用 book_get_context 读取大纲及相关故事资产：有 ${unread.length} 项未读或已变化。不要用 index 代替全文；用 includeBodies: true 显式读取资料页并翻页，或按返回的 ID 读。`,
           { unread: unread.slice(0, 25), remaining: Math.max(0, unread.length - 25) },
         );
     }
@@ -1726,7 +1830,7 @@ export class NovelTools {
         old = existing.get(key);
       if ((m.action === 'create' && old) || (m.action !== 'create' && !old))
         throw new Error(`不符合创建或更新前提：${key}`);
-      if (old && this.readSet.get(key)?.revision !== old.revision)
+      if (old && this.reads.readSet.get(key)?.revision !== old.revision)
         throw new Error(`先读取当前版本：${key}`);
       if (m.action === 'delete') return { ...ref, expect: old!.revision, delete: true };
       if (m.type === 'chapter' && m.body !== undefined && m.body !== '')
@@ -1758,9 +1862,9 @@ export class NovelTools {
     const submitted = new Map(changes.map((change) => [docKey(change), change]));
     for (const ref of report.committed) {
       const change = submitted.get(docKey(ref));
-      if (!change || 'delete' in change) this.readSet.delete(docKey(ref));
+      if (!change || 'delete' in change) this.reads.readSet.delete(docKey(ref));
       else
-        this.readSet.set(docKey(ref), {
+        this.reads.readSet.set(docKey(ref), {
           ...ref,
           revision: digest(renderDocument(ref, change.fields, change.body)),
         });
@@ -1822,7 +1926,7 @@ export class NovelTools {
       const { documents } = await this.workspace.readAll(this.bookId);
       for (const { id } of input.targets) {
         const doc = documents.find((entry) => entry.type === input.kind && entry.id === id);
-        if (!doc || this.readSet.get(docKey(doc))?.revision !== doc.revision)
+        if (!doc || this.reads.readSet.get(docKey(doc))?.revision !== doc.revision)
           throw new ToolFailure('context_required', '更新前须读取相应资料的当前版本。');
         expectedRevisions.set(id, doc.revision);
       }
@@ -2016,7 +2120,7 @@ export class NovelTools {
           throw new ToolFailure('conflict', `目标章 ${chapterId} 已改版，请重新读取并定位原文。`, {
             chapterId,
           });
-        if (this.readSet.get(docKey(chapter))?.revision !== chapter.revision)
+        if (this.reads.readSet.get(docKey(chapter))?.revision !== chapter.revision)
           throw new ToolFailure('context_required', '插入前须读取目标章的当前版本。', { chapterId });
         const known = new Set(documents.map(docKey));
         const linked: DocRef[] = [
@@ -2161,7 +2265,7 @@ export class NovelTools {
           'rewrite_not_authorized',
           '仅当作者在当前消息明确要求重写指定章节时才允许覆盖原文。',
         );
-      if (scope && this.readSet.get(docKey(replacement))?.revision !== replacement.revision)
+      if (scope && this.reads.readSet.get(docKey(replacement))?.revision !== replacement.revision)
         throw new ToolFailure('context_required', '重写前须读取目标章当前版本。');
       guards = [replacement];
     }
@@ -2377,7 +2481,7 @@ export class NovelTools {
       {
         name: 'book_get_context',
         description:
-          '读取当前作品。按 type/documentId 定向读取；index=chapters/subjects/beats 查真实 ID；offset/length 可读限定范围内的精确原文与版本。按写入要求核对有关现稿，不反复读取未变化的同版资料。整书先登记 book_task_scope 的 novel.register 或 novel.resume，再用 novelGoal 激活完整目标；check 只核对活动目标。',
+          '读取当前作品。按 type/documentId 定向读取；index=chapters/subjects/beats 查真实 ID；offset/length 只读有界原文；按实际 nextOffset 和 revision 续页。目录默认仅元数据，includeBodies 可请求完整短资料，长资料按 ID 翻页。按写入要求核对有关现稿，不反复读取未变化的同版资料。整书先登记 book_task_scope 的 novel.register 或 novel.resume，再用 novelGoal 激活完整目标；check 只核对活动目标。',
         schema: object(
           {
             type: typeSchema,
@@ -2389,6 +2493,11 @@ export class NovelTools {
               maximum: 6000,
               description: '定向读取原文时可选；兼用于取修订所需的精确短句',
             },
+            includeBodies: {
+              type: 'boolean',
+              description: '显式请求目录页中能装下的完整短资料；章节正文仍按 ID 读。',
+            },
+            revision: revisionSchema,
             index: { type: 'string', enum: indexes },
             novelGoal: object(
               {
@@ -2427,9 +2536,28 @@ export class NovelTools {
         execute: async (args, ctx) => this.context(args, ctx),
       },
       {
+        name: 'book_search_text',
+        description:
+          '在当前作品按字面搜索正文或资料，按可选类型和文档 ID 缩小范围；返回修订、位置和预览，不是写入原文证据。按 nextOffset 翻页。',
+        schema: object(
+          {
+            query: str('要查的原文字面词句', 120),
+            type: typeSchema,
+            documentId: idSchema,
+            offset: page,
+          },
+          ['query'],
+        ),
+        execute: (args, ctx) =>
+          this.search(
+            { query: args.query, type: args.type, documentId: args.documentId, offset: args.offset },
+            ctx,
+          ),
+      },
+      {
         name: 'book_apply_changes',
         description:
-          '提交小说资料及章节目录变更，不接受章节正文。局部修订用 book_patch_chapter。若用整书 Skill，先用 book_get_context 的 novelGoal 登记／续接。修改既有或已变化的故事资料前，调用不带 index/type 的 book_get_context，读完各页或按 ID 补读。本轮已显式读到的资料未变化时无需重复取回。可批量提交；引用用真实 ID，可选关系字段用 null 清除。AI 生成或补齐主体／伏笔说明用 book_generate_assets；整书不能在这里新建或填写它们。',
+          '提交小说资料及章节目录变更，不接受章节正文。局部修订用 book_patch_chapter。若用整书 Skill，先用 book_get_context 的 novelGoal 登记／续接。修改既有或已变化的故事资料前，显式用 book_get_context.includeBodies 读资料页，未完整提供的按 ID 分页补读。本轮已显式读到的资料未变化时无需重复取回。可批量提交；引用用真实 ID，可选关系字段用 null 清除。AI 生成或补齐主体／伏笔说明用 book_generate_assets；整书不能在这里新建或填写它们。',
         schema: object({
           operations: {
             type: 'array',
