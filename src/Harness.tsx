@@ -1,8 +1,15 @@
-import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { api } from './bridge';
 import { ErrorText, Icon, errorDetails, norm } from './ui';
 import type { ActiveChapter } from './Workspace';
-import type { Effort, ModelProfile, RuntimeView, Session, StartRun } from '../shared/contracts';
+import type {
+  ChatLine,
+  Effort,
+  ModelProfile,
+  RuntimeView,
+  Session,
+  StartRun,
+} from '../shared/contracts';
 const statuses = {
   running: '运行中',
   completed: '已完成',
@@ -12,6 +19,77 @@ const statuses = {
 };
 const roles = { user: '你', assistant: 'Agent', tool: '工具', status: '状态' };
 const basename = (path: string) => path.split(/[\\/]/).at(-1) || path;
+
+function ChatMessage({ line }: { line: ChatLine }) {
+  return (
+    <article className={`chat-line ${line.role}`}>
+      <strong>{roles[line.role]}</strong>
+      <p>{line.text}</p>
+    </article>
+  );
+}
+
+function ToolActivity({ lines }: { lines: ChatLine[] }) {
+  const pending = new Map<string, number>();
+  let calls = 0;
+  let unsuccessful = 0;
+  let other = 0;
+  // Saved tool rows contain display text only. Keep every row and count recognizable calls by name.
+  for (const { text } of lines) {
+    const start = /^运行 (.+)$/.exec(text);
+    if (start) {
+      const name = start[1];
+      pending.set(name, (pending.get(name) ?? 0) + 1);
+      calls++;
+      continue;
+    }
+    const end = /^(.+) · (已完成|未完成)$/.exec(text);
+    if (!end) {
+      other++;
+      continue;
+    }
+    const [, name, outcome] = end;
+    const count = pending.get(name) ?? 0;
+    if (count) pending.set(name, count - 1);
+    else calls++;
+    if (outcome === '未完成') unsuccessful++;
+  }
+  const unresolved = [...pending.values()].reduce((sum, count) => sum + count, 0);
+
+  return (
+    <details className="tool-activity">
+      <summary>
+        <strong>工具活动</strong>
+        {calls > 0 && ` · ${calls} 次调用`}
+        {other > 0 && ` · ${other} 条记录`}
+        {unsuccessful > 0 && <span className="tool-activity-warning"> · {unsuccessful} 项未完成</span>}
+        {unresolved > 0 && ` · ${unresolved} 项无结果`}
+      </summary>
+      <div className="tool-activity-details">
+        {lines.map((line, i) => (
+          <ChatMessage key={i} line={line} />
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function ChatTranscript({ messages }: { messages: ChatLine[] }) {
+  const entries: ReactNode[] = [];
+  let i = 0;
+  while (i < messages.length) {
+    const start = i;
+    const line = messages[i++];
+    if (line.role === 'tool') {
+      while (messages[i]?.role === 'tool') i++;
+      entries.push(<ToolActivity key={start} lines={messages.slice(start, i)} />);
+    } else {
+      entries.push(<ChatMessage key={start} line={line} />);
+    }
+  }
+  return entries;
+}
+
 function DiagnosticId({ id }: { id?: string }) {
   const [copied, setCopied] = useState(false);
   useEffect(() => setCopied(false), [id]);
@@ -254,18 +332,8 @@ export function Harness({
             }}
             aria-label="对话消息"
           >
-            {current.messages.map((line, i) => (
-              <article className={`chat-line ${line.role}`} key={i}>
-                <strong>{roles[line.role]}</strong>
-                <p>{line.text}</p>
-              </article>
-            ))}
-            {current.streaming && (
-              <article className="chat-line assistant">
-                <strong>Agent</strong>
-                <p>{current.streaming}</p>
-              </article>
-            )}
+            <ChatTranscript key={current.session.id} messages={current.messages} />
+            {current.streaming && <ChatMessage line={{ role: 'assistant', text: current.streaming }} />}
             {!current.messages.length && (
               <div className="chat-empty">
                 <span className="book-mark">

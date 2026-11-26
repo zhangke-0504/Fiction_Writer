@@ -801,6 +801,28 @@ dialog::backdrop {
   line-height: 1.6;
   font-size: 13px;
 }
+.tool-activity {
+  border-bottom: 1px solid #e8e8e1;
+  color: var(--muted);
+  font-size: 12px;
+}
+.tool-activity > summary {
+  padding: 7px 0;
+  cursor: pointer;
+  line-height: 1.5;
+}
+.tool-activity > summary:hover {
+  background: var(--soft);
+}
+.tool-activity > summary strong {
+  color: var(--teal);
+}
+.tool-activity-warning {
+  color: var(--accent-dark);
+}
+.tool-activity-details {
+  padding-inline-start: 14px;
+}
 .chat-line.tool {
   padding: 4px 0;
   color: var(--muted);
@@ -809,6 +831,9 @@ dialog::backdrop {
   font-size: 11px;
   display: inline;
   margin-left: 6px;
+}
+.tool-activity-details > :last-child {
+  border-bottom: 0;
 }
 .chat-empty {
   max-width: 250px;
