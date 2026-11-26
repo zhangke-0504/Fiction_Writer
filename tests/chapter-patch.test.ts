@@ -6,7 +6,9 @@ import { test, type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type { DocRef, Manuscript } from '../shared/contracts.js';
 import { NovelTools } from '../electron/agent/novel-tools.js';
+import { BookTaskScope } from '../electron/agent/task-scope.js';
 import { prosePatchIntent } from '../electron/agent/chapter-intent.js';
+import type { ProseEdit } from '../electron/agent/chapter-patch.js';
 import { runAgent } from '../electron/agent/loop.js';
 import { RunManager } from '../electron/agent/runs.js';
 import { Gate, ScriptedProvider, type Script } from '../electron/agent/scripted.js';
@@ -98,10 +100,10 @@ async function fixture(t: TestContext, authored = 10) {
       .map((s) => JSON.parse(s));
   const patch = (
     doc: Manuscript,
-    edits = [{ quote: injury, replacement: correction }],
+    edits: ProseEdit[] = [{ quote: injury, replacement: correction }],
     evidence?: object[],
   ) => use('book_patch_chapter', { chapterId: doc.id, revision: doc.revision, edits, evidence });
-  const start = (prompt: string, script: Script[], selectedChapterId?: string) => {
+  const start = (prompt: string, script: Script[], selectedChapterId?: string, scoped = false) => {
     const trace = collectDiagnostics();
     const model = new ScriptedProvider(script);
     const asked: string[] = [];
@@ -111,11 +113,16 @@ async function fixture(t: TestContext, authored = 10) {
       asked.push(named || (req.tools.length ? 'main' : 'draft'));
       return named === 'book_read_chapter' ? Promise.resolve(text('无需回读')) : step(req);
     };
-    const novel = new NovelTools(ws, id, model, catalog, { authorPrompt: prompt, selectedChapterId });
     runs.start(
       session.id,
       prompt,
       async (ctx) => {
+        const scope = scoped ? new BookTaskScope(ctx, prompt, model) : undefined;
+        const novel = new NovelTools(ws, id, model, catalog, {
+          authorPrompt: prompt,
+          selectedChapterId,
+          scope,
+        });
         const system = novel.prepareEdit(ctx, (await ws.readAll(id)).documents);
         await runAgent(
           ctx,
@@ -123,8 +130,13 @@ async function fixture(t: TestContext, authored = 10) {
           system,
           [],
           prompt,
-          [...catalog.tools((name) => novel.skillApplied(name)), ...novel.tools()],
+          [
+            ...catalog.tools((name) => novel.skillApplied(name)),
+            ...novel.tools(),
+            ...(scope ? [scope.tool(async () => (await ws.readAll(id)).documents)] : []),
+          ],
           novel,
+          scoped ? {} : undefined,
         );
         await novel.assertFinished(ctx);
       },
@@ -164,10 +176,15 @@ test('explicit exact patch saves only the specified text, emits a real receipt, 
     () => f.patch(doc),
     async ({ history }) => {
       assert.match(latest(history), /"patched":1/);
-      return f.patch(await f.load(10));
+      return f.patch(doc);
     },
     ({ history }) => {
-      assert.match(latest(history), /patch_scope/);
+      assert.match(latest(history), /conflict/);
+      return read(10);
+    },
+    async () => f.patch(await f.load(10)),
+    ({ history }) => {
+      assert.match(latest(history), /patch_anchor/);
       return text('第十章伤因已定点修订。');
     },
   ]);
@@ -190,11 +207,125 @@ test('explicit exact patch saves only the specified text, emits a real receipt, 
     [
       ['ok', 1, saved.revision],
       ['failed', 0, undefined],
+      ['failed', 0, undefined],
     ],
   );
   assert.deepEqual(op.trace.rejected, []);
   assert.doesNotMatch(JSON.stringify(op.trace.rows), /_OLD_ONLY|_NEW_ONLY|_SOURCE_ONLY/);
 });
+
+const seventh = 7;
+const moving = '周澜低声把那晚听到的对话重新说了一遍。';
+const destination = '两人回到车尾，终于能慢慢把话说完。';
+const movePrompt = '把第七章走廊里周澜的这段对话挪到车尾。';
+const beforeMove = [prefix, moving, suffix, destination, prefix].join('\n\n');
+const afterMove = [prefix, suffix, destination, moving, prefix].join('\n\n');
+const removeDialogue = { quote: `${moving}\n\n`, replacement: '', part: 'remove-old' };
+const addDialogue = { quote: destination, replacement: `${destination}\n\n${moving}`, part: 'add-new' };
+const moveScope = () =>
+  use('book_task_scope', {
+    items: [
+      {
+        operation: 'chapter.patch',
+        id: ch(seventh).id,
+        part: 'remove-old',
+        purpose: '移除走廊对话',
+      },
+      { operation: 'chapter.patch', id: ch(seventh).id, part: 'add-new', purpose: '补入车尾对话' },
+    ],
+  });
+
+for (const variant of ['stepwise', 'batch', 'invalid-batch', 'delete-only', 'rename-only'] as const) {
+  test(`seventh chapter relocation: ${variant}`, async (t) => {
+    const f = await fixture(t);
+    assert.equal((await f.save(await f.load(seventh), beforeMove)).error, undefined);
+    const initial = await f.load(seventh);
+    const stepwise = variant === 'stepwise';
+    const invalid = variant === 'invalid-batch';
+    const deletionOnly = variant === 'delete-only';
+    const renameOnly = variant === 'rename-only';
+    const run = f.start(
+      movePrompt,
+      [
+        () => use('tool_search', { query: 'book_patch_chapter book_get_context book_apply_changes' }),
+        () => {
+          const request = moveScope();
+          if (renameOnly) {
+            const input = JSON.parse(request.calls[0].args);
+            input.items.push({ operation: 'chapter.catalog', id: initial.id, purpose: '改章名' });
+            request.calls[0].args = JSON.stringify(input);
+          }
+          return request;
+        },
+        () => use('check_book_scope', { allowed: true }),
+        () => read(seventh),
+        () =>
+          renameOnly
+            ? use('book_apply_changes', {
+                operations: [
+                  { type: 'chapter', id: initial.id, action: 'update', fields: { title: '车尾' } },
+                ],
+              })
+            : f.patch(initial, [
+                removeDialogue,
+                ...(stepwise || deletionOnly
+                  ? []
+                  : [invalid ? { ...addDialogue, quote: '没有这个锚点' } : addDialogue]),
+              ]),
+        ...(invalid || renameOnly ? [] : [() => decision(true)]),
+        ...(!stepwise
+          ? []
+          : [
+              ({ history }: Parameters<Script>[0]) => {
+                assert.match(latest(history), /patched.*1/);
+                return read(seventh);
+              },
+              async () => f.patch(await f.load(seventh), [addDialogue]),
+              () => decision(true),
+            ]),
+        ({ history }) => {
+          assert.match(latest(history), invalid ? /patch_anchor/ : renameOnly ? /committed/ : /patched/);
+          return text('核对结果。');
+        },
+      ],
+      undefined,
+      true,
+    );
+    const finished = await run.wait();
+    assert.equal(finished.status, 'completed', finished.error);
+    assert.equal(
+      finished.taskOutcome,
+      invalid || renameOnly ? 'incomplete' : deletionOnly ? 'partial' : 'fulfilled',
+    );
+    assert.equal(finished.progress?.done, invalid || renameOnly ? 0 : deletionOnly ? 1 : 2);
+    assert.equal(finished.progress?.total, 2);
+    if (deletionOnly) {
+      assert.match(finished.progress?.message ?? '', /补入车尾对话/);
+      assert.doesNotMatch(finished.progress?.message ?? '', /移除走廊对话/);
+    }
+    assert.equal(
+      (await f.load(seventh)).body,
+      invalid || renameOnly
+        ? beforeMove
+        : deletionOnly
+          ? beforeMove.replace(removeDialogue.quote, '')
+          : afterMove,
+    );
+    const patches = (await f.history())
+      .map((row) => row.toolReceipt)
+      .filter((r) => r?.tool === 'book_patch_chapter');
+    assert.deepEqual(
+      patches.map((r) => r.commitCount),
+      stepwise ? [1, 1] : invalid ? [0] : renameOnly ? [] : [1],
+    );
+    if (stepwise) assert.notEqual(patches[0].commits[0].revision, patches[1].commits[0].revision);
+    const observed = run.trace.rows.filter((row) => row.event === 'chapter.patch.part');
+    assert.equal(observed.length, renameOnly ? 0 : deletionOnly ? 1 : 2);
+    assert.equal(new Set(observed.map((row) => row.fields.partRef)).size, observed.length);
+    assert.deepEqual(run.trace.rejected, []);
+    assert.doesNotMatch(JSON.stringify(observed), /remove-old|add-new|周澜|车尾/);
+  });
+}
 
 for (const prompt of [
   '只检查第十章的伤因。',
@@ -471,4 +602,264 @@ test('an explicit literal instruction cannot be repurposed to change different t
   const result = await op.wait();
   assert.equal(result.status, 'completed', result.error);
   assert.deepEqual(await f.load(10), doc);
+});
+
+for (const prompt of ['解决未清理的问题', '把上面那几项处理掉']) {
+  test(`same-session follow-up can actually patch from a visible unresolved item: ${prompt}`, async (t) => {
+    const f = await fixture(t);
+    const original = await f.load(10);
+    const prior = '尚有一项待处理：第十章的检察官伤因与第八章不一致，应该将碎玻璃划伤改为被液体烧伤。';
+    assert.equal(
+      (await f.start('检查伤因，先不要改稿', [() => text(prior)], undefined, true).wait()).status,
+      'completed',
+    );
+    const applied = f.start(
+      prompt,
+      [
+        ({ tools }) => {
+          assert.ok(tools.some(({ name }) => name === 'tool_search'));
+          assert.ok(!tools.some(({ name }) => name === 'book_patch_chapter'));
+          return use('tool_search', { query: 'book_get_context book_patch_chapter' });
+        },
+        () =>
+          use('book_task_scope', {
+            sourceQuote: '第十章的检察官伤因与第八章不一致',
+            items: [
+              { operation: 'chapter.patch', id: ch(10).id, purpose: '按第八章将伤因改为液体烧伤' },
+            ],
+          }),
+        ({ tools, history }) => {
+          assert.equal(tools[0].name, 'check_book_scope');
+          const request = (history[0] as { text: string }).text;
+          assert.match(request, /第十章的检察官伤因与第八章不一致/);
+          assert.ok(request.includes(prompt));
+          return use('check_book_scope', { allowed: true });
+        },
+        () => read(8),
+        () => read(10),
+        () => f.patch(original),
+        ({ tools }) => {
+          assert.equal(tools[0].name, 'submit_chapter_patch_review');
+          return decision(true);
+        },
+        ({ history }) => {
+          assert.match(latest(history), /"patched":1/);
+          return text('已核对并改正');
+        },
+      ],
+      undefined,
+      true,
+    );
+    const run = await applied.wait();
+    assert.equal(run.status, 'completed', run.error);
+    assert.equal(run.progress?.complete, true);
+    assert.equal(run.progress?.done, 1);
+    assert.equal((await f.load(10)).body, original.body.replace(injury, correction));
+    assert.deepEqual(applied.trace.rejected, []);
+  });
+}
+
+test('a read-only current instruction with a real previous quote does not unlock patch', async (t) => {
+  const f = await fixture(t);
+  const original = await f.load(10);
+  const prior = '第十章伤因待核对，可能需要修订。';
+  await f.start('列出待办', [() => text(prior)], undefined, true).wait();
+  const result = f.start(
+    '检查前面的伤因，先别改稿。',
+    [
+      () => use('tool_search', { query: 'book_get_context book_patch_chapter' }),
+      () =>
+        use('book_task_scope', {
+          sourceQuote: prior,
+          items: [{ operation: 'chapter.patch', id: ch(10).id, purpose: '改写伤因' }],
+        }),
+      () => use('check_book_scope', { allowed: false }),
+      () => read(10),
+      () => f.patch(original),
+      ({ history }) => {
+        assert.match(latest(history), /patch_not_authorized/);
+        return text('未改稿');
+      },
+    ],
+    undefined,
+    true,
+  );
+  assert.equal((await result.wait()).status, 'completed');
+  assert.equal((await f.load(10)).revision, original.revision);
+});
+
+test('a verified readback may finish without issuing a write', async (t) => {
+  const f = await fixture(t);
+  const original = await f.load(10);
+  await f.save(original, original.body.replace(injury, correction));
+  const updated = await f.load(10);
+  const prior = '还要确认第十章的伤因是否已统一为液体烧伤。';
+  await f.start('先告诉我还需核对什么', [() => text(prior)], undefined, true).wait();
+  const operation = f.start(
+    '把前面剩下的事处理完',
+    [
+      () => use('tool_search', { query: 'book_get_context' }),
+      () => read(10),
+      () =>
+        use('book_task_scope', {
+          sourceQuote: prior,
+          items: [
+            {
+              operation: 'chapter.patch',
+              id: ch(10).id,
+              purpose: '确保伤因为液体烧伤',
+              currentEvidence: { revision: updated.revision, quote: correction },
+            },
+          ],
+        }),
+      () => use('check_book_scope', { allowed: true }),
+      () => text('现稿已满足，无需改动。'),
+    ],
+    undefined,
+    true,
+  );
+  const run = await operation.wait();
+  assert.equal(run.taskOutcome, 'no_write_needed');
+  assert.equal(run.progress?.done, 1);
+  assert.equal((await f.load(10)).revision, updated.revision);
+  assert.equal(
+    operation.trace.rows.some(({ event }) => event === 'workspace.document.committed'),
+    false,
+  );
+});
+
+test('a scope cannot borrow a quote that is not in the same conversation', async (t) => {
+  const approvedElsewhere = '另一个会话中的任务：第十章把伤因改为液体烧伤。';
+  const other = await fixture(t);
+  await other.start('列出需要更正的事实', [() => text(approvedElsewhere)], undefined, true).wait();
+  const f = await fixture(t);
+  const existing = await f.load(10);
+  const op = f.start(
+    '把参考内容里的问题修完',
+    [
+      () => use('tool_search', { query: 'book_get_context book_patch_chapter' }),
+      () =>
+        use('book_task_scope', {
+          sourceQuote: approvedElsewhere,
+          items: [{ operation: 'chapter.patch', id: ch(10).id, purpose: '使用未核实的外部方案' }],
+        }),
+      ({ history }) => {
+        assert.match(latest(history), /invalid_options/);
+        return read(10);
+      },
+      () => f.patch(existing),
+      ({ history }) => {
+        assert.match(latest(history), /patch_not_authorized/);
+        return text('未写入');
+      },
+    ],
+    undefined,
+    true,
+  );
+  await op.wait();
+  assert.equal(op.asked.includes('check_book_scope'), false);
+  assert.equal((await f.load(10)).revision, existing.revision);
+});
+
+test('accepted scope does not override a later chapter change or mask partial completion', async (t) => {
+  const f = await fixture(t);
+  const first = await f.load(9);
+  const second = await f.load(10);
+  const quote = '第9段旅程。';
+  const newQuote = '第9段走向渡口。';
+  const prior = '先列出两项勘误，不修改章节。';
+  const source = '请分别核对第九章的旅程描述和第十章的检察官伤因，这两处仍需要更正。';
+  await f.start(prior, [() => text(source)], undefined, true).wait();
+  const op = f.start(
+    '按刚才的两项处理',
+    [
+      () => use('tool_search', { query: 'book_get_context book_patch_chapter' }),
+      () =>
+        use('book_task_scope', {
+          sourceQuote: source,
+          items: [
+            { operation: 'chapter.patch', id: first.id, purpose: '核对第九章的旅程描述' },
+            { operation: 'chapter.patch', id: second.id, purpose: '根据第八章核对伤因' },
+          ],
+        }),
+      () => use('check_book_scope', { allowed: true }),
+      () => read(9),
+      () => f.patch(first, [{ quote, replacement: newQuote }]),
+      () => decision(true),
+      ({ history }) => {
+        assert.match(latest(history), /"patched":1/);
+        return read(10);
+      },
+      async () => {
+        const changed = await f.save(second, second.body + '\n\n作者新加的检查标记。');
+        assert.equal(changed.error, undefined);
+        return f.patch(second);
+      },
+      ({ history }) => {
+        assert.match(latest(history), /conflict/);
+        return text('第一处已修，第二处改版未覆盖。');
+      },
+    ],
+    undefined,
+    true,
+  );
+  const result = await op.wait();
+  assert.equal(result.status, 'completed', result.error);
+  assert.equal(result.taskOutcome, 'partial');
+  assert.equal(result.progress?.done, 1);
+  assert.match((await f.load(9)).body, new RegExp(newQuote));
+  assert.ok((await f.load(10)).body.trimEnd().endsWith('作者新加的检查标记。'));
+  assert.equal(op.trace.rows.filter(({ event }) => event === 'chapter.patch.finished').length, 2);
+});
+
+test('cancelling a scoped continuation does not commit or replay the candidate', async (t) => {
+  const f = await fixture(t);
+  const baseline = await f.load(10);
+  const prior = '第十章伤因还没按第八章核对。';
+  await f.start('只报告遗留', [() => text(prior)], undefined, true).wait();
+  const gate = new Gate();
+  let reviewing!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    reviewing = resolve;
+  });
+  const op = f.start(
+    '解决未清理的问题',
+    [
+      () => use('tool_search', { query: 'book_get_context book_patch_chapter' }),
+      () =>
+        use('book_task_scope', {
+          sourceQuote: prior,
+          items: [{ operation: 'chapter.patch', id: ch(10).id, purpose: '更正伤因' }],
+        }),
+      () => use('check_book_scope', { allowed: true }),
+      () => read(10),
+      () => f.patch(baseline),
+      async ({ signal }) => {
+        reviewing();
+        await gate.wait(signal);
+        return decision(true);
+      },
+    ],
+    undefined,
+    true,
+  );
+  await ready;
+  await op.stop();
+  assert.equal((await op.wait()).status, 'cancelled');
+  assert.equal((await f.load(10)).revision, baseline.revision);
+  const next = f.start(
+    '只读检查',
+    [
+      () => use('tool_search', { query: 'book_patch_chapter' }),
+      () => f.patch(baseline),
+      ({ history }) => {
+        assert.match(latest(history), /patch_not_authorized/);
+        return text('无需写入');
+      },
+    ],
+    undefined,
+    true,
+  );
+  assert.equal((await next.wait()).status, 'completed');
+  assert.equal((await f.load(10)).revision, baseline.revision);
 });

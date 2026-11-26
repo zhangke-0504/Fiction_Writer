@@ -71,7 +71,8 @@ export type Protocol = 'chat' | 'responses' | 'messages';
 export type Effort = 'low' | 'medium' | 'high';
 export type ProviderId = 'custom' | 'deepseek';
 export type CapabilitySource = 'provider' | 'provider-fallback' | 'generic-fallback';
-export type CapabilityIssue = 'not_supported' | 'unavailable' | 'auth' | 'timeout' | 'invalid' | 'model_missing';
+export type CapabilityIssue =
+  'not_supported' | 'unavailable' | 'auth' | 'timeout' | 'invalid' | 'model_missing';
 export interface ModelCapabilities {
   contextWindow: number;
   maxOutputTokens: number;
@@ -116,11 +117,14 @@ export interface WorkProgress {
   complete?: boolean;
   message?: string;
 }
+export type TaskOutcome =
+  'fulfilled' | 'no_write_needed' | 'partial' | 'incomplete' | 'cancelled' | 'interrupted';
 export interface RunInfo {
   id: string;
   status: RunStatus;
   error?: string;
   effort?: Effort | 'default';
+  taskOutcome?: TaskOutcome;
   preview?: ChapterPreview;
   progress?: WorkProgress;
 }

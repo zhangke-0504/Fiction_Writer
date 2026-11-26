@@ -162,6 +162,8 @@ const tool = one(
   'book_memory_recall',
   'book_memory_remember',
   'book_memory_forget',
+  'tool_search',
+  'book_task_scope',
   'skill_search',
   'skill_load',
   'fixture_value',
@@ -243,8 +245,8 @@ const writingCountsRequired = [
   'includedOptional',
   'omittedOptional',
 ] as const;
-const memoryRecall = { recallId: uuid, trigger: one('agent', 'draft', 'tool') };
-const memoryDispatch = { recallId: uuid, trigger: one('agent', 'draft') };
+const memoryRecall = { recallId: uuid, trigger: one('draft', 'tool') };
+const memoryDispatch = { recallId: uuid, trigger: one('draft', 'tool') };
 const memoryCounts = {
   storyCount: count,
   planCount: count,
@@ -524,6 +526,9 @@ const diag = new Map<string, Definition>(
     'tool.validated': worker({ tool, fieldCount: count }),
     'tool.rejected': worker({ tool, reason }, 'warn'),
     'tool.started': worker({ tool }),
+    'tool.discovery': worker({ count, outcome }),
+    'writing.task_scope': worker({ count, outcome, reason }),
+    'writing.task_result': worker({ count, done: count, outcome }),
     'tool.finished': worker({
       tool,
       ...final,
@@ -601,6 +606,7 @@ const diag = new Map<string, Definition>(
     'novel.chapter.reused': worker({ reason }),
     'chapter.retry': worker({ reason }),
     'chapter.patch.finished': worker({ outcome, reason, count, revision }),
+    'chapter.patch.part': worker({ partRef: ref, outcome, reason, revision }),
     'chapter.insertion.receipt': worker({ insertionRef: uuid, revision }),
     'chapter.insertion.cleanup': worker({
       insertionRef: uuid,

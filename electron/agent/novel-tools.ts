@@ -9,7 +9,6 @@ import {
   isId,
   renderDocument,
   storyBeats,
-  storyLinks,
 } from '../documents.js';
 import { draftChapter, DraftCommitFailure, InsertionQualityFailure } from './draft.js';
 import type { ChapterPlan } from './chapter-boundary.js';
@@ -18,10 +17,10 @@ import {
   insertPassage,
   safeInsertionEchoCut,
   outlineInsertion,
-  suggestInsertionPoints,
   type ChapterInsertion,
 } from './chapter-insertion.js';
 import { checkBookEditPlan, ConfirmedBookEdit } from './book-edit.js';
+import type { BookTaskScope, ScopeOperation } from './task-scope.js';
 import {
   approvesEdit,
   assetTarget,
@@ -48,10 +47,7 @@ import { chapterAssetRequirements } from './chapter-context.js';
 import {
   blocksProsePatch,
   prosePatchIntent,
-  minimumExistingSubjects,
   passageTargetAllowed,
-  chapterStage,
-  wantsStagedAntagonist,
   rewriteTarget,
   wantsPassageAddition,
 } from './chapter-intent.js';
@@ -274,7 +270,6 @@ export class NovelTools {
   private readonly targetedReads = new Set<string>();
   private readonly readSet = new Map<string, Guard>();
   private readonly chapterReads = new Map<string, { revision: string; ranges: [number, number][] }>();
-  private readonly patchedHere = new Set<string>();
   private populatedAtStart?: Set<string>;
   private readonly draftedHere = new Map<string, string>();
   private readonly offsets = new Map<string, { revision: string; next: number }>();
@@ -290,27 +285,22 @@ export class NovelTools {
   >();
   private edit?: ConfirmedBookEdit;
   private editMode: 'direct' | 'proposal' | 'confirmed' | 'unresolved' = 'direct';
-  private get stagedEntry() {
-    return wantsStagedAntagonist(this.input.authorPrompt ?? '');
-  }
-  private get connectedEntry() {
-    return (
-      this.stagedEntry ||
-      (minimumExistingSubjects(this.input.authorPrompt ?? '') > 0 &&
-        /伏笔|线索/u.test(this.input.authorPrompt ?? ''))
-    );
-  }
   constructor(
     private workspace: WorkspaceService,
     private bookId: string,
     private provider: ModelProvider,
     private skills: SkillCatalog,
-    private input: { authorPrompt?: string; selectedChapterId?: string } = {},
+    private input: { authorPrompt?: string; selectedChapterId?: string; scope?: BookTaskScope } = {},
   ) {}
-  prepareEdit(ctx: RunContext, documents: Manuscript[]) {
+  captureStart(documents: Manuscript[]) {
     this.populatedAtStart ??= new Set(
       documents.filter((d) => d.type === 'chapter' && d.body.trim()).map((d) => d.id),
     );
+  }
+  /** Compatibility entry for legacy fixtures; real sessions use captureStart and BookTaskScope. */
+  prepareEdit(ctx: RunContext, documents: Manuscript[]) {
+    this.captureStart(documents);
+    if (this.input.scope) return '';
     const author = this.input.authorPrompt ?? '';
     const confirmed = confirmedEdit(ctx.bookEdit, ctx.history?.lines ?? [], author);
     if (proposalOnly(author)) this.editMode = 'proposal';
@@ -344,20 +334,14 @@ export class NovelTools {
       return '\n作者本轮只问方案，不写入作品。用索引查真实主体和章节 ID，定向查目标章、已有设定和大纲后，用 book_propose_edits 登记一份范围完整的建议，最终可见方案会随回复给出。中期多个迹象和后期实际登场要分别列章；登场与伏笔计划回收可以是不同章。列出新资料、真实关联与章锚点，不要提前执行。';
     if (this.editMode === 'unresolved')
       return '\n本轮确认没有唯一可核对的同会话方案，不允许把它当全书写权限；请指出缺少的方案，不重复尝试生成。如需执行清楚的直接写作指令，不必先登记方案。';
-    if (this.stagedEntry) {
-      ctx.progress({ step: '执行关联增补', done: 0, total: 5, complete: false });
-      ctx.diagnostic?.('writing.edit.scope', { editMode: 'direct', count: 5, done: 0 });
-      return '\n作者已直接要求改稿，不要停在方案或再问确认。先用 book_generate_assets 保存一个新反派：顶层 kind="subject", action="create", targets:[{id:"新ID",fields:{name:"角色名",kind:"character"},relatedSubjectIds:["旧主体ID1","旧主体ID2"]}]；主体 fields 只填 name 和 kind，不填 title 或伏笔字段。接着用同工具保存关联伏笔；以章节索引的 entryChoices 为准，至少选两个中期章分别写迹象，再在一个后期章写反派本人登场。每处 book_generate_chapter mode=insert，都附唯一锚点及当时的大纲 revision 和只针对该章的短安排；每次成功后使用返回的新 outlineRevision。伏笔的回收章仅是计划，不等于登场章，不另改回收章；最后按 pendingSync 回执对本轮新建资料用 book_generate_assets action=update 同步，只传资料类型和 ID。全部完成再总结。禁止用通用工具或整章重写绕过。';
-    }
-    return this.connectedEntry
-      ? '\n按插入回执的 pendingSync 用 book_generate_assets action=update 同步本轮新资料。'
-      : '';
+    return '';
   }
   private requireEditAction() {
     if (this.editMode === 'proposal' || this.editMode === 'unresolved')
       throw new ToolFailure('invalid_options', '当前仅讨论或没有明确可承接的确认方案，不执行作品修改。');
   }
   private noteSyncAllowed(key: string) {
+    if (this.input.scope) return true; // Individual updates still require a scope; surface evidence-based pending work.
     const kind = key.startsWith('subject/') ? '主体|角色|人物|反派' : '伏笔|线索';
     const restriction = new RegExp(
       `(?:不要|别|禁止|不许|不必|无需|不)\\s*(?:再\\s*)?(?:同步|更新|修改|改写|改动|改|动)\\s*(?:这些|相关|本次新建的?|新建的?)?\\s*(?:资料|说明|资产|${kind})`,
@@ -489,19 +473,21 @@ export class NovelTools {
       pendingSync: this.syncStatus((await this.workspace.readAll(this.bookId)).documents),
     };
   }
-  canDeliverWholeSkill = () => this.editMode === 'direct' && !this.stagedEntry;
+  canDeliverWholeSkill = () => this.editMode === 'direct';
   skillApplied(name: SkillName) {
     if (this.canDeliverWholeSkill() && name === 'generate-novel') this.wholeSkill = true;
   }
   // For manual acceptance, the per-run cap is uniform regardless of goal size.
   roundLimit = () => defaultRoundLimit;
   budgetPurpose = () => (this.wholeSkill ? ('long-writing' as const) : undefined);
-  /** Recovery offers only work justified by the live goal or confirmed plan, never by partial model output. */
+  /** Recovery uses current targets and receipts, never the truncated model output. */
   narrowedWritingStep = async (ctx: RunContext): Promise<NarrowedWritingStep | undefined> => {
     const edit = this.editMode === 'confirmed' && this.edit?.hasTargets ? this.edit : undefined;
+    const scope = this.input.scope;
+    const scoped = !!scope?.items.length && !this.wholeWork;
     if (
       ctx.session.bookId !== this.bookId ||
-      (!edit && !(this.wholeSkill && this.canDeliverWholeSkill()))
+      (!scoped && !edit && !(this.wholeSkill && this.canDeliverWholeSkill()))
     )
       return;
     const view = await this.workspace.readAll(this.bookId);
@@ -547,16 +533,21 @@ export class NovelTools {
         (a) => a.index === index && (a.offset ?? 0) === 0 && !a.type && !a.documentId && !a.novelGoal,
       );
     };
-    const offerAsset = (kind: string, id: string | undefined, action: string) => {
-      add('book_generate_assets', `${action} ${kind}/${id ?? '一个必要的新资料'}`, (a) => {
-        const target = Array.isArray(a.targets) && a.targets.length === 1 && asRecord(a.targets[0]);
-        return (
-          !!target &&
-          a.kind === kind &&
-          a.action === action &&
-          (id ? target.id === id : isId(target.id) && !byKey.has(`${kind}/${target.id}`))
-        );
-      });
+    const offerAsset = (kind: string, id: string | undefined, action: string, sync = false) => {
+      add(
+        'book_generate_assets',
+        `${sync ? '只传 ID 同步' : action} ${kind}/${id ?? '一个必要的新资料'}`,
+        (a) => {
+          const target = Array.isArray(a.targets) && a.targets.length === 1 && asRecord(a.targets[0]);
+          return (
+            !!target &&
+            a.kind === kind &&
+            a.action === action &&
+            (!sync || (target.fields === undefined && target.relatedSubjectIds === undefined)) &&
+            (id ? target.id === id : isId(target.id) && !byKey.has(`${kind}/${target.id}`))
+          );
+        },
+      );
     };
     const plan = (status: string, complete = false): NarrowedWritingStep => ({
       status,
@@ -568,7 +559,114 @@ export class NovelTools {
         .join('；'),
       accepts: (name: string, args: Record<string, unknown>) =>
         options.slice(0, 8).some((entry) => entry.name === name && entry.accepts(args)),
+      ...(scope && { toolNames: [...new Set(options.slice(0, 8).map(({ name }) => name))] }),
     });
+
+    if (scope && scoped) {
+      const { remaining, done, total } = scope.summarize(docs);
+      const sync = this.syncStatus(docs);
+      const status = `本轮任务已核对 ${done}/${total} 项；待做：${
+        [
+          ...remaining.map(({ operation, id, part }) => `${operation}/${id}${part ? '/' + part : ''}`),
+          ...sync.map(({ key }) => `同步 ${key}`),
+        ]
+          .slice(0, 6)
+          .join('、') || '无'
+      }`;
+      if (!remaining.length && !sync.length) return plan(status, true);
+
+      const unread = (doc: Manuscript) => this.readSet.get(docKey(doc))?.revision !== doc.revision;
+      const syncKeys = new Set(sync.map(({ key }) => key));
+      for (const { key, ready } of sync) {
+        const [kind, id] = key.split('/');
+        if (ready && (kind === 'subject' || kind === 'clue') && scope.allows(`${kind}.update`, id, ctx))
+          offerAsset(kind, id, 'update', true);
+      }
+      for (const { operation, id, part } of remaining) {
+        if (!scope.allows(operation, id, ctx, part)) continue;
+        const [kind, action] = operation.split('.');
+        const key = `${kind}/${id}`;
+        const doc = byKey.get(key);
+        if (kind === 'subject' || kind === 'clue') {
+          if (action === 'update' && doc && !syncKeys.has(key)) {
+            if (unread(doc)) readDoc(key);
+            else offerAsset(kind, id, action);
+          } else if (action === 'create' && !doc) offerAsset(kind, id, action);
+          else if (action === 'fill' && doc && !hasStoryDescription(doc.body))
+            offerAsset(kind, id, action);
+          continue;
+        }
+        if (operation === 'outline.write' || operation === 'chapter.catalog') {
+          // The existing outline writer validates references against current, read revisions.
+          const basis =
+            operation === 'outline.write'
+              ? docs.find(
+                  (entry) => ['outline', 'subject', 'clue'].includes(entry.type) && unread(entry),
+                )
+              : doc && unread(doc)
+                ? doc
+                : undefined;
+          if (basis) {
+            readDoc(docKey(basis));
+            continue;
+          }
+          add('book_apply_changes', `仅 ${operation}/${id}，不要合并其他文档`, (a) => {
+            const op =
+              Array.isArray(a.operations) && a.operations.length === 1 && asRecord(a.operations[0]);
+            return (
+              !!op &&
+              op.type === kind &&
+              op.id === id &&
+              op.action === (doc ? 'update' : 'create') &&
+              (kind !== 'chapter' || !op.body)
+            );
+          });
+          continue;
+        }
+        if (!doc || kind !== 'chapter') continue;
+        if (operation === 'chapter.patch') {
+          const hasProse = this.chapterReads.get(id)?.revision === doc.revision;
+          if (!hasProse || this.offsets.has(key)) readDoc(key);
+          if (hasProse)
+            add(
+              'book_patch_chapter',
+              `仅修订 ${id}${part ? '/' + part : ''} 的已读短文`,
+              (a) =>
+                a.chapterId === id &&
+                a.revision === doc.revision &&
+                Array.isArray(a.edits) &&
+                !!a.edits.length &&
+                a.edits.every((entry) => {
+                  const edit = asRecord(entry);
+                  return !!edit && edit.part === part;
+                }),
+            );
+        } else if (operation === 'chapter.insert' || operation === 'chapter.replace') {
+          if (unread(doc)) readDoc(key);
+          else
+            add(
+              'book_generate_chapter',
+              `仅 ${action} ${id}，使用当前版本`,
+              (a) =>
+                a.chapterId === id &&
+                a.mode === action &&
+                (action === 'insert'
+                  ? asRecord(a.insertion)?.revision === doc.revision
+                  : a.insertion === undefined),
+            );
+        } else if (
+          (operation === 'chapter.draft' && !doc.body.trim()) ||
+          operation === 'chapter.append'
+        ) {
+          add(
+            'book_generate_chapter',
+            `仅 ${action} ${id}`,
+            (a) => a.chapterId === id && a.mode === action && a.insertion === undefined,
+          );
+        }
+      }
+      return plan(status);
+    }
 
     if (edit) {
       const remaining = new Set(edit.remaining(docs));
@@ -641,17 +739,29 @@ export class NovelTools {
 
     if (!this.task) {
       const action = ctx.continuation ? 'resume' : 'register';
-      add('book_get_context', `novelGoal.${action}，沿用完整整书目标，不分批登记`, (a) => {
-        const goal = asRecord(a.novelGoal);
-        return (
-          goal?.action === action &&
-          !goal.updateDirection &&
-          !a.type &&
-          !a.documentId &&
-          !a.index &&
-          a.offset === undefined
+      const operation = action === 'resume' ? 'novel.resume' : 'novel.register';
+      if (scope && !scope.allows(operation, this.bookId, ctx)) {
+        add(
+          'book_task_scope',
+          '先登记 ' + operation + '（作品 ID：' + this.bookId + '），保留完整目标',
+          (a) => {
+            const item = Array.isArray(a.items) && a.items.length === 1 && asRecord(a.items[0]);
+            return !!item && item.operation === operation && item.id === this.bookId;
+          },
         );
-      });
+      } else {
+        add('book_get_context', `novelGoal.${action}，沿用完整整书目标，不分批登记`, (a) => {
+          const goal = asRecord(a.novelGoal);
+          return (
+            goal?.action === action &&
+            !goal.updateDirection &&
+            !a.type &&
+            !a.documentId &&
+            !a.index &&
+            a.offset === undefined
+          );
+        });
+      }
       readIndex('chapters');
       for (const doc of docs.filter((d) => d.type === 'book' || d.type === 'outline'))
         readDoc(docKey(doc));
@@ -742,12 +852,32 @@ export class NovelTools {
     const last = [...this.chapterFailures.values()].at(-1);
     if (this.wholeSkill && last) throw last;
   }
-  private requireGoal() {
-    if (this.wholeSkill && !this.target)
-      throw new ToolFailure(
-        'novel_goal_required',
-        '请先通过 book_get_context 的 novelGoal 登记或续接整书目标。',
-      );
+  private get wholeWork() {
+    return this.wholeSkill || !!this.input.scope?.whole;
+  }
+  private missingGoal(ctx: RunContext) {
+    const action = ctx.continuation ? 'resume' : 'register';
+    const operation = action === 'resume' ? 'novel.resume' : 'novel.register';
+    const scope = this.input.scope;
+    const next =
+      scope && !scope.allows(operation, this.bookId, ctx)
+        ? '用 book_task_scope 登记 ' + operation + '（id=' + this.bookId + '），不要逐章登记；再'
+        : '';
+    const goal =
+      action === 'register' ? '，chapterIds 须为完整有序目标，包含已保存的章节' : '，沿用原目标，不另建';
+    return new ToolFailure(
+      'novel_goal_required',
+      '整书目标未登记或尚未恢复。' +
+        (this.wholeSkill ? '' : '先加载 generate-novel；') +
+        next +
+        '调用 book_get_context 的 novelGoal.' +
+        action +
+        goal +
+        '。',
+    );
+  }
+  private requireGoal(ctx: RunContext) {
+    if (this.wholeWork && !this.target) throw this.missingGoal(ctx);
     return this.target;
   }
   private publish(check: NovelCheck, ctx: RunContext, message = goalProblem(check)) {
@@ -798,7 +928,9 @@ export class NovelTools {
             'novel_goal_conflict',
             '已有未完成整书目标，请用 novelGoal.resume 核对现稿和原指令。',
           );
-        const expected = requestedChapterCount(this.input.authorPrompt ?? '');
+        const expected = this.input.scope
+          ? this.input.scope.whole?.count
+          : requestedChapterCount(this.input.authorPrompt ?? '');
         if (expected && expected !== ids.length)
           throw new ToolFailure(
             'novel_goal_conflict',
@@ -812,9 +944,13 @@ export class NovelTools {
           )
         )
           throw new ToolFailure('novel_goal_conflict', '目标必须保留当前目录的章节 ID 及相对顺序。');
+        const historical = this.input.scope?.whole?.sourceAuthorLine;
+        const originalLine = historical ?? ctx.authorLine;
+        const original = historical === undefined ? undefined : ctx.history?.lines[historical];
+        if (original?.role === 'user') this.inheritedDirections = [original.text];
         this.task = {
           chapterIds: [...ids],
-          originalLine: ctx.authorLine,
+          originalLine,
           knownCatalog: existing,
           pendingReferences: [],
         };
@@ -836,7 +972,7 @@ export class NovelTools {
         activated = true;
       }
     }
-    this.requireGoal();
+    this.requireGoal(ctx);
     const check = this.check(view);
     this.publish(check, ctx);
     if (activated || expanded) await this.saveGoal(ctx, check);
@@ -900,6 +1036,16 @@ export class NovelTools {
           });
       }
   }
+  async reportInterruptedTask(ctx: RunContext) {
+    if (!this.input.scope?.items.length) return;
+    if (ctx.signal.aborted) {
+      ctx.taskOutcome?.('cancelled');
+      ctx.diagnostic?.('writing.task_result', { outcome: 'cancelled' });
+    } else if (this.wholeWork) {
+      const check = this.target && this.check(await this.workspace.readAll(this.bookId));
+      ctx.taskOutcome?.(check && check.done > 0 ? 'partial' : 'incomplete');
+    } else await this.assertFinished(ctx);
+  }
   async assertFinished(ctx: RunContext) {
     if (this.editMode === 'proposal' || this.editMode === 'unresolved') return;
     if (this.edit) {
@@ -928,76 +1074,54 @@ export class NovelTools {
       }
       return;
     }
-    if (this.stagedEntry) {
+    if (this.input.scope && !this.wholeWork) {
       const { documents } = await this.workspace.readAll(this.bookId);
-      const { chapters, setups, clues } = this.stagedProgress(documents);
-      const actor = documents.find((doc) => doc.type === 'subject' && this.createdHere.has(docKey(doc)));
-      const reveal = chapters.find(
-        (chapter) => chapterStage(chapters, chapter.id) === 'reveal' && this.committedEntry(chapter),
+      const check = this.input.scope.summarize(documents);
+      const pending = this.syncTargets(documents).filter((item) => !item.synced);
+      const undisclosed = pending.filter(
+        (item) =>
+          !check.remaining.some(({ operation, id }) => `${operation.split('.')[0]}/${id}` === item.key),
       );
-      const missingSetups = [...new Set(clues.map((doc) => doc.fields.setupChapterId!))].filter(
-        (id) => !setups.includes(id),
+      const complete = !check.remaining.length && !pending.length;
+      const remaining = [
+        ...check.remaining.map(({ id, part, purpose }) => (part ? `${id}：${purpose}` : id)),
+        ...undisclosed.map(({ key }) => `待同步 ${key}`),
+      ];
+      const total = check.total + undisclosed.length;
+      if (!total) return;
+      ctx.taskOutcome?.(
+        complete
+          ? check.noWrite
+            ? 'no_write_needed'
+            : 'fulfilled'
+          : check.done
+            ? 'partial'
+            : 'incomplete',
       );
-      const missing = [
-        !actor && '新反派说明',
-        !clues.length && '关联伏笔说明',
-        setups.length < 2 && `中期迹象及对应大纲（已保存 ${setups.length}/2 章）`,
-        missingSetups.length && `伏笔埋设章 ${missingSetups.join('、')}`,
-        !reveal && '后期登场及对应大纲',
-      ].filter(Boolean);
-      const sync = this.syncTargets(documents);
-      const pending = sync.filter((t) => !t.synced).map((t) => `待同步 ${t.key}`);
-      missing.push(...pending);
-      this.reportPendingSync(documents, ctx);
-      const total = 5 + sync.length;
-      const done =
-        sync.length -
-        pending.length +
-        Number(!!actor) +
-        Number(!!clues.length && !missingSetups.length) +
-        Math.min(2, setups.length) +
-        Number(!!reveal);
       ctx.progress({
-        step: '执行关联增补',
+        step: complete ? (check.noWrite ? '已满足，无需写入' : '任务已完成') : '任务未全部完成',
         total,
-        done,
-        complete: !missing.length,
-        message: missing.length ? missing.join('；') : undefined,
+        done: check.done,
+        complete,
+        message: remaining.length ? `仍需核对或提交：${remaining.join('、')}` : undefined,
       });
-      ctx.diagnostic?.('writing.edit.scope', {
-        editMode: 'direct',
-        outcome: missing.length ? 'partial' : 'ok',
+      ctx.diagnostic?.('writing.task_result', {
         count: total,
-        done,
-        reason: missing.length ? 'book_edit_incomplete' : undefined,
+        done: check.done,
+        outcome: complete ? (check.noWrite ? 'reused' : 'ok') : check.done ? 'partial' : 'failed',
       });
-      if (missing.length)
-        throw new DiagnosticFailure(
-          'book_edit_incomplete',
-          `关联增补未全部提交：${missing.join('；')}。已保存的内容保留。`,
-        );
+      return;
     }
-    if (this.connectedEntry && ![...this.inserted.values()].some((item) => item.outlineUpdated))
-      throw new DiagnosticFailure(
-        'context_required',
-        '关联增补未完成：还没有一处经核对的登场正文及对应大纲提交。已保存的资料保留。',
-      );
-    if (this.connectedEntry && !this.stagedEntry) {
-      const documents = (await this.workspace.readAll(this.bookId)).documents;
-      const pending = this.syncStatus(documents);
-      this.reportPendingSync(documents, ctx);
-      if (pending.length)
-        throw new DiagnosticFailure(
-          'book_edit_incomplete',
-          `关联增补还有待同步资料：${pending.map((t) => t.key).join('、')}。`,
-        );
+    if (!this.wholeWork) return;
+    if (!this.target) {
+      if (this.input.scope) ctx.taskOutcome?.('incomplete');
+      throw this.missingGoal(ctx);
     }
-    if (!this.wholeSkill) return;
-    if (!this.target)
-      throw new DiagnosticFailure('novel_goal_required', '整书未完成：未登记可核对的章节目标。');
     const check = this.check(await this.workspace.readAll(this.bookId));
     const failure = check.firstUnwritten && this.chapterFailures.get(check.firstUnwritten);
     this.publish(check, ctx, failure ? failure.message : undefined);
+    if (this.input.scope)
+      ctx.taskOutcome?.(check.complete ? 'fulfilled' : check.done ? 'partial' : 'incomplete');
     if (check.complete) await ctx.saveNovelTask(null);
     else
       throw new DiagnosticFailure(
@@ -1030,17 +1154,27 @@ export class NovelTools {
     ctx: RunContext,
   ) {
     const view = await this.workspace.readAll(this.bookId);
-    if (args.novelGoal && (this.editMode !== 'direct' || this.stagedEntry))
+    if (args.novelGoal && this.editMode !== 'direct')
       throw new ToolFailure('invalid_options', '本轮不是整书请求，不登记或续接整书目标。');
-    if (args.novelGoal) return this.goalView(args.novelGoal, view, ctx);
+    if (args.novelGoal) {
+      if (
+        this.input.scope &&
+        !this.input.scope.allows(
+          args.novelGoal.action === 'resume' ? 'novel.resume' : 'novel.register',
+          this.bookId,
+          ctx,
+        ) &&
+        !(args.novelGoal.action === 'check' && this.target)
+      ) {
+        if (this.wholeWork) throw this.missingGoal(ctx);
+        throw new ToolFailure('invalid_options', '当前没有此作品的有效整书目标范围。');
+      }
+      return this.goalView(args.novelGoal, view, ctx);
+    }
     const offset = args.offset ?? 0;
     if (args.index) {
       this.targetedReads.add(this.indexReadKey(view.documents, args.index, offset));
-      return {
-        ...referenceIndex(view.documents, args.index, offset),
-        ...(this.connectedEntry &&
-          args.index === 'chapters' && { entryChoices: this.entryChoices(view.documents) }),
-      };
+      return referenceIndex(view.documents, args.index, offset);
     }
     const documents = view.documents
       .filter((d) => !args.type || d.type === args.type)
@@ -1125,12 +1259,14 @@ export class NovelTools {
       this.wholeSkill &&
       this.editMode === 'direct' &&
       !ctx.continuation &&
-      !proposalOnly(author) &&
-      !blocksProsePatch(author) &&
-      !/^(?:请\s*)?(?:继续|接着|续写)/u.test(author.trim()) &&
-      /(?:写完|写成|写|创作|生成|编写|撰写|完成|补全|补齐|构思并写)[^。；;\n]{0,32}(?:整本|一整本|全书|整部|本书|这本小说|一部小说|[\d零一二三四五六七八九十两百]+\s*章)|(?:整本|全书|整部)[^。；;\n]{0,16}(?:写完|创作|生成)/u.test(
-        author,
-      )
+      (this.input.scope
+        ? this.input.scope.whole?.operation === 'novel.register'
+        : !proposalOnly(author) &&
+          !blocksProsePatch(author) &&
+          !/^(?:请\s*)?(?:继续|接着|续写)/u.test(author.trim()) &&
+          /(?:写完|写成|写|创作|生成|编写|撰写|完成|补全|补齐|构思并写)[^。；;\n]{0,32}(?:整本|一整本|全书|整部|本书|这本小说|一部小说|[\d零一二三四五六七八九十两百]+\s*章)|(?:整本|全书|整部)[^。；;\n]{0,16}(?:写完|创作|生成)/u.test(
+            author,
+          ))
     );
   }
   private issueInsertionRef(
@@ -1178,6 +1314,8 @@ export class NovelTools {
     const ref = { type: 'chapter' as const, id: chapterId };
     const chapterKey = docKey(ref);
     let wrote = false;
+    if (this.input.scope)
+      ctx = this.input.scope.track(ctx, [{ operation: 'chapter.cleanup', id: chapterId }]);
     const report = diagnosticScope(ctx.diagnostic ?? noDiagnostic, {
       documentRef: chapterKey,
       insertionRef: receipt?.runId === ctx.id ? insertionRef : undefined,
@@ -1187,6 +1325,7 @@ export class NovelTools {
     };
     try {
       ctx.signal.throwIfAborted();
+      const taskScope = this.input.scope;
       const author = (this.input.authorPrompt ?? '').normalize('NFKC');
       if (
         ctx.session.bookId !== this.bookId ||
@@ -1194,10 +1333,11 @@ export class NovelTools {
         this.task ||
         this.editMode === 'proposal' ||
         this.editMode === 'unresolved' ||
-        proposalOnly(author) ||
-        /(?:不要|别|禁止|不允许|不许|不得|不能|无需|不必|不)\s*(?:(?:再|自动|直接|自行|擅自)\s*)?(?:删|移除|去掉|清理|去重|修订|改稿|(?:改动?|修改|动)(?:正文|新增|这段|插入段|原文))|(?:do not|don't|never) (?:edit|clean|remove|delete)\b/iu.test(
-          author,
-        )
+        (!taskScope &&
+          (proposalOnly(author) ||
+            /(?:不要|别|禁止|不允许|不许|不得|不能|无需|不必|不)\s*(?:(?:再|自动|直接|自行|擅自)\s*)?(?:删|移除|去掉|清理|去重|修订|改稿|(?:改动?|修改|动)(?:正文|新增|这段|插入段|原文))|(?:do not|don't|never) (?:edit|clean|remove|delete)\b/iu.test(
+              author,
+            )))
       )
         reject('insert_cleanup_scope', '当前增补范围不允许回声清理。');
       if (
@@ -1223,12 +1363,14 @@ export class NovelTools {
         this.edit.passage(chapterId, receipt.insertion.targetId);
         this.edit.verifySharedDocuments(documents, [chapterKey]);
       } else if (
-        !passageTargetAllowed(
-          author,
-          documents.filter((row) => row.type === 'chapter'),
-          chapterId,
-          this.input.selectedChapterId,
-        )
+        taskScope
+          ? !taskScope.allows('chapter.cleanup', chapterId, ctx)
+          : !passageTargetAllowed(
+              author,
+              documents.filter((row) => row.type === 'chapter'),
+              chapterId,
+              this.input.selectedChapterId,
+            )
       )
         reject('insert_cleanup_scope', '此位置已不在本轮允许的增补范围内。');
       const scene = receipt.commit.scene!;
@@ -1303,7 +1445,16 @@ export class NovelTools {
             .filter((chapter) => chapter.id !== chapterId),
         );
         if (preservesSyncEvidence(prior, next, chapterId)) retained.push(key);
-        else if (this.noteSyncAllowed(key)) pending.push(key);
+        else if (
+          this.input.scope
+            ? this.input.scope.allows(
+                `${key.split('/')[0]}.update` as ScopeOperation,
+                key.split('/')[1],
+                ctx,
+              )
+            : this.noteSyncAllowed(key)
+        )
+          pending.push(key);
         else reject('insert_cleanup_sync', '清理后须重新核验相关资料，但作者限制了所需同步；未写入。');
       }
       commit.cleanup!.preservedSync = retained;
@@ -1361,21 +1512,29 @@ export class NovelTools {
     ctx: RunContext,
   ) {
     const ref = { type: 'chapter' as const, id: chapterId };
+    const taskScope = this.input.scope;
     const reportPatch = diagnosticScope(ctx.diagnostic ?? noDiagnostic, { documentRef: docKey(ref) });
+    const parts = new Set(edits.map(({ part }) => part).filter((part): part is string => !!part));
     try {
       ctx.signal.throwIfAborted();
-      const author = this.input.authorPrompt ?? '';
+      const targets = taskScope?.patchTargets(chapterId, edits, ctx);
+      const explicitScope =
+        !!targets?.length &&
+        targets.every(({ operation, id, part }) => taskScope!.allows(operation, id, ctx, part));
+      const author =
+        taskScope?.instruction('chapter.patch', chapterId, targets) ?? this.input.authorPrompt ?? '';
       if (
         ctx.session.bookId !== this.bookId ||
         this.editMode !== 'direct' ||
-        proposalOnly(author) ||
-        blocksProsePatch(author)
+        (!taskScope && (proposalOnly(author) || blocksProsePatch(author)))
       )
         throw new ToolFailure('patch_not_authorized', '当前请求不授权修改章节原文。');
       const { documents } = await this.workspace.readAll(this.bookId);
       const chapters = documents.filter((d) => d.type === 'chapter');
-      const intent = prosePatchIntent(author, chapters, this.input.selectedChapterId);
-      const explicit = intent?.chapterId === chapterId;
+      const intent = !taskScope
+        ? prosePatchIntent(author, chapters, this.input.selectedChapterId)
+        : undefined;
+      const explicit = explicitScope || intent?.chapterId === chapterId;
       const owned =
         !explicit &&
         !ctx.continuation &&
@@ -1388,8 +1547,6 @@ export class NovelTools {
         );
       const doc = chapters.find((d) => d.id === chapterId);
       if (!doc) throw new ToolFailure('missing', '目标章不存在。');
-      if (this.patchedHere.has(chapterId))
-        throw new ToolFailure('patch_scope', '本轮已提交此章的局部修订；不重复写入或拆批扩大改动。');
       if (doc.revision !== revision || (owned && revision !== owned))
         throw new ToolFailure('conflict', '目标章修订已变化；不会用旧补丁覆盖当前正文。');
       const body = patchBody(doc.body, edits);
@@ -1416,7 +1573,7 @@ export class NovelTools {
         this.requirePatchQuote(source, entry.quote, true);
         guards.push({ type: 'chapter', id: source.id, revision: source.revision });
       }
-      if (explicit && intent.exact) {
+      if (explicit && intent?.exact) {
         if (
           edits.length !== 1 ||
           edits[0].quote !== intent.exact.quote ||
@@ -1431,7 +1588,10 @@ export class NovelTools {
         });
       } else await reviewProsePatch(this.provider, ctx, { evidence, edits });
       ctx.signal.throwIfAborted();
-      const write = editWriteContext({ ...ctx, diagnostic: reportPatch });
+      const patchContext = { ...ctx, diagnostic: reportPatch };
+      const write = editWriteContext(
+        taskScope && targets ? taskScope.track(patchContext, targets) : patchContext,
+      );
       const result = await this.workspace.writeChanges(
         this.bookId,
         [{ ...ref, fields: doc.fields, body, expect: doc.revision }],
@@ -1439,7 +1599,6 @@ export class NovelTools {
         guards,
         write.ctx.diagnostic,
       );
-      if (result.committed.some((item) => docKey(item) === docKey(ref))) this.patchedHere.add(chapterId);
       if (result.error) throw new ToolFailure(result.reason ?? 'unknown', result.error, result);
       const savedRevision = write.revisions([ref])[docKey(ref)];
       reportPatch('chapter.patch.finished', {
@@ -1447,13 +1606,25 @@ export class NovelTools {
         count: edits.length,
         revision: savedRevision,
       });
-      return { chapterId, revision: savedRevision, patched: edits.length, factCorrection: !explicit };
+      return {
+        chapterId,
+        revision: savedRevision,
+        patched: edits.length,
+        factCorrection: !explicit,
+        ...(parts.size ? { parts: [...parts] } : {}),
+      };
     } catch (error) {
       const reason = classified(error, ctx.signal);
       reportPatch('chapter.patch.finished', {
         outcome: reason === 'cancelled' ? 'cancelled' : 'failed',
         reason,
       });
+      for (const part of parts)
+        reportPatch('chapter.patch.part', {
+          partRef: part,
+          outcome: reason === 'cancelled' ? 'cancelled' : 'failed',
+          reason,
+        });
       if (error instanceof DiagnosticFailure && !(error instanceof ToolFailure))
         throw new ToolFailure(reason, error.message, { chapterId });
       throw error;
@@ -1466,14 +1637,27 @@ export class NovelTools {
         'invalid_options',
         '已确认的局部方案使用资产工具和逐章 insert；不能用通用工具扩大写入范围。',
       );
-    const target = this.requireGoal();
+    const target = this.requireGoal(ctx);
+    const scope = this.input.scope;
     if (
+      scope &&
+      !target &&
+      !operations.every(
+        ({ type, id, action }) =>
+          action !== 'delete' &&
+          (type === 'outline'
+            ? scope.allows('outline.write', id, ctx)
+            : type === 'chapter' && scope.allows('chapter.catalog', id, ctx)),
+      )
+    )
+      throw new ToolFailure('invalid_options', '通用目录或大纲动作不在本轮有效范围。');
+    if (
+      !scope &&
       !target &&
       wantsPassageAddition(this.input.authorPrompt ?? '') &&
-      (this.connectedEntry ||
-        operations.some(
-          ({ type, action }) => type === 'chapter' || type === 'outline' || action !== 'create',
-        ))
+      operations.some(
+        ({ type, action }) => type === 'chapter' || type === 'outline' || action !== 'create',
+      )
     )
       throw new ToolFailure(
         'invalid_options',
@@ -1501,6 +1685,14 @@ export class NovelTools {
             `${docKey(mutation)}：多次修正仍有无效引用，请报告未完成项。`,
           );
       }
+    if (scope && !target)
+      ctx = scope.track(
+        ctx,
+        operations.map(({ type, id }) => ({
+          operation: type === 'outline' ? 'outline.write' : 'chapter.catalog',
+          id,
+        })),
+      );
     const before = await this.workspace.readAll(this.bookId);
     if (target && this.check(before).catalogConflict)
       throw new ToolFailure(
@@ -1584,50 +1776,56 @@ export class NovelTools {
     if (report.error) throw new ToolFailure(report.reason ?? 'unknown', report.error, report);
     return report;
   }
-  private writingIntent(arrangement?: string, confirmed?: string): WritingIntent {
+  private writingIntent(
+    arrangement?: string,
+    confirmed?: string,
+    author = this.input.authorPrompt,
+  ): WritingIntent {
     return {
-      author: this.input.authorPrompt,
+      author,
       continued: this.inheritedDirections,
       confirmed,
       arrangement,
-    };
-  }
-  private entryChoices(documents: Manuscript[], ids?: Set<string>) {
-    const chapters = documents.filter((doc) => doc.type === 'chapter');
-    const outlineRevision = documents.find((doc) => doc.type === 'outline')?.revision;
-    return {
-      outlineRevision,
-      chapters: chapters
-        .filter(
-          (doc) =>
-            doc.body.trim() &&
-            (!ids || ids.has(doc.id)) &&
-            passageTargetAllowed(
-              this.input.authorPrompt ?? '',
-              chapters,
-              doc.id,
-              this.input.selectedChapterId,
-            ),
-        )
-        .map((doc) => ({
-          chapterId: doc.id,
-          title: doc.fields.title,
-          order: doc.fields.order,
-          insertion: suggestInsertionPoints(doc),
-          ...(this.stagedEntry ? { stage: chapterStage(chapters, doc.id) } : {}),
-        })),
-      note: this.stagedEntry
-        ? 'setup 候选仅写中期迹象；reveal 候选仅用于后期实际登场。新伏笔选择实际写入的 setup 章，payoff 只是计划。'
-        : '可从候选选一章；伏笔 setupChapterId 与登场章相同，另填一个真实的计划 payoffChapterId（不用改回收章）。锚点是建议，也可定向读取现稿换一处。',
     };
   }
   private async generateAssets(input: AssetInput, arrangement: string | undefined, ctx: RunContext) {
     if (ctx.session.bookId !== this.bookId)
       throw new ToolFailure('invalid_options', '生成资料必须使用本次会话绑定的作品。');
     this.requireEditAction();
-    if (input.action === 'update' && (this.edit || this.connectedEntry)) {
+    const taskScope = this.input.scope;
+    const operation = `${input.kind}.${input.action}` as ScopeOperation;
+    const permitted =
+      !!taskScope && input.targets.every(({ id }) => taskScope.allows(operation, id, ctx));
+    const whole = !!this.target && input.action !== 'update';
+    const expectedRevisions = new Map<string, string>();
+    if (taskScope)
+      ctx = taskScope.track(
+        ctx,
+        input.targets.map(({ id }) => ({ operation, id })),
+      );
+    if (
+      taskScope &&
+      operation === 'subject.create' &&
+      input.targets.some(
+        ({ id, relatedSubjectIds }) =>
+          new Set(relatedSubjectIds ?? []).size < (taskScope.item(operation, id)?.relatedMinimum ?? 0),
+      )
+    )
+      throw new ToolFailure('invalid_arguments', '关联的不同既有主体数不足登记要求。');
+    if (taskScope && !permitted && !whole)
+      throw new ToolFailure('invalid_options', '这些资料与动作不在本轮有效执行范围。');
+    if (input.action === 'update' && (this.edit || taskScope)) {
       const synced = await this.reconcileAssets(input, ctx);
       if (synced) return synced;
+    }
+    if (taskScope && input.action === 'update') {
+      const { documents } = await this.workspace.readAll(this.bookId);
+      for (const { id } of input.targets) {
+        const doc = documents.find((entry) => entry.type === input.kind && entry.id === id);
+        if (!doc || this.readSet.get(docKey(doc))?.revision !== doc.revision)
+          throw new ToolFailure('context_required', '更新前须读取相应资料的当前版本。');
+        expectedRevisions.set(id, doc.revision);
+      }
     }
     if (this.edit) {
       const edit = this.edit;
@@ -1680,59 +1878,9 @@ export class NovelTools {
       await save(result.assets);
       return { assets: [...scope.reused, ...result.assets] };
     }
-    const target = this.requireGoal();
-    if (this.stagedEntry && input.action !== 'create')
-      throw new ToolFailure('invalid_options', '本轮只新建反派及伏笔，不修改既有资料。');
-    if (
-      this.stagedEntry &&
-      input.kind === 'subject' &&
-      (input.targets.length !== 1 || input.targets[0].fields?.kind !== 'character')
-    )
-      throw new ToolFailure(
-        'invalid_arguments',
-        '请调用 kind="subject", action="create"，targets 只放一个反派：{id, fields:{name, kind:"character"}, relatedSubjectIds:[已有主体ID,...]}。主体 fields 内不要填 title。',
-      );
-    if (
-      this.connectedEntry &&
-      input.kind === 'clue' &&
-      input.action === 'create' &&
-      Array.isArray(input.targets)
-    ) {
-      const { documents } = await this.workspace.readAll(this.bookId);
-      const chapters = documents.filter(({ type }) => type === 'chapter');
-      const actor = documents.find((doc) => doc.type === 'subject' && this.createdHere.has(docKey(doc)));
-      if (
-        !actor ||
-        input.targets.some(
-          ({ fields }) =>
-            !fields?.setupChapterId ||
-            !fields.payoffChapterId ||
-            !fields.subjectIds?.includes(actor.id) ||
-            (this.stagedEntry && chapterStage(chapters, fields.setupChapterId) !== 'setup') ||
-            !passageTargetAllowed(
-              this.input.authorPrompt ?? '',
-              chapters,
-              fields.setupChapterId,
-              this.input.selectedChapterId,
-            ),
-        )
-      )
-        throw new ToolFailure(
-          'invalid_arguments',
-          '新增登场伏笔须关联已保存的新角色，填实际中期埋设章 setupChapterId 和有效的计划回收章 payoffChapterId；不用修改回收章。',
-          { actorId: actor?.id, entryChoices: this.entryChoices(documents) },
-        );
-    }
-    if (
-      this.connectedEntry &&
-      input.kind === 'subject' &&
-      input.action === 'create' &&
-      [...this.createdHere].some((key) => key.startsWith('subject/'))
-    )
-      throw new ToolFailure('conflict', '本轮已有新反派说明，请复用已保存的主体，不再生成第二个。');
+    const target = this.requireGoal(ctx);
     let authorized: DocRef[] = [];
-    const scopedWrite =
-      this.connectedEntry && input.action === 'create' ? editWriteContext(ctx) : undefined;
+    const scopedWrite = taskScope && input.action === 'create' ? editWriteContext(ctx) : undefined;
     const recordCreation = (ref: DocRef, revision: string) => {
       const key = docKey(ref);
       this.createdHere.add(key);
@@ -1750,7 +1898,13 @@ export class NovelTools {
         scopedWrite?.ctx ?? ctx,
         this.provider,
         input,
-        this.writingIntent(arrangement),
+        this.writingIntent(
+          arrangement,
+          undefined,
+          permitted
+            ? input.targets.map(({ id }) => taskScope!.instruction(operation, id)).join('\n')
+            : undefined,
+        ),
         !!target,
         async (refs) => {
           authorized = refs;
@@ -1762,39 +1916,14 @@ export class NovelTools {
               { refs },
             );
         },
+        permitted || (!!taskScope && whole),
+        expectedRevisions,
       );
       if (input.action === 'create')
         for (const saved of result.assets) recordCreation(saved, saved.revision);
       if (target) {
         for (const saved of result.assets) this.referenceFailures.delete(docKey(saved));
         await checkpoint();
-      }
-      if (this.connectedEntry && input.kind === 'clue' && input.action === 'create') {
-        const { documents } = await this.workspace.readAll(this.bookId);
-        const actor = documents.find(
-          (doc) => doc.type === 'subject' && this.createdHere.has(docKey(doc)),
-        );
-        const saved = new Set(result.assets.map(docKey));
-        const linked = documents.filter(
-          (doc) =>
-            doc.type === 'clue' &&
-            saved.has(docKey(doc)) &&
-            doc.fields.subjectIds?.includes(actor?.id ?? ''),
-        );
-        const chapters = new Set(
-          linked.flatMap(({ fields }) => (fields.setupChapterId ? [fields.setupChapterId] : [])),
-        );
-        return {
-          ...result,
-          entryReady: {
-            ...this.entryChoices(documents, this.stagedEntry ? undefined : chapters),
-            subjectIds: actor ? [actor.id] : [],
-            clueIds: linked.map(({ id }) => id),
-            next: this.stagedEntry
-              ? '先分别 insert 至少两个中期迹象，再在后期候选中选一章实际登场。每处附本章短大纲；成功后使用返回的新大纲 revision。'
-              : '可用 book_generate_chapter mode=insert：选同一个埋设章及一个 insertion 锚点，附 outline:{revision:outlineRevision,addition:只写本章登场与埋设的简短安排}。无需重新扫描全书。',
-          },
-        };
       }
       return result;
     } catch (error) {
@@ -1821,87 +1950,6 @@ export class NovelTools {
       throw error;
     }
   }
-  private committedEntry(chapter: Manuscript) {
-    const saved = this.inserted.get(chapter.id);
-    return saved?.outlineUpdated && saved.revision === chapter.revision;
-  }
-  private stagedProgress(documents: Manuscript[]) {
-    const chapters = documents.filter(({ type }) => type === 'chapter');
-    const setups = chapters
-      .filter(
-        (chapter) => chapterStage(chapters, chapter.id) === 'setup' && this.committedEntry(chapter),
-      )
-      .map(({ id }) => id);
-    const clues = documents.filter((doc) => doc.type === 'clue' && this.createdHere.has(docKey(doc)));
-    return { chapters, setups, clues };
-  }
-  private entryPlan(
-    documents: Manuscript[],
-    chapterId: string,
-    plan: ChapterPlan & { insertion?: ChapterInsertion },
-  ) {
-    const inBook = documents.filter((doc) => this.createdHere.has(docKey(doc)));
-    const actor = inBook.find(({ type }) => type === 'subject');
-    const { chapters, setups, clues } = this.stagedProgress(documents);
-    const stage = this.stagedEntry ? chapterStage(chapters, chapterId) : undefined;
-    const order = (id?: string) => chapters.find((chapter) => chapter.id === id)?.fields.order ?? -1;
-    if (
-      stage === 'reveal' &&
-      (setups.length < 2 || clues.some((clue) => !setups.includes(clue.fields.setupChapterId!)))
-    )
-      throw new ToolFailure(
-        'context_required',
-        '先保存至少两个不同中期章的迹象和大纲，并完成新伏笔的埋设，再写后期登场。',
-        { setups },
-      );
-    const admitted = inBook.filter(
-      (doc) =>
-        doc.type === 'clue' &&
-        (doc.fields.setupChapterId === chapterId ||
-          (stage &&
-            setups.includes(doc.fields.setupChapterId!) &&
-            order(doc.fields.setupChapterId) < order(chapterId))) &&
-        doc.fields.subjectIds?.includes(actor?.id ?? '') &&
-        documents.some(
-          (chapter) => chapter.type === 'chapter' && chapter.id === doc.fields.payoffChapterId,
-        ),
-    );
-    if (!actor || !admitted.length || !plan.insertion?.outline)
-      throw new ToolFailure(
-        'context_required',
-        stage
-          ? '先用资产工具保存关联反派和伏笔。中期迹象必须埋设或承接一个已提交的较早埋设；每处应附上当前版本的大纲增补。'
-          : '本轮要求新反派及其伏笔实际登场。先保存其关联说明和绑定同一埋设章的伏笔，再对该章 insert 并附上当前版本的大纲增补。',
-        {
-          chapterId,
-          existingActorId: actor?.id,
-          linkedClueIds: admitted.map(({ id }) => id),
-          needsOutline: !plan.insertion?.outline,
-        },
-      );
-    const newClues = admitted.map(({ id }) => id);
-    const addition = plan.insertion.outline.addition;
-    const refs = new Set(storyLinks(addition).map(({ ref }) => docKey(ref)));
-    const actualRefs = [actor, ...admitted]
-      .filter((doc) => !refs.has(docKey(doc)))
-      .map((doc) => {
-        const label =
-          (doc.fields.name ?? doc.fields.title ?? doc.id).replace(/[\r\n\[\]]/gu, ' ').trim() || doc.id;
-        return `[${label}](${doc.type === 'subject' ? 'subjects' : 'foreshadowing'}/${doc.id}.md)`;
-      });
-    return {
-      ...plan,
-      subjectIds: [...new Set([...(plan.subjectIds ?? []), actor.id])],
-      clueIds: [...new Set([...(plan.clueIds ?? []), ...newClues])],
-      insertion: {
-        ...plan.insertion,
-        outline: {
-          ...plan.insertion.outline,
-          addition: addition + (actualRefs.length ? ' ' + actualRefs.join(' ') : ''),
-        },
-      },
-    };
-  }
   private async generate(
     chapterId: string,
     mode: ChapterAction,
@@ -1910,13 +1958,17 @@ export class NovelTools {
     ctx: RunContext,
   ) {
     this.requireEditAction();
+    const scope = this.input.scope;
+    const operation = `chapter.${mode}` as ScopeOperation;
+    const scoped = scope?.allows(operation, chapterId, ctx);
+    if (scope) ctx = scope.track(ctx, [{ operation, id: chapterId }]);
     const edit = this.edit;
     if (edit && mode !== 'insert')
       throw new ToolFailure(
         'insert_not_authorized',
         '已确认的方案是局部增补，不授权新章、续写或整章覆盖。',
       );
-    const target = this.requireGoal();
+    const target = this.requireGoal(ctx);
     let editPassage: EditPassage | undefined;
     let entryStage: 'setup' | 'reveal' | undefined;
     let anchorKey: string | undefined;
@@ -1944,14 +1996,41 @@ export class NovelTools {
         }),
       };
     }
+    if (scope && !target && !scoped)
+      throw new ToolFailure(
+        mode === 'insert'
+          ? 'insert_not_authorized'
+          : mode === 'replace'
+            ? 'rewrite_not_authorized'
+            : 'invalid_options',
+        '该章及动作不在本轮有效执行范围，请核对作者请求。',
+      );
     if (mode === 'insert') {
-      if (!edit && this.connectedEntry && !this.stagedEntry && this.inserted.size)
-        throw new ToolFailure(
-          'conflict',
-          '本轮的局部增补已经提交，不在其他章重复插入。',
-          [...this.inserted.values()][0],
-        );
       const { documents } = await this.workspace.readAll(this.bookId);
+      if (scope) {
+        const chapter = documents.find((doc) => doc.type === 'chapter' && doc.id === chapterId);
+        if (!chapter) throw new ToolFailure('missing', `目标章 ${chapterId} 不存在。`, { chapterId });
+        if (!plan.insertion)
+          throw new ToolFailure('invalid_arguments', '定点插入需要原文锚点和章节版本。', { chapterId });
+        if (chapter.revision !== plan.insertion.revision)
+          throw new ToolFailure('conflict', `目标章 ${chapterId} 已改版，请重新读取并定位原文。`, {
+            chapterId,
+          });
+        if (this.readSet.get(docKey(chapter))?.revision !== chapter.revision)
+          throw new ToolFailure('context_required', '插入前须读取目标章的当前版本。', { chapterId });
+        const known = new Set(documents.map(docKey));
+        const linked: DocRef[] = [
+          ...(plan.subjectIds ?? []).map((id): DocRef => ({ type: 'subject', id })),
+          ...(plan.clueIds ?? []).map((id): DocRef => ({ type: 'clue', id })),
+        ];
+        const missing = linked.filter((ref) => !known.has(docKey(ref)));
+        if (missing.length)
+          throw new ToolFailure(
+            'invalid_references',
+            `当前作品没有这些场景资料：${missing.map(docKey).join('、')}。请按实际资料修正引用。`,
+            { chapterId, missing },
+          );
+      }
       if (edit) {
         edit.verifyPlacement(documents);
         editPassage = edit.passage(chapterId, plan.insertion?.targetId);
@@ -2017,6 +2096,7 @@ export class NovelTools {
           );
         plan = { ...plan, ...links, insertion: { ...plan.insertion, outline: update } };
       } else if (
+        !scope &&
         !passageTargetAllowed(
           this.input.authorPrompt ?? '',
           documents.filter((doc) => doc.type === 'chapter'),
@@ -2030,22 +2110,7 @@ export class NovelTools {
           { chapterId },
         );
       else {
-        if (this.stagedEntry) {
-          const chapters = documents.filter((doc) => doc.type === 'chapter');
-          entryStage = chapterStage(chapters, chapterId);
-          if (
-            this.inserted.has(chapterId) ||
-            (entryStage === 'reveal' &&
-              chapters.some(
-                (chapter) =>
-                  chapterStage(chapters, chapter.id) === 'reveal' && this.inserted.has(chapter.id),
-              ))
-          )
-            throw new ToolFailure('conflict', '此章或后期登场已经提交（可能部分提交），不要重复插入。', {
-              chapterId,
-            });
-        }
-        if (this.connectedEntry) plan = this.entryPlan(documents, chapterId, plan);
+        if (scoped?.stage === 'setup' || scoped?.stage === 'reveal') entryStage = scoped.stage;
         if (plan.insertion) {
           const chapter = documents.find((d) => d.type === 'chapter' && d.id === chapterId);
           if (chapter && chapter.revision === plan.insertion.revision) {
@@ -2074,7 +2139,7 @@ export class NovelTools {
       expectedPlacement = chapterPlacementFingerprint(documents);
     } else if (plan.insertion) {
       throw new ToolFailure('invalid_arguments', '仅 insert 接受局部插入锚点与大纲增补。');
-    } else if (mode !== 'replace' && wantsPassageAddition(this.input.authorPrompt ?? '')) {
+    } else if (!scope && mode !== 'replace' && wantsPassageAddition(this.input.authorPrompt ?? '')) {
       throw new ToolFailure(
         'insert_not_authorized',
         '本轮是指定剧情位置的局部登场增补，请读取既有章并用 insert，不能跳到续写或新章。',
@@ -2083,17 +2148,21 @@ export class NovelTools {
     }
     if (mode === 'replace') {
       const { documents } = await this.workspace.readAll(this.bookId);
-      const authorized = rewriteTarget(
-        this.input.authorPrompt ?? '',
-        documents.filter((doc) => doc.type === 'chapter'),
-        this.input.selectedChapterId,
-      );
+      const authorized = scope
+        ? scoped?.id
+        : rewriteTarget(
+            this.input.authorPrompt ?? '',
+            documents.filter((doc) => doc.type === 'chapter'),
+            this.input.selectedChapterId,
+          );
       const replacement = documents.find((doc) => doc.type === 'chapter' && doc.id === authorized);
       if (!replacement || replacement.id !== chapterId)
         throw new ToolFailure(
           'rewrite_not_authorized',
           '仅当作者在当前消息明确要求重写指定章节时才允许覆盖原文。',
         );
+      if (scope && this.readSet.get(docKey(replacement))?.revision !== replacement.revision)
+        throw new ToolFailure('context_required', '重写前须读取目标章当前版本。');
       guards = [replacement];
     }
     const insertionKey = anchorKey && plan.insertion && anchorKey + ':' + plan.insertion.revision;
@@ -2102,8 +2171,7 @@ export class NovelTools {
       : this.chapterFailures.get(chapterId);
     if (previousFailure) throw previousFailure;
     const draftOwned = mode === 'draft' && this.recordsDraftForCorrection(chapterId, ctx);
-    const write =
-      mode === 'insert' || edit || this.connectedEntry || draftOwned ? editWriteContext(ctx) : undefined;
+    const write = mode === 'insert' || edit || draftOwned ? editWriteContext(ctx) : undefined;
     const chapterKey = `chapter/${chapterId}`;
     const created = edit
       ? new Set(edit.plan.assets.filter((a) => a.action === 'create').map(assetTarget))
@@ -2120,7 +2188,7 @@ export class NovelTools {
       const commit = { target: sceneTarget, anchor: anchorKey, revisions, scene: body };
       if (edit && editPassage) await edit.record(ctx, commit);
       else {
-        if (this.connectedEntry && body && sceneAssets.length)
+        if (body && sceneAssets.length)
           this.directPassages.set(sceneTarget, {
             chapterId,
             stage: entryStage ?? 'addition',
@@ -2139,13 +2207,14 @@ export class NovelTools {
         chapterId,
         mode,
         this.writingIntent(
-          direction,
+          scoped?.purpose ?? direction,
           editPassage?.note ??
             (entryStage === 'setup'
-              ? '此处只在正文留下可观察的迹象；反派不得本人出场或被揭示身份，不提前回收伏笔。'
+              ? '此处只在正文留下场景安排中的可观察迹象，不提前揭示身份、安排实际登场或回收伏笔。'
               : entryStage === 'reveal'
-                ? '此处要在正文写出反派本人实际登场；回收仅限本章允许披露的伏笔，不把未来计划写成既成事实。'
+                ? '按场景安排在正文写出实际登场、对决或揭示；回收仅限本章允许披露的伏笔，不把未来计划写成既成事实。'
                 : undefined),
+          scoped && scope?.instruction(operation, chapterId),
         ),
         {
           plan,
@@ -2209,7 +2278,7 @@ export class NovelTools {
           outlineUpdated: !!plan.insertion?.outline,
           outlineRevision,
           ...(insertionRef && { insertionRef }),
-          ...((edit || this.connectedEntry) && {
+          ...((edit || scope) && {
             pendingSync: this.syncStatus((await this.workspace.readAll(this.bookId)).documents),
           }),
         }),
@@ -2273,12 +2342,16 @@ export class NovelTools {
         '作者只问修改方案时保存用于后续确认的范围，不修改作品。assets 和 passages 分列，按真实 ID 和章节位置说明；先查索引。创建主体字段 name/kind，可在同级写 relatedSubjectIds；新伏笔在 fields 里写 title/subjectIds/setupChapterId/payoffChapterId。不同中期迹象用不同位置、后期实际登场用 stage=reveal；payoffChapterId 是计划回收，允许与登场分章。',
       schema: editPlanSchema,
       execute: async (args, ctx) => {
-        if (!ctx.stageEditProposal || this.editMode !== 'proposal' || ctx.session.bookId !== this.bookId)
+        if (
+          !ctx.stageEditProposal ||
+          (!this.input.scope && this.editMode !== 'proposal') ||
+          ctx.session.bookId !== this.bookId
+        )
           throw new ToolFailure('invalid_options', '只有作者明确询问绑定作品的方案时才可登记建议。');
         const plan = readEditPlan(args);
         if (!plan) throw new ToolFailure('invalid_arguments', '方案须包含有界的资产或位置及简要安排。');
         const { documents } = await this.workspace.readAll(this.bookId);
-        checkBookEditPlan(plan, documents, this.input.authorPrompt ?? '');
+        checkBookEditPlan(plan, documents);
         const keys = new Set(plan.assets.filter((a) => a.action !== 'create').map(assetTarget));
         ctx.stageEditProposal(plan, {
           placement: chapterPlacementFingerprint(documents),
@@ -2300,11 +2373,11 @@ export class NovelTools {
       },
     };
     return [
-      ...(this.editMode === 'proposal' ? [proposalTool] : []),
+      ...(this.input.scope || this.editMode === 'proposal' ? [proposalTool] : []),
       {
         name: 'book_get_context',
         description:
-          '读取当前作品。按 type/documentId 定向读取；index=chapters/subjects/beats 查真实 ID；offset/length 可读限定范围内的精确原文与版本。按写入要求核对有关现稿，不反复读取未变化的同版资料。整书用 novelGoal 登记、续接或检查目标，不负责执行生成。',
+          '读取当前作品。按 type/documentId 定向读取；index=chapters/subjects/beats 查真实 ID；offset/length 可读限定范围内的精确原文与版本。按写入要求核对有关现稿，不反复读取未变化的同版资料。整书先登记 book_task_scope 的 novel.register 或 novel.resume，再用 novelGoal 激活完整目标；check 只核对活动目标。',
         schema: object(
           {
             type: typeSchema,
@@ -2319,7 +2392,12 @@ export class NovelTools {
             index: { type: 'string', enum: indexes },
             novelGoal: object(
               {
-                action: { type: 'string', enum: ['register', 'resume', 'check'] },
+                action: {
+                  type: 'string',
+                  enum: ['register', 'resume', 'check'],
+                  description:
+                    'register 建完整目标（含已有稿）；resume 恢复已保存目标；check 核对本轮目标',
+                },
                 chapterIds: {
                   type: 'array',
                   items: idSchema,
@@ -2435,7 +2513,7 @@ export class NovelTools {
       {
         name: 'book_patch_chapter',
         description:
-          '按当前作者明确授权定点修改一章的少量原文，不用于插入新场景或整章重写。先用 book_get_context 按章节 ID 读取精确短文与当前版本。只有本轮从空白生成并保持原提交版本的整书新稿，才可另凭已读取的前章原文证据做明确事实勘误；不补写不确定的剧情。',
+          '按当前作者明确授权定点修改一章的少量原文，不用于插入新场景或整章重写。先用 book_get_context 读取精确短文与当前版本。章内搬移优先同一批删除旧段并在新锚点补入；任一项不成立则整批不写。还需修订时重读新版本后继续，不重发旧补丁。只有本轮从空白生成并保持原提交版本的整书新稿，才可另凭已读取的前章原文证据做明确事实勘误。',
         schema: object(
           {
             chapterId: idSchema,
@@ -2444,14 +2522,18 @@ export class NovelTools {
               type: 'array',
               minItems: 1,
               maxItems: patchEntryLimit,
-              items: object({
-                quote: str('已读取的当前版中唯一的完整短原文，不得截断或归一化', patchFragmentLimit),
-                replacement: {
-                  type: 'string',
-                  maxLength: patchFragmentLimit,
-                  description: '替换后的局部正文；空字符串表示定点删除',
+              items: object(
+                {
+                  quote: str('已读取的当前版中唯一的完整短原文，不得截断或归一化', patchFragmentLimit),
+                  replacement: {
+                    type: 'string',
+                    maxLength: patchFragmentLimit,
+                    description: '替换后的局部正文；空字符串表示定点删除',
+                  },
+                  part: str('如已登记同章子目标，填对应 part。删除与补入各用自己的 part。', 64),
                 },
-              }),
+                ['quote', 'replacement'],
+              ),
             },
             evidence: {
               type: 'array',
@@ -2473,7 +2555,7 @@ export class NovelTools {
       {
         name: 'book_generate_chapter',
         description:
-          '流式生成空白章、续写、明确重写或在旧章锚点只插入新段落。insert 是作者要求新增出场／场景时的局部能力，先读该章拿版本和唯一短原文；可一并传有版本的大纲章节增补。正常插入成功可返回 insertionRef，只有本轮凭该回执可请求清理新增片段的确定回声。用 subjectIds / clueIds 指定内容依赖。若没有已写过渡且后章已有正文，提供 nextBoundary。整书只按序写空白章，replace 需本轮明确授权。',
+          '流式生成空白章、续写、明确重写或在旧章锚点只插入新段落。insert 在旧章补写场景，先读该章拿版本和唯一短原文。已有角色和伏笔可直接按 ID 引用，无需新建资料或改目录。若需要更新本章大纲才附局部增补，已有相关安排时不用重复加。正常插入成功可返回 insertionRef，只有本轮凭该回执可请求清理新增片段的确定回声。用 subjectIds / clueIds 指定内容依赖。若没有已写过渡且后章已有正文，提供 nextBoundary。整书先用 novelGoal.register/resume 激活完整目标，再按序 draft 空白章；独立单章不需要整书目标。replace 需本轮明确授权。',
         schema: object(
           {
             chapterId: idSchema,

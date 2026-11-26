@@ -45,25 +45,6 @@ export function rewriteTarget(prompt: string, chapters: Manuscript[], selected?:
   return matches.length === 1 ? matches[0].id : undefined;
 }
 
-/** Use the earliest referenced chapter if ambiguous, so recall cannot add later prose. */
-export function memoryChapterTarget(prompt: string, chapters: Manuscript[], selected?: string) {
-  const text = prompt.normalize('NFKC');
-  const orders = new Set(
-    [...text.matchAll(/第\s*[\d零一二三四五六七八九十两]+\s*章|\bchapter\s+\d+\b/giu)].map(([value]) =>
-      chapterOrder(value),
-    ),
-  );
-  return (
-    chapters.find(
-      (chapter) =>
-        orders.has(chapter.fields.order ?? -1) ||
-        (chapter.fields.title &&
-          chapter.fields.title.length >= 3 &&
-          text.includes(chapter.fields.title.normalize('NFKC'))),
-    )?.id ?? selected
-  );
-}
-
 /** A request for actual entry into an existing story can authorize an addition, never a replacement. */
 export function wantsPassageAddition(prompt: string) {
   const text = prompt.normalize('NFKC').trim();
@@ -89,25 +70,6 @@ export function wantsPassageAddition(prompt: string) {
   );
 }
 
-export function wantsStagedAntagonist(prompt: string) {
-  const source = prompt.normalize('NFKC');
-  return (
-    wantsPassageAddition(source) &&
-    /(?:新增|增加|加入|添加|加一个)[^，,。；;\n]{0,65}反派/u.test(source) &&
-    /(?:中期|中段)[^。；;\n]{0,50}(?:迹象|暗线|伏笔|线索)/u.test(source) &&
-    /(?:后期|后段)[^。；;\n]{0,40}(?:登场|出场|露面|现身)/u.test(source)
-  );
-}
-
-export function chapterStage(chapters: Manuscript[], target: string) {
-  const index = chapters
-    .slice()
-    .sort((a, b) => (a.fields.order ?? 0) - (b.fields.order ?? 0))
-    .findIndex(({ id }) => id === target);
-  if (index < Math.floor(chapters.length / 3)) return;
-  return index < Math.ceil((chapters.length * 2) / 3) ? 'setup' : 'reveal';
-}
-
 export function passageTargetAllowed(
   prompt: string,
   chapters: Manuscript[],
@@ -130,19 +92,7 @@ export function passageTargetAllowed(
       fields.title && fields.title.length > 2 && source.includes(fields.title.normalize('NFKC')),
   );
   if (named.length) return named.length === 1 && named[0].id === target;
-  const stage = chapterStage(chapters, target);
-  if (wantsStagedAntagonist(source)) return stage !== undefined;
-  if (/中期|中段|故事中间/u.test(source)) return stage === 'setup';
   return false;
-}
-
-export function minimumExistingSubjects(prompt: string) {
-  if (!wantsPassageAddition(prompt)) return 0;
-  const count =
-    /(?:至少\s*)?([\d一二三四五六七八九十两]+)\s*(?:个|位|项)\s*(?:以上)?\s*(?:不同的?)?\s*(?:已有|既有|现有|人物(?=主体))\s*(?:主体|人物|角色)/u.exec(
-      prompt.normalize('NFKC'),
-    )?.[1];
-  return count ? chapterOrder(`第${count}章`) || 0 : 0;
 }
 
 /** Only the current author's directive (not prior dialogue, proposed plans, or file contents) can narrow a patch. */

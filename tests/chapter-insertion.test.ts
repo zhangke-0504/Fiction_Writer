@@ -8,14 +8,14 @@ import { WorkspaceService } from '../electron/workspace.js';
 import { RunManager } from '../electron/agent/runs.js';
 import { Journal } from '../electron/journal.js';
 import { NovelTools } from '../electron/agent/novel-tools.js';
+import { BookTaskScope } from '../electron/agent/task-scope.js';
 import { runAgent } from '../electron/agent/loop.js';
 import { SkillCatalog } from '../electron/agent/skills.js';
 import { captureWritingRequests } from './writing-request-fixture.js';
 import { Gate, type Script } from '../electron/agent/scripted.js';
 import { collectDiagnostics } from './diagnostic-fixture.js';
 
-const author = '在故事中期插入一段陌生人登场的正文';
-const entry = '增加一个跟2个以上已有主体有关联的反派及他的伏笔，在故事中期登场';
+const author = '在第5章插入一段陌生人登场的正文';
 const before = '酒馆掌柜把油灯留在门边。';
 const after = '众船仍在港里，守夜人没有离开。';
 const original = before + '\r\n\r\n' + after;
@@ -52,15 +52,29 @@ async function fixture(t: import('node:test').TestContext, body = original) {
   const session = await runs.create({ cwd: workspace.bookRoot(id), bookId: id }, '写这本');
   const target = await workspace.readDocument(id, doc(5));
   const currentOutline = await workspace.readDocument(id, outline);
-  const start = (prompt: string, script: Script[]) => {
+  const start = (prompt: string, script: Script[], scoped = false) => {
     const { provider, requests } = captureWritingRequests(script);
     const trace = collectDiagnostics();
-    const novel = new NovelTools(workspace, id, provider, catalog, { authorPrompt: prompt });
     runs.start(
       session.id,
       prompt,
       async (ctx) => {
-        await runAgent(ctx, provider, '只操作作者要求的作品。', [], prompt, novel.tools());
+        const scope = scoped ? new BookTaskScope(ctx, prompt, provider) : undefined;
+        const novel = new NovelTools(workspace, id, provider, catalog, { authorPrompt: prompt, scope });
+        await runAgent(
+          ctx,
+          provider,
+          '只操作作者要求的作品。',
+          [],
+          prompt,
+          [
+            ...novel.tools(),
+            ...(scope ? [scope.tool(async () => (await workspace.readAll(id)).documents)] : []),
+          ],
+          15,
+          scoped ? {} : undefined,
+        );
+        if (scope) await novel.assertFinished(ctx);
       },
       'high',
       trace.report,
@@ -233,21 +247,6 @@ for (const change of ['cancel', 'external-edit'] as const) {
   });
 }
 
-test('the connected entry cannot be inserted before its actual actor and clue have been saved', async (t) => {
-  const f = await fixture(t);
-  const op = f.start(entry, [
-    () => use('book_generate_chapter', f.operation),
-    ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /同一埋设章/);
-      return text('未提交。');
-    },
-  ]);
-  const result = await op.wait();
-  assert.equal(result.status, 'completed', result.error);
-  assert.equal(op.requests.filter(({ lane }) => lane === 'draft').length, 0);
-  assert.equal((await f.workspace.readDocument(f.id, f.target)).body, original);
-});
-
 test('the tool does not draft a second insertion after a successful local addition', async (t) => {
   const f = await fixture(t);
   const op = f.start(author, [
@@ -389,3 +388,39 @@ for (const valid of [false, true]) {
     },
   );
 }
+
+test('the user can continue a specific unresolved insertion without repeating the chapter or anchor', async (t) => {
+  const f = await fixture(t);
+  const waiting = '仍未处理：第 5 章酒馆处需要补上陌生人交给掌柜指环的情节。';
+  await f.start('先说明哪里需要补写，不动稿', [() => text(waiting)], true).wait();
+  const op = f.start(
+    '解决未清理的问题',
+    [
+      () => use('tool_search', { query: 'book_get_context book_generate_chapter' }),
+      () =>
+        use('book_task_scope', {
+          sourceQuote: waiting,
+          items: [
+            { operation: 'chapter.insert', id: f.target.id, purpose: '补写在酒馆交给掌柜指环的片段' },
+          ],
+        }),
+      () => use('check_book_scope', { allowed: true }),
+      () => use('book_get_context', { type: 'chapter', documentId: f.target.id }),
+      () => use('book_generate_chapter', f.operation),
+      () => text(fragment),
+      ({ history }) => {
+        assert.match(JSON.stringify(history.at(-1)), /"inserted":true/);
+        return text('已补写。');
+      },
+    ],
+    true,
+  );
+  const result = await op.wait();
+  assert.equal(result.status, 'completed', result.error);
+  assert.equal(result.taskOutcome, 'fulfilled');
+  assert.equal(
+    (await f.workspace.readDocument(f.id, f.target)).body,
+    before + '\r\n\r\n' + fragment + '\r\n\r\n' + after,
+  );
+  assert.deepEqual(op.trace.rejected, []);
+});

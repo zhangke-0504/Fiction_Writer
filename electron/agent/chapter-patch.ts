@@ -9,7 +9,7 @@ export const patchEntryLimit = 3;
 export const patchFragmentLimit = 600;
 const patchTotalLimit = 1200;
 
-export type ProseEdit = { quote: string; replacement: string };
+export type ProseEdit = { quote: string; replacement: string; part?: string };
 export type PatchEvidence = { chapterId: string; revision: string; quote: string };
 
 export function exactRange(body: string, quote: string, reason = 'patch_anchor') {

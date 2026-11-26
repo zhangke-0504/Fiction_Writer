@@ -156,7 +156,7 @@ export class ActiveContext {
     return shrunk;
   }
 
-  fit(limit: number, keep?: ProtectedResult, notice?: string) {
+  fit(limit: number, keep?: ProtectedResult, notice?: string, tools = this.tools) {
     const measure = () => {
       const wire = this.wire(limit, notice);
       if (
@@ -166,7 +166,7 @@ export class ActiveContext {
         )
       )
         throw contextOverflow();
-      return { wire, fits: inputEstimate(wire.system, wire.history, this.tools) <= limit };
+      return { wire, fits: inputEstimate(wire.system, wire.history, tools) <= limit };
     };
     let { wire, fits } = measure();
     if (fits) return wire;

@@ -266,7 +266,8 @@ test('local diaries reconstruct concurrent runs and actual tool decisions withou
     let raw = '';
     for await (const chunk of req) raw += chunk;
     acceptedKey ||= req.headers.authorization === `Bearer ${marker.key}`;
-    const messages = JSON.parse(raw).messages as { role: string; content: string }[];
+    const body = JSON.parse(raw);
+    const messages = body.messages as { role: string; content: string }[];
     if (messages.at(-1)?.content === 'fail only this Run') {
       res.writeHead(401);
       res.end(marker.error);
@@ -278,7 +279,12 @@ test('local diaries reconstruct concurrent runs and actual tool decisions withou
         `data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason }] })}\n\ndata: [DONE]\n\n`,
       );
     };
-    if (messages.at(-1)?.role === 'tool') {
+    const discovered = body.tools?.some(
+      (tool: { function: { name: string } }) => tool.function.name === 'read_file',
+    );
+    const discoveryResult =
+      messages.at(-1)?.role === 'tool' && messages.at(-1)?.content.includes('candidates');
+    if (messages.at(-1)?.role === 'tool' && !discoveryResult) {
       sawReadOutput = messages.some((m) => m.role === 'tool' && m.content.includes(marker.result));
       sawShellOutput = messages.some((m) => m.role === 'tool' && m.content.includes(marker.stdout));
       reply({ content: 'fixture finished' }, 'stop');
@@ -289,6 +295,24 @@ test('local diaries reconstruct concurrent runs and actual tool decisions withou
       raw.includes(marker.reference) &&
       raw.includes(reference.split(/[\\/]/).at(-1)!);
     await hold;
+    if (!discovered) {
+      reply(
+        {
+          tool_calls: [
+            {
+              index: 0,
+              id: 'discover-fixture-tools',
+              function: {
+                name: 'tool_search',
+                arguments: JSON.stringify({ query: 'read_file run_command' }),
+              },
+            },
+          ],
+        },
+        'tool_calls',
+      );
+      return;
+    }
     const command =
       process.platform === 'win32'
         ? `# ${marker.command}\nWrite-Output '${marker.stdout}'; exit 7`
@@ -416,10 +440,11 @@ test('local diaries reconstruct concurrent runs and actual tool decisions withou
   });
   expect(first.filter((e) => e.event === 'loop.round.finished').map((e) => e.fields.reason)).toEqual([
     'continue_tools',
+    'continue_tools',
     'complete',
   ]);
   const startedTwice = first.filter((e) => e.event === 'model.started');
-  expect(startedTwice).toHaveLength(2);
+  expect(startedTwice).toHaveLength(3);
   const callPath = (id: string) =>
     first.filter((e) => e.fields.callId === id && /^tool\.(?!file)/.test(e.event));
   const finishedRead = first.find(
@@ -444,7 +469,7 @@ test('local diaries reconstruct concurrent runs and actual tool decisions withou
       'tool.result_ready',
       'tool.result_sent',
     ]);
-    expect(rows.at(-1)!.fields).toMatchObject({ spanId: startedTwice[1].fields.spanId, nextTurn: 2 });
+    expect(rows.at(-1)!.fields).toMatchObject({ spanId: startedTwice[2].fields.spanId, nextTurn: 3 });
     expect(rows[2].fields.outcome).toBe('failed');
   }
   expect(

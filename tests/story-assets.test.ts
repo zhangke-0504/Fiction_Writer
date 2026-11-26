@@ -9,6 +9,7 @@ import { Journal } from '../electron/journal.js';
 import { RunManager } from '../electron/agent/runs.js';
 import { SkillCatalog } from '../electron/agent/skills.js';
 import { NovelTools } from '../electron/agent/novel-tools.js';
+import { BookTaskScope } from '../electron/agent/task-scope.js';
 import { runAgent } from '../electron/agent/loop.js';
 import { Gate } from '../electron/agent/scripted.js';
 import type { Script } from '../electron/agent/scripted.js';
@@ -90,12 +91,26 @@ async function fixture(t: import('node:test').TestContext) {
   await runs.init();
   const session = await runs.create({ cwd: workspace.bookRoot(id), bookId: id }, '测试');
   const catalog = new SkillCatalog(fileURLToPath(new URL('../skills', import.meta.url)));
-  const start = (prompt: string, script: Script[]) => {
+  const start = (prompt: string, script: Script[], scoped = false) => {
     const { provider, requests } = captureWritingRequests(script);
-    const novel = new NovelTools(workspace, id, provider, catalog, { authorPrompt: prompt });
-    runs.start(session.id, prompt, (ctx) =>
-      runAgent(ctx, provider, 'OUTER_CHAT_ONLY', [], prompt, novel.tools()),
-    );
+    runs.start(session.id, prompt, async (ctx) => {
+      const scope = scoped ? new BookTaskScope(ctx, prompt, provider) : undefined;
+      const novel = new NovelTools(workspace, id, provider, catalog, { authorPrompt: prompt, scope });
+      await runAgent(
+        ctx,
+        provider,
+        'OUTER_CHAT_ONLY',
+        [],
+        prompt,
+        [
+          ...novel.tools(),
+          ...(scope ? [scope.tool(async () => (await workspace.readAll(id)).documents)] : []),
+        ],
+        20,
+        scoped ? {} : undefined,
+      );
+      if (scope) await novel.assertFinished(ctx);
+    });
     return {
       requests,
       wait: async () => {
@@ -347,22 +362,39 @@ test('a new mid-story actor must connect to the requested number of distinct exi
     (await f.workspace.writeChanges(f.id, [{ ...old, expect: old.revision, body: generated }])).error,
     undefined,
   );
-  const op = f.start(prompt, [
-    () => send('book_generate_assets', input),
-    ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /至少 2 个不同的既有主体/);
-      return send('book_generate_assets', {
-        ...input,
-        targets: [{ ...actor, relatedSubjectIds: ['bell', 'keeper'] }],
-      });
-    },
-    ({ history }) => {
-      assert.match(JSON.stringify(history), /SOURCE_ITEM_SETTING/);
-      assert.match(JSON.stringify(history), /NEW_ASSET_BODY/);
-      return propose('rust', '## 稳定设定\n赤锈曾替罗蓝保管铜铃，如今借铃声误导他。');
-    },
-    () => finish(),
-  ]);
+  const op = f.start(
+    prompt,
+    [
+      () => send('tool_search', { query: 'book_generate_assets' }),
+      () =>
+        send('book_task_scope', {
+          items: [
+            {
+              operation: 'subject.create',
+              id: 'rust',
+              purpose: '新增与两名主体有关联的反派',
+              relatedMinimum: 2,
+            },
+          ],
+        }),
+      () => send('check_book_scope', { allowed: true }),
+      () => send('book_generate_assets', input),
+      ({ history }) => {
+        assert.match(JSON.stringify(history.at(-1)), /关联的不同既有主体数不足/);
+        return send('book_generate_assets', {
+          ...input,
+          targets: [{ ...actor, relatedSubjectIds: ['bell', 'keeper'] }],
+        });
+      },
+      ({ history }) => {
+        assert.match(JSON.stringify(history), /SOURCE_ITEM_SETTING/);
+        assert.match(JSON.stringify(history), /NEW_ASSET_BODY/);
+        return propose('rust', '## 稳定设定\n赤锈曾替罗蓝保管铜铃，如今借铃声误导他。');
+      },
+      () => finish(),
+    ],
+    true,
+  );
   const result = await op.wait();
   assert.equal(result.run?.status, 'completed', result.run?.error);
   assert.equal(op.requests.filter(({ lane }) => lane === 'asset').length, 1);
@@ -370,3 +402,54 @@ test('a new mid-story actor must connect to the requested number of distinct exi
   assert.match(doc.body, /subjects\/bell.md/);
   assert.match(doc.body, /subjects\/keeper.md/);
 });
+
+for (const allowed of [true, false]) {
+  test(`continuation asset update preserves status and actual commit evidence (allowed=${allowed})`, async (t) => {
+    const f = await fixture(t);
+    const ref = { type: 'subject' as const, id: 'bell' };
+    const original = await f.workspace.readDocument(f.id, ref);
+    const waiting = '还有一点：铜铃已经回到主人手里，资料缺少这个已发生的状态。保留铜铃的稳定设定。';
+    await f.start('说明还缺哪些资料状态，别改', [() => ({ ...finish(), text: waiting })], true).wait();
+    const revised = `## 稳定设定\n${original.body}\n\n## 已发生变化\n铜铃回到主人手里。`;
+    const out = await f
+      .start(
+        '解决未清理的问题',
+        [
+          () => send('tool_search', { query: 'book_get_context book_generate_assets' }),
+          () =>
+            send('book_task_scope', {
+              sourceQuote: waiting,
+              items: [
+                {
+                  operation: 'subject.update',
+                  id: ref.id,
+                  purpose: '仅同步已发生变化，保留铜铃的稳定设定。',
+                },
+              ],
+            }),
+          () => send('check_book_scope', { allowed: true }),
+          () => send('book_get_context', { type: ref.type, documentId: ref.id }),
+          () =>
+            send('book_generate_assets', {
+              kind: ref.type,
+              action: 'update',
+              targets: [{ id: ref.id }],
+            }),
+          () => propose(ref.id, revised),
+          ({ tools, history }) => {
+            assert.equal(tools[0].name, 'check_asset_update_scope');
+            assert.match(JSON.stringify(history), /SOURCE_ITEM_SETTING/);
+            return send('check_asset_update_scope', { allowed });
+          },
+          () => finish(),
+        ],
+        true,
+      )
+      .wait();
+    assert.equal(out.run?.status, 'completed', out.run?.error);
+    assert.equal(out.run?.taskOutcome, allowed ? 'fulfilled' : 'incomplete');
+    const actual = await f.workspace.readDocument(f.id, ref);
+    assert.deepEqual(actual.fields, original.fields);
+    assert.equal(actual.body, allowed ? revised + '\n' : original.body);
+  });
+}

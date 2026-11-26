@@ -111,7 +111,7 @@ $rows | Where-Object { $_.fields.runId -eq $id -and
   Sort-Object time, logSeq | Format-List time, bootId, event, fields
 ```
 
-- **是否召回：** `memory.recall.finished` 的 `trigger` 区分 `agent`、`draft`、`tool`。`outcome: ok` 且 `storyCount`、`planCount`、`referenceCount`、`conventionCount` 都为零是正常空结果，不是失败。显式 `book_memory_recall` 还可以用 `callId` 对照工具执行事件。
+- **是否召回：** `memory.recall.finished` 的 `trigger` 区分明确目标章的写章取材 `draft` 和 Agent 主动调用 `tool`；首轮不预取。`outcome: ok` 且 `storyCount`、`planCount`、`referenceCount`、`conventionCount` 都为零是正常空结果，不是失败。显式 `book_memory_recall` 还可以用 `callId` 对照工具执行事件。
 - **索引是否刷新：** 用 `recallId` 找 `memory.index.finished`。`cacheAction` 为 `created`、`updated` 才表示实际写入；`unchanged` 表示未写，`degraded` 表示本次根据现稿在内存中处理，`cacheIssue` 可区分读失败、格式无效和写失败。降级仍可能正确召回。
 - **哪个请求带了证据：** 用 `recallId` 跟到 `memory.context.dispatched`，再用 `spanId` 对照 `memory.context.source` 和 `model.http`。正文重试使用新的 `spanId`。可以看证据类别、来源章序和文档／修订指纹；每次派发最多记录 8 个来源。同一 `bootId`、`workspaceRef` 下可以和文件提交事件比较指纹。派发只表示交给传输层，不代表上游收到或模型采纳；无对应的派发行也可能是本地日志缺失，不要把它当成模型没有收到的证明。
 

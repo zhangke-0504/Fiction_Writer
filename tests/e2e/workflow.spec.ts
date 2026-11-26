@@ -83,6 +83,7 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
   const repairId = 'indexer';
   const allSubjects = mode === 'full' ? [hero, ...retainedSubjects.map(({ target }) => target)] : [hero];
   const chapterForEntry = 5;
+  let outlineRevision = '';
   const extraClue = {
     id: newClueId,
     fields: {
@@ -133,6 +134,8 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
           ...(mode !== 'single' && { subjectIds: [hero.id], clueIds: [clue.id] }),
         });
       const last = body.messages.at(-1)?.content.at(-1);
+      if (body.tools?.length === 1 && body.tools[0].name === 'check_book_scope')
+        return use('check_book_scope', 'scope-verdict', { allowed: true });
       if (body.tools?.length === 1 && body.tools[0].name === 'submit_story_sync') {
         const { asset, sources } = JSON.parse(last!.text!);
         expect(sources).toHaveLength(1);
@@ -237,10 +240,13 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
       }
       if (last?.type !== 'tool_result') {
         if (last?.text === discussion) return reply('先构思归乡与身份的冲突，不写文件。');
-        if (last?.text === antagonistRequest) return use('book_get_context', 'entry-context', {});
+        if (last?.text === antagonistRequest)
+          return use('tool_search', 'entry-discover', {
+            query: 'book_get_context book_generate_assets book_generate_chapter',
+          });
         if (mode === 'single') {
           expect(last?.text).toBe('只写第三章');
-          return generate(3);
+          return use('tool_search', 'single-discover', { query: 'book_generate_chapter' });
         }
         expect(last?.text).toBe(
           resumed
@@ -252,14 +258,64 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
                 : faultPrompt,
         );
         expect(body.system).toContain('skill_search');
-        if (resumed) expect(body.system).toContain('有可供作者明确续接的整书记录');
-        return use('skill_search', 'search', { query: searchQuery });
+        if (resumed) expect(body.system).toContain('有可续接的整书记录');
+        return use('tool_search', 'whole-discover', {
+          query: 'book_get_context book_apply_changes book_generate_assets book_generate_chapter',
+        });
       }
       const result = JSON.parse(last.content!);
       const marker = last.tool_use_id!;
+      if (marker === 'whole-discover') {
+        const bookId = /当前绑定小说 ID：([a-z0-9-]+)/u.exec(body.system)?.[1];
+        expect(bookId).toBeTruthy();
+        return use('book_task_scope', 'whole-scope', {
+          items: [
+            {
+              operation: resumed ? 'novel.resume' : 'novel.register',
+              id: bookId,
+              purpose: resumed ? '承接当前未完成整书目标' : '完成请求章数和配套资料',
+              ...(!resumed && { count }),
+            },
+          ],
+        });
+      }
+      if (marker === 'whole-scope') {
+        expect(result.ok).toBe(true);
+        return use('skill_search', 'search', { query: searchQuery });
+      }
+      if (marker === 'single-discover')
+        return use('book_task_scope', 'single-scope', {
+          items: [{ operation: 'chapter.draft', id: id(3), purpose: '只写第三章' }],
+        });
+      if (marker === 'single-scope') {
+        expect(result.ok).toBe(true);
+        return generate(3);
+      }
+      if (marker === 'entry-discover') return use('book_get_context', 'entry-context', {});
       if (marker === 'entry-context') {
         expect(result.ok).toBe(true);
         expect(result.value.documents.filter((d: Manuscript) => d.type === 'subject')).toHaveLength(3);
+        outlineRevision = result.value.documents.find((d: Manuscript) => d.type === 'outline').revision;
+        return use('book_task_scope', 'entry-scope', {
+          items: [
+            {
+              operation: 'subject.create',
+              id: antagonist.id,
+              purpose: '新增与多个既有主体关联的反派',
+              relatedMinimum: 2,
+            },
+            { operation: 'clue.create', id: newClueId, purpose: '新增关联反派的三道灰痕伏笔' },
+            {
+              operation: 'chapter.insert',
+              id: id(chapterForEntry),
+              purpose: '让灰冠守夜人在中期实际登场并埋设灰痕',
+              stage: 'reveal',
+            },
+          ],
+        });
+      }
+      if (marker === 'entry-scope') {
+        expect(result.ok).toBe(true);
         return use('book_generate_assets', 'entry-subject', {
           kind: 'subject',
           action: 'create',
@@ -271,15 +327,13 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
         return use('book_generate_assets', 'entry-unbound', {
           kind: 'clue',
           action: 'create',
-          targets: [{ ...extraClue, fields: { ...extraClue.fields, payoffChapterId: undefined } }],
+          targets: [
+            { ...extraClue, fields: { ...extraClue.fields, payoffChapterId: 'missing-payoff' } },
+          ],
         });
       }
       if (marker === 'entry-unbound') {
-        expect(result).toMatchObject({
-          ok: false,
-          reason: 'invalid_arguments',
-          value: { actorId: antagonist.id },
-        });
+        expect(result).toMatchObject({ ok: false, reason: 'invalid_references' });
         return use('book_generate_assets', 'entry-clue', {
           kind: 'clue',
           action: 'create',
@@ -288,21 +342,24 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
       }
       if (marker === 'entry-clue') {
         expect(result.value.assets).toMatchObject([{ type: 'clue', id: newClueId }]);
-        const ready = result.value.entryReady;
-        expect(ready.chapters.map((chapter: { chapterId: string }) => chapter.chapterId)).toEqual([
-          id(chapterForEntry),
-        ]);
-        expect(ready.chapters[0].insertion[0].quote.length).toBeGreaterThan(5);
+        return use('book_get_context', 'entry-chapter', {
+          type: 'chapter',
+          documentId: id(chapterForEntry),
+        });
+      }
+      if (marker === 'entry-chapter') {
+        expect(result.value.document.body).toContain(chapterBody(chapterForEntry));
         return use('book_generate_chapter', 'entry-insert', {
-          chapterId: ready.chapters[0].chapterId,
+          chapterId: id(chapterForEntry),
           mode: 'insert',
           insertion: {
-            ...ready.chapters[0].insertion[0],
-            outline: { revision: ready.outlineRevision, addition: newOutlineBeat },
+            quote: chapterBody(chapterForEntry),
+            place: 'before',
+            revision: result.value.document.revision,
+            outline: { revision: outlineRevision, addition: newOutlineBeat },
           },
-          subjectIds: ready.subjectIds,
-          clueIds: ready.clueIds,
-          direction: '让灰冠守夜人在中期出场，以灰痕埋设线索，不揭晓内情。',
+          subjectIds: [antagonist.id],
+          clueIds: [newClueId],
         });
       }
       if (marker === 'entry-insert') {
@@ -311,6 +368,15 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
           outlineUpdated: true,
           chapterId: id(chapterForEntry),
         });
+        return use('book_task_scope', 'entry-sync-scope', {
+          items: [
+            { operation: 'subject.update', id: antagonist.id, purpose: '按实际登场同步新建反派资料' },
+            { operation: 'clue.update', id: newClueId, purpose: '按实际埋设同步新建伏笔，不冒称回收' },
+          ],
+        });
+      }
+      if (marker === 'entry-sync-scope') {
+        expect(result.ok).toBe(true);
         return use('book_generate_assets', 'entry-sync-actor', {
           kind: 'subject',
           action: 'update',
@@ -616,7 +682,11 @@ test('two natural-language sends complete the Odyssey and insert a related antag
     });
     for (const [index, chapterId] of mock.chapterIds.entries())
       expect((await read(page, bookId, chapterId)).body).toBe(chapterBody(index + 1));
-    expect(mock.calls.slice(0, 2)).toEqual(['skill_search:search', 'skill_load:load']);
+    expect(mock.calls.filter((call) => call.startsWith('skill_'))).toEqual([
+      'skill_search:search',
+      'skill_load:load',
+    ]);
+    expect(mock.calls).toContain('tool_search:whole-discover');
     expect(mock.drafts).toEqual(Array.from({ length: 10 }, (_, index) => index + 1));
     const prior = (await status(page, bookId))!.id;
     const originalOutline = await readDoc('outline', 'outline');
@@ -839,7 +909,11 @@ test('single-chapter request uses the same composer, can be stopped, and never s
       'chapter',
       'outline',
     ]);
-    expect(mock.calls).toEqual(['book_generate_chapter:draft-3', 'book_generate_chapter:draft-3']);
+    expect(mock.calls.filter((call) => call.startsWith('book_generate_chapter:'))).toEqual([
+      'book_generate_chapter:draft-3',
+      'book_generate_chapter:draft-3',
+    ]);
+    expect(mock.calls.some((call) => call.startsWith('skill_') || call.includes('whole-'))).toBe(false);
     expect(mock.drafts).toEqual([3, 3]);
     expect(mock.errors).toEqual([]);
   } finally {

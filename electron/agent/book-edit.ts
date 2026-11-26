@@ -1,7 +1,7 @@
 import type { DocRef, Manuscript } from '../../shared/contracts.js';
 import { chapterPlacementFingerprint, docKey, validateFields } from '../documents.js';
 import { ToolFailure } from './loop.js';
-import { chapterOrder, chapterStage } from './chapter-intent.js';
+import { chapterOrder } from './chapter-intent.js';
 import { hasStoryDescription } from './story-notes.js';
 import {
   assetTarget,
@@ -21,7 +21,7 @@ import type { ChapterInsertion } from './chapter-insertion.js';
 const outlineKey = 'outline/outline';
 
 /** Validate proposed identities against the current book. Proposed new cards may refer to one another. */
-export function checkBookEditPlan(plan: EditPlan, documents: Manuscript[], author: string) {
+export function checkBookEditPlan(plan: EditPlan, documents: Manuscript[]) {
   const byKey = new Map(documents.map((doc) => [docKey(doc), doc]));
   const planned = new Set(plan.assets.filter((a) => a.action === 'create').map(assetTarget));
   const exists = (type: 'subject' | 'clue', id: string) =>
@@ -64,66 +64,6 @@ export function checkBookEditPlan(plan: EditPlan, documents: Manuscript[], autho
     reveals = plan.passages.filter((p) => p.stage === 'reveal');
   if (setups.some((a) => reveals.some((b) => order(a.chapterId) >= order(b.chapterId))))
     throw new ToolFailure('invalid_options', '方案的迹象必须安排在实际登场之前。');
-  const minimum =
-    /(?:跟|与|和|至少)\s*([\d一二三四五六七八九十两]+)\s*(?:个|位)\s*(?:以上)?[^，。；\n]{0,12}(?:主体|人物|角色)/u.exec(
-      author.normalize('NFKC'),
-    )?.[1];
-  const requested = minimum ? chapterOrder(`第${minimum}章`) : 0;
-  const actors = plan.assets.filter(
-    (a) => a.kind === 'subject' && a.action === 'create' && a.fields?.kind === 'character',
-  );
-  if (
-    requested > 0 &&
-    /反派|角色|人物/u.test(author) &&
-    !actors.some((a) => (a.relatedSubjectIds?.length ?? 0) >= requested)
-  )
-    throw new ToolFailure('invalid_arguments', `方案的新角色须关联至少 ${requested} 个不同的已有主体。`);
-  if (
-    /反派/u.test(author) &&
-    /中期/u.test(author) &&
-    /后期/u.test(author) &&
-    /迹象|暗线|伏笔|线索/u.test(author)
-  ) {
-    const chapters = documents.filter((d) => d.type === 'chapter');
-    const middle = chapters.filter((chapter) => chapterStage(chapters, chapter.id) === 'setup');
-    const late = chapters.filter((chapter) => chapterStage(chapters, chapter.id) === 'reveal');
-    if (
-      new Set(
-        setups
-          .filter((p) => middle.some((chapter) => chapter.id === p.chapterId))
-          .map((p) => p.chapterId),
-      ).size < 2
-    )
-      throw new ToolFailure('invalid_arguments', '请在至少两个不同的中期章登记 setup 迹象。', {
-        chapterIds: middle.map((chapter) => chapter.id),
-      });
-    if (!reveals.length || reveals.some((p) => !late.some((chapter) => chapter.id === p.chapterId)))
-      throw new ToolFailure('invalid_arguments', '请在后期章登记 reveal，安排反派实际登场。', {
-        chapterIds: late.map((chapter) => chapter.id),
-      });
-    const linked = plan.assets.filter(
-      (a) =>
-        a.kind === 'clue' &&
-        a.action === 'create' &&
-        actors.some((actor) => a.fields?.subjectIds?.includes(actor.id)),
-    );
-    if (!linked.length)
-      throw new ToolFailure('invalid_arguments', '新伏笔的 fields.subjectIds 须包含新反派的 ID。');
-    // A character's entrance may be on a different chapter than the clue's planned payoff.
-    // Chapter-relative disclosure still uses the clue's own anchors, not the passage stage.
-    if (
-      !linked.some((a) =>
-        setups.some(
-          (p) => p.chapterId === a.fields?.setupChapterId && (!p.clueIds || p.clueIds.includes(a.id)),
-        ),
-      )
-    )
-      throw new ToolFailure(
-        'invalid_arguments',
-        '请把新伏笔的 setupChapterId 对应到埋设这条伏笔的 setup 位置；payoffChapterId 只标记计划回收，不必与登场同章。',
-        { setupChapterIds: [...new Set(setups.map((p) => p.chapterId))] },
-      );
-  }
 }
 
 // Restrictions can narrow a displayed plan, never authorize a target that was not shown.

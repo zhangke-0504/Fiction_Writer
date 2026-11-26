@@ -28,6 +28,8 @@ async function chapter(page: Page, title: string) {
 }
 
 test('offline library search, metadata edits, three subject groups, linked clues and chapters', async ({}, info) => {
+  // This hidden-window E2E traverses every editor and a reload; give the scenario its own budget.
+  test.setTimeout(90_000);
   const root = info.outputPath('app');
   const app = await electron.launch({
     args: ['.'],

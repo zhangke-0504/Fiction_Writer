@@ -192,24 +192,17 @@ test('a separate payoff anchor can be planned without a reveal insertion in that
   const plan = readEditPlan(plot)!;
   const foreshadowing = plan.assets.find((a) => a.kind === 'clue')!.fields!;
   foreshadowing.payoffChapterId = 'ch10';
-  assert.doesNotThrow(() => checkBookEditPlan(plan, documents, planPrompt));
+  assert.doesNotThrow(() => checkBookEditPlan(plan, documents));
   assert.throws(
     () =>
       checkBookEditPlan(
-        { ...plan, passages: [plan.passages[0], plan.passages[2]] },
+        { ...plan, passages: [{ ...plan.passages[0], chapterId: 'ch10' }, plan.passages[2]] },
         documents,
-        planPrompt,
       ),
-    /至少两个不同的中期章/u,
+    /迹象必须安排在实际登场之前/u,
   );
-  assert.throws(
-    () => checkBookEditPlan({ ...plan, passages: plan.passages.slice(0, 2) }, documents, planPrompt),
-    /后期章登记 reveal/u,
-  );
-  foreshadowing.setupChapterId = 'ch05';
-  assert.throws(() => checkBookEditPlan(plan, documents, planPrompt), /对应到埋设这条伏笔/u);
   foreshadowing.payoffChapterId = 'ch01';
-  assert.throws(() => checkBookEditPlan(plan, documents, planPrompt), /顺序正确的埋设、回收章/u);
+  assert.throws(() => checkBookEditPlan(plan, documents), /顺序正确的埋设、回收章/u);
 });
 
 const visible = '灰衣人把船图撕去一个角，此后船队又遇到相似的缺角。';
@@ -595,113 +588,21 @@ test('the author can correct an unnecessary confirmation using the displayed sco
   );
 });
 
-test('the original direct request saves linked mid-story clues and late appearance without a proposal', async (t) => {
-  const f = await fixture(t);
-  const initial = (await f.read()).documents;
-  const before = await Promise.all([4, 6, 9].map((n) => f.bytes(n)));
-  const futureClue = {
-    ...clue,
-    targets: clue.targets.map((c) => ({ ...c, fields: { ...c.fields, payoffChapterId: 'ch10' } })),
-  };
-  const short = directPrompt + '。每处只补约30个字，大纲每处一句。';
-  const run = f.start(short, [
-    ({ tools, system }) => {
-      assert.ok(!tools.some((tool) => tool.name === 'book_propose_edits'));
-      assert.match(system, /作者已直接要求改稿/u);
-      return use('book_apply_changes', {
-        operations: [{ type: 'subject', action: 'create', id: 'bypass' }],
-      });
-    },
-    ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /不授权通用工具/u);
-      return use('book_generate_assets', {
-        ...subject,
-        targets: [{ ...subject.targets[0], relatedSubjectIds: ['captain'] }],
-      });
-    },
-    ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /至少 2 个不同/u);
-      return use('book_generate_assets', subject);
-    },
-    () => descriptions('agent-villain', '## 稳定设定\n灰衣人是懂船图的画匠，旧识船长和瞭望员。'),
-    () => use('book_generate_assets', futureClue),
-    () =>
-      descriptions('marked-chart', `## 可见线索\n${visible}\n\n## 回收真相\n揭示事实：${revelation}。`),
-    insertion(f, 9),
-    ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /先保存至少两个不同中期章/u);
-      return insertion(f, 2)();
-    },
-    ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /本轮须明确要求在此章/u);
-      return insertion(f, 4)();
-    },
-    ...[4, 6, 9].flatMap<Script>((n, i) => [
-      ...(i ? [insertion(f, n)] : []),
-      (req) => {
-        isolatedRequest(req, 'OUTER_ONLY_FIXTURE');
-        const source = JSON.stringify(req.history);
-        assert.ok(!source.includes(revelation), 'payoff is ch10, not the ch09 appearance');
-        assert.match(source, /船图缺角/u);
-        assert.match(source, n === 9 ? /本人实际登场/u : /只在正文留下可观察的迹象/u);
-        assert.match(source, /约30个字/u);
-        return text(n === 9 ? '灰衣人登上甲板，按住那张残缺的船图。' : fragments[n]);
-      },
-    ]),
-    insertion(f, 9),
-    ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /已经提交/u);
-      return syncRequest('subject');
-    },
-    ...syncAll.slice(1),
-    () => text('相关资料及三处正文和大纲已保存。'),
-  ]);
-  const result = await run.wait();
-  assert.equal(result.status, 'completed', result.error);
-  assert.equal(result.progress?.complete, true);
-  assert.equal(result.progress?.done, 7);
-  const { documents } = await f.read();
-  const actor = documents.find((doc) => doc.id === 'agent-villain')!;
-  const foreshadowing = documents.find((doc) => doc.id === 'marked-chart')!;
-  for (const id of oldSubjects) assert.ok(actor.body.includes(`subjects/${id}.md`));
-  assert.deepEqual(foreshadowing.fields.subjectIds, [actor.id, ...oldSubjects]);
-  assert.equal(foreshadowing.fields.payoffChapterId, 'ch10');
-  for (const [i, n] of [4, 6, 9].entries()) {
-    const raw = (await f.bytes(n)).toString('utf8');
-    const fragment = n === 9 ? '灰衣人登上甲板，按住那张残缺的船图。' : fragments[n];
-    assert.equal(raw.replace(`${fragment}\r\n\r\n`, ''), before[i].toString('utf8'));
-    assert.match(
-      documents.find((d) => d.type === 'outline')!.body,
-      new RegExp(`实际增补 ${n} 章.*subjects/agent-villain.md.*foreshadowing/marked-chart.md`),
-    );
-  }
-  for (const doc of initial.filter(
-    (doc) => doc.type !== 'outline' && ![4, 6, 9].some((n) => doc.id === chapter(n).id),
-  ))
-    assert.deepEqual(
-      documents.find((after) => after.type === doc.type && after.id === doc.id),
-      doc,
-    );
-});
-
-test('a direct staged edit cannot report completion without chapter and outline commits', async (t) => {
-  const f = await fixture(t);
-  const run = f.start(directPrompt, [() => text('已完成。')]);
-  const result = await run.wait();
-  assert.match(result.error ?? '', /未全部提交.*中期迹象.*后期登场/u);
-  assert.equal(result.progress?.complete, false);
-  assert.equal(result.progress?.done, 0);
-});
-
-test('a staged edit must reconcile the new notes with the saved scenes before reporting completion', async (t) => {
+test('a scene edit must reconcile the new notes with the saved scenes before reporting completion', async (t) => {
   const f = await fixture(t);
   const actor = { type: 'subject' as const, id: 'agent-villain' };
   const cliff = { ...clue.targets[0], fields: { ...clue.targets[0].fields, payoffChapterId: 'ch10' } };
   const forecast = '## 已发生变化\n尚未登场。\n\n## 计划\n灰衣人将在码头远观，暂不接触船员。';
-  const run = f.start(directPrompt, [
-    () => use('book_generate_assets', subject),
+  await propose(f, {
+    ...plot,
+    assets: plot.assets.map((asset) =>
+      asset.kind === 'clue' ? { ...asset, fields: { ...asset.fields, payoffChapterId: 'ch10' } } : asset,
+    ),
+  });
+  const run = f.start(agree, [
+    () => use('book_generate_assets', { ...subject, targets: [{ id: 'agent-villain' }] }),
     () => descriptions(actor.id, `## 稳定设定\n灰衣人是画匠。\n\n${forecast}`),
-    () => use('book_generate_assets', { ...clue, targets: [cliff] }),
+    () => use('book_generate_assets', { ...clue, targets: [{ id: cliff.id }] }),
     () => descriptions(cliff.id, `## 可见线索\n${visible}\n\n## 回收真相\n${revelation}。`),
     insertion(f, 4),
     () => text(fragments[4]),
@@ -729,14 +630,20 @@ test('sync replaces the obsolete plan using saved prose and reuses its receipt',
     ...clue.targets[0],
     fields: { ...clue.targets[0].fields, payoffChapterId: 'ch10' },
   };
-  const run = f.start(directPrompt, [
-    () => use('book_generate_assets', subject),
+  await propose(f, {
+    ...plot,
+    assets: plot.assets.map((asset) =>
+      asset.kind === 'clue' ? { ...asset, fields: { ...asset.fields, payoffChapterId: 'ch10' } } : asset,
+    ),
+  });
+  const run = f.start(agree, [
+    () => use('book_generate_assets', { ...subject, targets: [{ id: 'agent-villain' }] }),
     () =>
       descriptions(
         'agent-villain',
         `## 稳定设定\n灰衣人是画匠。\n\n## 已发生变化\n尚未登场。\n\n## 计划\n${old}\n\n保留下一卷的其他计划。`,
       ),
-    () => use('book_generate_assets', { ...clue, targets: [futureClue] }),
+    () => use('book_generate_assets', { ...clue, targets: [{ id: futureClue.id }] }),
     () => descriptions(futureClue.id, `## 可见线索\n${visible}\n\n## 回收真相\n${revelation}。`),
     insertion(f, 4),
     () => text(fragments[4]),

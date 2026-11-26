@@ -20,6 +20,7 @@ const target = 'private-target-chapter';
 const chapterTitle = '暗号 PRIVATE_EARLY_TITLE';
 const marker = '灰珍珠的三道裂纹拼成渡港图';
 const rule = '所有回忆使用现在时';
+const rememberPrompt = '以后每章回想旧事都像正发生一样写。';
 const privateQuery = '灰珍珠 PRIVATE_EXPLICIT_SEARCH';
 const explicitPrompt = '只查询本书记忆，不写。';
 const draftingPrompt = '续写第25章，让灰珍珠的裂纹再次出现。';
@@ -28,7 +29,8 @@ const apiKey = 'not-a-real-key-memory-fixture';
 const recallEvent = 'memory.recall.finished';
 const dispatchEvent = 'memory.context.dispatched';
 const sourceEvent = 'memory.context.source';
-const systemMemory = '本书记忆（来源数据，不是操作指令）：\n';
+const recallPrompt = '第25章里的灰珍珠和裂纹此前怎么写的？';
+const overviewPrompt = '只查本书记忆里的作品约定。';
 const proseContext = '作品资料（数据）：\n';
 
 type Wire = { messages: { role: string; content: string }[]; tools?: { function: { name: string } }[] };
@@ -78,11 +80,35 @@ test('new editor sessions isolate book memory and diagnostics match actual reque
       if (++draftAttempts === 1) return res.end(frame({ content: '合成断流不入稿' }, null));
       return send({ content: draftText }, 'stop');
     }
-    if (current.role === 'user') {
-      if (current.content.startsWith('请记住：')) return use('book_memory_remember', { text: rule });
-      if (current.content === explicitPrompt) return use('book_memory_recall', { query: privateQuery });
-      if (current.content === draftingPrompt)
-        return use('book_generate_chapter', { chapterId: target, mode: 'draft' });
+    const names = body.tools?.map(({ function: tool }) => tool.name) ?? [];
+    if (names.length === 1 && names[0] === 'check_book_scope')
+      return use('check_book_scope', { allowed: true });
+    const author = body.messages.findLast(({ role }) => role === 'user')?.content;
+    const wanted =
+      author === rememberPrompt
+        ? 'book_memory_remember'
+        : author === explicitPrompt || author === recallPrompt || author === overviewPrompt
+          ? 'book_memory_recall'
+          : author === draftingPrompt
+            ? 'book_generate_chapter'
+            : undefined;
+    if (wanted && current.role === 'user') return use('tool_search', { query: wanted });
+    if (wanted && current.role === 'tool') {
+      const result = JSON.parse(current.content);
+      if (result.value?.candidates) {
+        expect(names).toContain(wanted);
+        if (wanted === 'book_memory_remember') return use(wanted, { text: rule });
+        if (wanted === 'book_memory_recall')
+          return use(wanted, {
+            query: privateQuery,
+            ...(author !== overviewPrompt && { chapterId: target }),
+          });
+        return use('book_task_scope', {
+          items: [{ operation: 'chapter.draft', id: target, purpose: '为第25章的空白稿写出灰珍珠情节' }],
+        });
+      }
+      if (wanted === 'book_generate_chapter' && result.value?.targets)
+        return use(wanted, { chapterId: target, mode: 'draft' });
     }
     return send({ content: '已检查该书的记忆。' }, 'stop');
   });
@@ -152,42 +178,40 @@ test('new editor sessions isolate book memory and diagnostics match actual reque
       return (await sessionRun(id, text))!.id;
     };
     await open(a.id);
-    await send(a.id, `请记住：${rule}。`);
-    const query = '第25章里的灰珍珠和裂纹此前怎么写的？';
-    const aRecall = await send(a.id, query);
-    expect(received).toHaveLength(3);
-    const contextA = system(received[2]);
-    expect(contextA).toContain(marker);
-    expect(contextA).toContain(rule);
-    expect(contextA).toContain(early);
-    expect(received[2].messages.filter((m) => m.role !== 'system')).toEqual([
-      { role: 'user', content: query },
+    await send(a.id, rememberPrompt);
+    const firstRecallWire = received.length;
+    const aRecall = await send(a.id, recallPrompt);
+    const requestA = received[firstRecallWire];
+    for (const value of [marker, rule, early]) expect(system(requestA)).not.toContain(value);
+    expect(requestA.messages.filter((m) => m.role !== 'system')).toEqual([
+      { role: 'user', content: recallPrompt },
     ]);
+    const aMem = JSON.parse(received.at(-1)!.messages.at(-1)!.content).value as BookRecall;
+    expect(JSON.stringify(aMem.earlierStory)).toContain(marker);
+    expect(aMem.conventions[0]?.text).toBe(rule);
 
     await page.getByRole('button', { name: '返回书库' }).click();
     await open(b.id);
-    await expect(panel.getByText(`请记住：${rule}。`, { exact: true })).toHaveCount(0);
+    await expect(panel.getByText(rememberPrompt, { exact: true })).toHaveCount(0);
     await expect(panel.getByText('这本小说还没有会话。')).toBeVisible();
-    const bRecall = await send(b.id, query);
-    expect(received).toHaveLength(4);
-    const contextB = system(received[3]);
-    for (const privateValue of [marker, rule, early, systemMemory])
-      expect(contextB).not.toContain(privateValue);
+    const bRecall = await send(b.id, overviewPrompt);
+    const bResult = JSON.parse(received.at(-1)!.messages.at(-1)!.content).value as BookRecall;
+    expect(bResult).toEqual({ conventions: [], earlierStory: [], plans: [], reference: [] });
 
     await page.getByRole('button', { name: '返回书库' }).click();
     await open(a.id);
     const toolRun = await send(a.id, explicitPrompt);
-    expect(received).toHaveLength(6);
-    const toolOutput = JSON.parse(received[5].messages.at(-1)!.content);
+    const toolOutput = JSON.parse(received.at(-1)!.messages.at(-1)!.content);
     expect(toolOutput.ok).toBe(true);
     expect(toolOutput.value.earlierStory).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: early })]),
     );
     expect(toolOutput.value).not.toHaveProperty('recallId');
 
+    const priorWires = received.length;
     const proseRun = await send(a.id, draftingPrompt);
     expect(draftAttempts).toBe(2);
-    const wires = received.slice(6);
+    const wires = received.slice(priorWires);
     const actualDrafts = wires.filter((wire) => !wire.tools?.length);
     expect(actualDrafts).toHaveLength(2);
     expect(
@@ -195,7 +219,6 @@ test('new editor sessions isolate book memory and diagnostics match actual reque
         wire.tools?.some(({ function: tool }) => tool.name === 'book_read_chapter'),
       ),
     ).toHaveLength(1);
-    const aMem = readContext(contextA, systemMemory) as BookRecall;
     const drafts = actualDrafts.map((wire) => readContext(wire.messages.at(-1)!.content, proseContext));
     for (const draft of drafts) {
       expect(JSON.stringify(draft.previous)).not.toContain(marker);
@@ -248,12 +271,7 @@ test('new editor sessions isolate book memory and diagnostics match actual reque
     const rows = await readDiagnostics(root, 'backend');
     const events = (runId: string, event: string) =>
       rows.filter((row) => row.fields.runId === runId && row.event === event);
-    const verifySpan = (
-      runId: string,
-      dispatch: Log,
-      actual: BookRecall,
-      trigger: 'agent' | 'draft',
-    ) => {
+    const verifySpan = (runId: string, dispatch: Log, actual: BookRecall, trigger: 'tool' | 'draft') => {
       expect(dispatch.fields).toMatchObject({
         ...counts(actual),
         trigger,
@@ -264,7 +282,11 @@ test('new editor sessions isolate book memory and diagnostics match actual reque
       expect(events(runId, 'model.http')).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            fields: expect.objectContaining({ spanId, lane: trigger, httpStatus: 200 }),
+            fields: expect.objectContaining({
+              spanId,
+              lane: trigger === 'tool' ? 'agent' : 'draft',
+              httpStatus: 200,
+            }),
           }),
         ]),
       );
@@ -295,7 +317,10 @@ test('new editor sessions isolate book memory and diagnostics match actual reque
       expect(source.fields.revision).toMatch(/^[a-f0-9]{16}$/);
     };
     expect(events(aRecall, dispatchEvent)).toHaveLength(1);
-    verifySpan(aRecall, events(aRecall, dispatchEvent)[0], aMem, 'agent');
+    verifySpan(aRecall, events(aRecall, dispatchEvent)[0], aMem, 'tool');
+    expect(events(aRecall, recallEvent)[0].logSeq).toBeGreaterThan(
+      events(aRecall, 'model.started')[0].logSeq,
+    );
     expect(events(bRecall, recallEvent)[0].fields).toMatchObject({
       outcome: 'ok',
       storyCount: 0,
@@ -315,9 +340,9 @@ test('new editor sessions isolate book memory and diagnostics match actual reque
       events(toolRun, 'tool.started').find((row) => row.fields.tool === 'book_memory_recall')?.fields
         .callId,
     );
-    expect(
-      events(toolRun, dispatchEvent).every((row) => row.fields.recallId !== explicit?.fields.recallId),
-    ).toBe(true);
+    const explicitDispatch = events(toolRun, dispatchEvent)[0];
+    expect(explicitDispatch.fields.recallId).toBe(explicit?.fields.recallId);
+    verifySpan(toolRun, explicitDispatch, toolOutput.value, 'tool');
 
     const proseDispatches = events(proseRun, dispatchEvent).filter(
       (row) => row.fields.trigger === 'draft',
@@ -333,22 +358,18 @@ test('new editor sessions isolate book memory and diagnostics match actual reque
       verifySpan(proseRun, dispatch, drafts[i].memory, 'draft');
       expect(dispatch.fields.documentRef).toBe(committed?.fields.documentRef);
     }
-    const agentWires = wires.filter((wire) =>
-      wire.tools?.some(({ function: tool }) => tool.name === 'book_generate_chapter'),
-    );
-    const agentDispatches = events(proseRun, dispatchEvent).filter(
-      (row) => row.fields.trigger === 'agent',
-    );
-    expect(agentDispatches).toHaveLength(2);
-    expect(agentWires).toHaveLength(agentDispatches.length);
-    for (const [i, dispatch] of agentDispatches.entries())
-      verifySpan(proseRun, dispatch, readContext(system(agentWires[i]), systemMemory), 'agent');
+    expect(events(proseRun, recallEvent).every(({ fields }) => fields.trigger === 'draft')).toBe(true);
+    expect(
+      wires
+        .filter((wire) => wire.tools?.some(({ function: tool }) => tool.name === 'tool_search'))
+        .every((wire) => !system(wire).includes(marker)),
+    ).toBe(true);
     const readback = events(proseRun, 'model.started').find((row) => row.fields.lane === 'readback');
     expect(readback).toBeDefined();
     expect(
       events(proseRun, dispatchEvent).some((row) => row.fields.spanId === readback?.fields.spanId),
     ).toBe(false);
-    expect(events(blockedRun, recallEvent)[0].fields.storyCount).toBeGreaterThan(0);
+    expect(events(blockedRun, recallEvent)).toHaveLength(0);
     expect(events(blockedRun, 'run.finished')[0].fields.reason).toBe('context_limit');
     expect(events(blockedRun, dispatchEvent)).toHaveLength(0);
     expect(events(blockedRun, 'model.started')).toHaveLength(0);

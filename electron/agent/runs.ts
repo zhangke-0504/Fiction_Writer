@@ -53,10 +53,13 @@ export interface RunContext {
   uncertainStop?: (reason: string) => void;
   preview: (value?: ChapterPreview) => void;
   progress: (value: WorkProgress) => void;
+  taskOutcome?: (value: NonNullable<RunInfo['taskOutcome']>) => void;
   authorLine?: number;
   narrowedWriting?: boolean;
   history?: SessionHistory;
   recordTool?: (receipt: ToolReceipt) => Promise<void>;
+  /** Observe a complete tool result only if it is actually sent to the model. */
+  onToolResultDispatch?: (observe: (report: ReportDiagnostic) => void) => void;
   continuation?: NovelContinuation;
   bookEdit?: BookEdit;
   stageEditProposal?: (value: EditPlan, basis: EditBasis) => void;
@@ -372,6 +375,10 @@ export class RunManager {
               this.changed(id);
             }
           },
+          taskOutcome: (value) => {
+            run.taskOutcome = value;
+            this.changed(id);
+          },
           progress: (value) => {
             run.progress = value;
             this.changed(id);
@@ -395,6 +402,8 @@ export class RunManager {
           run.status = 'failed';
           run.error = uncertain;
         }
+        if (run.taskOutcome && (run.status === 'cancelled' || run.status === 'interrupted'))
+          run.taskOutcome = run.status;
         run.preview = undefined;
         view.streaming = '';
         try {

@@ -227,3 +227,56 @@ test('a cancelled command records the observed stop, not just the abort request'
   assert.equal(trace.rows.at(-1)?.fields.termination, 'confirmed');
   assert.equal(trace.rows.at(-1)?.fields.outcome, 'cancelled');
 });
+
+test('tool discovery exposes only session tools on the next dispatched turn', async (t) => {
+  const { workspace, runs, dir, state } = await fixture(t);
+  const session = await runs.create({ cwd: dir });
+  const output = join(dir, 'catalog.txt');
+  const trace = collectDiagnostics();
+  const provider = new ScriptedProvider([
+    ({ tools }) => {
+      assert.deepEqual(
+        tools.map(({ name }) => name),
+        ['tool_search'],
+      );
+      return assistant('', [
+        ['tool_search', { query: 'book_patch_chapter' }],
+        ['tool_search', { query: 'write_file' }],
+        ['write_file', { path: 'catalog.txt', content: 'too early' }],
+      ]);
+    },
+    async ({ history, tools }) => {
+      assert.deepEqual(
+        tools.map(({ name }) => name),
+        ['tool_search', 'write_file'],
+      );
+      assert.ok(tools[1].schema.properties);
+      const results = history.filter((row) => row.role === 'tool');
+      assert.deepEqual(results[0]?.result.value, { candidates: [] });
+      assert.equal(results[2]?.result.ok, false);
+      await assert.rejects(access(output));
+      return assistant('', [['write_file', { path: 'catalog.txt', content: 'discovered' }]]);
+    },
+    ({ tools, history }) => {
+      assert.equal(tools.at(-1)?.name, 'write_file');
+      assert.ok(history.at(-1)?.role === 'tool');
+      return assistant('已保存');
+    },
+  ]);
+  runs.start(
+    session.id,
+    '写一个文件',
+    (ctx) =>
+      runAgent(ctx, provider, '', [], '写一个文件', new FileTools(workspace, state).tools(), 12, {}),
+    'default',
+    trace.report,
+  );
+  await runs.wait(session.id);
+  assert.equal(runs.get(session.id).run?.status, 'completed', runs.get(session.id).run?.error);
+  assert.equal(await readFile(output, 'utf8'), 'discovered');
+  assert.deepEqual(trace.rejected, []);
+  assert.deepEqual(
+    trace.rows.filter((row) => row.event === 'tool.discovery').map((row) => row.fields.count),
+    [0, 1],
+  );
+});

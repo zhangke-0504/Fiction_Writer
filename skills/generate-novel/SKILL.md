@@ -9,7 +9,7 @@ description: 按作者意图创作或补完整本小说，包括大纲、主体�
 
 ## 按现稿决定下一步
 
-- 用 `book_get_context` 查看当前作品，不用通用文件工具。沿用已有章节 ID，为缺少的章选短且稳定的 ID。首次写入前用 `novelGoal: { action: "register", chapterIds: [...] }` 一次登记完整有序目标，不按章反复登记；已确定必须交付的主体／伏笔可通过 `assetRefs: [{ type, id }]` 登记，后来发现的新项可按同一章范围增补。接续用 `novelGoal: { action: "resume" }` 读取现稿进度和原要求；仅当作者明确改变创作方向才设 `updateDirection: true`。
+- 用 `book_get_context` 查看当前作品，不用通用文件工具。沿用已有章节 ID，为缺少的章选短且稳定的 ID。首次写入前，用 `book_task_scope` 登记 `novel.register`（作品 ID、完整章数 `count` 和简短 `purpose`），再通过 `book_get_context` 的 `novelGoal: { action: "register", chapterIds: [...] }` 激活完整有序目标（含已有稿章节），不按章反复登记；已确定必须交付的主体／伏笔可通过 `assetRefs: [{ type, id }]` 登记，后来发现的新项可按同一章范围增补。同书同会话有已保存的未完成目标时，先登记 `novel.resume`，再用 `novelGoal: { action: "resume" }` 核对现稿进度和原要求；仅当作者明确改变创作方向才设 `updateDirection: true`。若此前从未登记而作者明确续写，核对原要求、完整章数和现稿，走 `novel.register`，优先用 `sourceQuote` 引用原作者要求以保留方向。收到 `novel_goal_required` 时照反馈登记或续接，不改用普通单章绕过。
 - 用 `book_apply_changes` 为缺项提交大纲和目录，大纲写全书脉络和每章关键情节，尽量按 `<!-- chapter:稳定章节ID -->` 或绑定到章的 `<!-- beat:稳定情节点ID -->` 分段。保持工具参数简短；修改已有资料先读全所需各页，`index` 只用来查校验器认可的 ID。
 - 主体和伏笔需要说明时调用 `book_generate_assets`：按类别分小批（通常 2–4 项；长设定再少一点），`create` 传新 ID 和字段，`fill` 仅补空白／占位；不要用 `book_apply_changes` 建空卡或填说明。主体只写对本书有用的人物、物品、场景，说明稳定设定和有依据的状态，不堆长篇背景。伏笔只写剧情要用的线索，使用已存在的 `setupChapterId`、`payoffChapterId` 和关联主体 `subjectIds`，分清可见线索和回收真相。保留已有非空说明与有效关联。提交成功且未被更改的资料不必再全量读取。引用错误就查目标索引；资产触限只缩小未提交的批次，不重放相同批次。
 - 对每个当前空白目标章，用 `book_generate_chapter` 的 `draft`，从现稿指定本章任务、参与的 `subjectIds` 和需埋设／推进／回收的 `clueIds`；`direction` 只给简明的情节安排，不复述稿件、不提前写后章真相。没有作者篇幅要求时约 1200–1800 汉字。遇到已有后接正文时先读该章开场，只把需保持的条件与短原文位置放在 `nextBoundary`。已有非空章直接复用。资料已就绪时直接写，不额外预检。若阻塞，按 `issues` 的真实类别与版本定向处理：仅空说明用 fill，已有说明查适用原文或调整合法安排，锚点错误查具体章／索引。条件没变化时不反复重放、不扫整书、不绕开写章工具；断流、触限或版本冲突终止时保留进度、不跳章。

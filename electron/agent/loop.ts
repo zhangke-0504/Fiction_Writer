@@ -11,10 +11,10 @@ import {
 } from '@earendil-works/pi-ai';
 import type { AssistantTurn, ModelProvider, ModelRequest, ToolSpec, Turn } from './model.js';
 import { MalformedMessagesArguments, MessagesOutputLimit } from './provider.js';
-import type { ReportMemoryDispatch } from './book-memory.js';
 import type { RunContext } from './runs.js';
 import type { ToolResult } from '../../shared/contracts.js';
 import { ActiveContext } from './active-context.js';
+import { discoverTools } from './tool-discovery.js';
 import {
   contextOverflow,
   inputEstimate,
@@ -91,8 +91,10 @@ interface Candidate {
   context: ReportDiagnostic;
   fieldCount?: number;
   parseFailure?: string;
+  notDispatched?: boolean;
   rejected?: boolean;
   executed?: boolean;
+  observeDispatch?: (report: ReportDiagnostic) => void;
 }
 interface Round {
   number: number;
@@ -132,6 +134,7 @@ export interface NarrowedWritingStep {
   readonly canAdvance: boolean;
   readonly status: string;
   readonly instructions: string;
+  readonly toolNames?: readonly string[];
   accepts(name: string, args: Record<string, unknown>): boolean;
 }
 interface AgentBudget {
@@ -149,12 +152,15 @@ export async function runAgent(
   prompt: string,
   tools: LocalTool[],
   budget: number | AgentBudget = defaultRoundLimit,
-  reportAttachedMemory?: ReportMemoryDispatch,
+  discovery?: { bootstrap?: string[] },
 ) {
+  const catalog = discovery && discoverTools(tools, discovery.bootstrap);
+  const registry = catalog?.registry ?? tools;
+  const initialTools = catalog?.visible() ?? tools;
   const trace = diagnosticScope(safeReporter(ctx.diagnostic ?? noDiagnostic), { lane: 'agent' });
   const purpose = () => (typeof budget === 'number' ? undefined : budget.budgetPurpose());
   const { inputTokens, capabilities } = planModelBudget(provider, purpose());
-  const spare = inputTokens - inputEstimate(system, [{ role: 'user', text: prompt }], tools);
+  const spare = inputTokens - inputEstimate(system, [{ role: 'user', text: prompt }], initialTools);
   if (spare < 0) throw contextOverflow();
   const session = await prepareSessionHistory(
     ctx.history,
@@ -168,7 +174,7 @@ export async function runAgent(
     session.prelude,
     [...previous, ...session.turns],
     prompt,
-    tools,
+    initialTools,
     provider.textHistoryInPrompt,
   );
   let history: Turn[] = [];
@@ -176,7 +182,7 @@ export async function runAgent(
   let receiptFailure = false;
   let projectionFailure: DiagnosticFailure | undefined;
   let previousCompaction = 0;
-  const registered = new Map(tools.map((tool) => [tool.name, tool]));
+  const registered = new Map(registry.map((tool) => [tool.name, tool]));
   const outbound: { id: string; candidate: Candidate; result: ToolResult; tool?: LocalTool }[] = [];
   let narrowed = false;
   let recoveryOrigin: string | undefined;
@@ -222,7 +228,7 @@ export async function runAgent(
     });
     active = undefined;
   };
-  const wrapped: AgentTool[] = tools.map((tool) => ({
+  const wrapped: AgentTool[] = registry.map((tool) => ({
     name: tool.name,
     label: tool.name,
     description: tool.description,
@@ -251,6 +257,9 @@ export async function runAgent(
         const value = await tool.execute(params as Record<string, unknown>, {
           ...ctx,
           narrowedWriting: narrowed,
+          onToolResultDispatch(observe) {
+            if (call) call.observeDispatch = observe;
+          },
           progress(value) {
             context.setProgress(value);
             ctx.progress(value);
@@ -378,11 +387,23 @@ export async function runAgent(
             : undefined;
         const budgetPurpose = pendingWholeSkill ? 'long-writing' : activePurpose;
         const planned = planModelBudget(provider, budgetPurpose);
+        const visibleTools = catalog?.visible() ?? tools;
+        let dispatchedTools = visibleTools;
         const fit = (step?: NarrowedWritingStep) => {
+          // A verified step may need an existing schema the Agent has not discovered yet.
+          if (step?.toolNames) {
+            const visible = new Set(visibleTools.map(({ name }) => name));
+            const needed = new Set(step.toolNames);
+            dispatchedTools = [
+              ...visibleTools,
+              ...tools.filter(({ name }) => needed.has(name) && !visible.has(name)),
+            ];
+          }
           const wire = context.fit(
             planned.inputTokens,
             pendingWholeSkill,
             step && narrowNotice(step, planned.maxTokens),
+            dispatchedTools,
           );
           history = wire.history;
           const stats = context.stats;
@@ -410,7 +431,7 @@ export async function runAgent(
           });
           return provider.turn({
             ...wire,
-            tools,
+            tools: dispatchedTools,
             budgetPurpose,
             budgetBasis: pendingWholeSkill
               ? 'first-whole-skill'
@@ -424,15 +445,18 @@ export async function runAgent(
             onDispatch(nextSpanId) {
               if (round.narrowStep) round.narrowSpanId = nextSpanId;
               if (replan) recovery(requestTrace, 'dispatched', 'output_limit', spanId, nextSpanId);
-              // The base system block is intact in the fitted wire projection.
-              reportAttachedMemory?.(diagnosticScope(requestTrace, { spanId: nextSpanId }));
               // Dispatch metadata and business receipts for already executed tools stay unique.
-              for (const { candidate, result, tool } of outbound.splice(0)) {
+              for (const { id, candidate, result, tool } of outbound.splice(0)) {
                 candidate.report('tool.result_sent', { spanId: nextSpanId, nextTurn: number });
-                tool?.onResultSent?.(
-                  result,
-                  diagnosticScope(candidate.context, { spanId: nextSpanId, turn: number }),
-                );
+                const sent = diagnosticScope(candidate.context, { spanId: nextSpanId, turn: number });
+                tool?.onResultSent?.(result, sent);
+                if (
+                  result.ok &&
+                  wire.history.some(
+                    (row) => row.role === 'tool' && row.id === id && row.result === result,
+                  )
+                )
+                  candidate.observeDispatch?.(sent);
               }
             },
           });
@@ -521,6 +545,7 @@ export async function runAgent(
           }
         }
         ctx.signal.throwIfAborted();
+        const dispatchedNames = new Set(dispatchedTools.map(({ name }) => name));
         const step = round.narrowStep;
         if (step) {
           const call = answer.calls[0];
@@ -584,8 +609,10 @@ export async function runAgent(
                 : undefined,
           });
           if (badBatch) reject(candidate, 'invalid_call');
-          else if (!tool) reject(candidate, 'unknown_tool');
-          else if (candidate.parseFailure) reject(candidate, candidate.parseFailure);
+          else if (!tool || !dispatchedNames.has(call.name)) {
+            candidate.notDispatched = true;
+            reject(candidate, 'unknown_tool');
+          } else if (candidate.parseFailure) reject(candidate, candidate.parseFailure);
           round.candidates.set(call.id, candidate);
           if (!badBatch)
             base.content.push({ type: 'toolCall', id: call.id, name: call.name, arguments: args });
@@ -620,6 +647,8 @@ export async function runAgent(
         async beforeToolCall({ toolCall }) {
           if (receiptFailure) return { block: true, reason: '回执未保存；本轮不再执行工具' };
           const candidate = active?.candidates.get(toolCall.id);
+          if (candidate?.notDispatched)
+            return { block: true, reason: '此能力未在本轮模型请求中出现，请先检索可用工具' };
           if (candidate?.parseFailure) return { block: true, reason: '工具参数不是完整的 JSON 对象' };
           if (!ctx.signal.aborted)
             candidate?.report('tool.validated', { fieldCount: candidate.fieldCount });
@@ -664,7 +693,9 @@ export async function runAgent(
             active?.narrowStep &&
             toolResults.length &&
             !active.receipts.some(
-              (r) => r.outcome === 'ok' && (r.commitCount > 0 || r.tool === 'book_get_context'),
+              (r) =>
+                r.outcome === 'ok' &&
+                (r.commitCount > 0 || r.tool === 'book_get_context' || r.tool === 'book_task_scope'),
             )
           ) {
             recovery(

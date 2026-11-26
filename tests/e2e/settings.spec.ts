@@ -91,7 +91,11 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
     await expect(page.getByText('额度未识别，使用通用兜底值')).toBeVisible();
     expect(a.providerId).toBe('custom');
     expect(b.providerId).toBe('deepseek');
-    expect(b.capabilities).toMatchObject({ contextWindow: 64_000, maxOutputTokens: 8_192, source: 'generic-fallback' });
+    expect(b.capabilities).toMatchObject({
+      contextWindow: 64_000,
+      maxOutputTokens: 8_192,
+      source: 'generic-fallback',
+    });
     expect(requests).toHaveLength(0);
     expect(JSON.stringify(profiles)).not.toContain(key);
     expect(await readFile(join(root, 'state', 'profiles.json'), 'utf8')).not.toContain(key);
@@ -145,10 +149,14 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
     expect(requests[0].url).toBe('/one/v1/chat/completions');
     expect(
       requests[0].body.tools.map((tool: { function: { name: string } }) => tool.function.name),
-    ).toContain('read_file');
+    ).toContain('tool_search');
+    expect(JSON.stringify(requests[0].body.tools)).not.toContain('read_file');
     expect(JSON.stringify(requests[0].body.tools)).toMatch(/skill_search|skill_load|book_get_context/);
     await expect(panel.getByLabel('写作动作')).toHaveCount(0);
-    expect(JSON.stringify(requests[0].body)).toContain('最初版本');
+    expect(
+      requests[0].body.messages.find((message: { role: string }) => message.role === 'system')?.content,
+    ).toContain('最初版本');
+    expect(requests[0].body.messages.at(-1).content).toBe('使用我的参考文件');
     expect(requests[0].body.reasoning_effort).toBeUndefined();
     await expect(panel.getByText(/使用模型默认思考设置/)).toBeVisible();
     await panel.getByLabel('给 Agent 的消息').fill('下一轮');
@@ -203,7 +211,7 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
     expect(JSON.stringify(reopenedProfiles)).not.toContain(key);
     for (const book of [first, second]) {
       const memory = join(root, 'library', book.id, '.fiction-writer', 'memory.json');
-      expect(await readFile(memory, 'utf8')).not.toContain(key);
+      await expect(readFile(memory, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' }); // No memory tool was called.
     }
   } finally {
     release();

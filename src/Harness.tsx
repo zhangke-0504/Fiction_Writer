@@ -286,7 +286,9 @@ export function Harness({
             )}
             {current.run && (
               <p className={`run-status ${running ? 'running' : ''}`} role="status">
-                {statuses[current.run.status]}
+                {current.run.status === 'completed' && current.run.taskOutcome
+                  ? '本轮运行已结束'
+                  : statuses[current.run.status]}
                 {current.run.effort === 'default' ? ' · 使用模型默认思考设置' : ''}
                 {current.run.error ? `：${current.run.error}` : ''}
               </p>

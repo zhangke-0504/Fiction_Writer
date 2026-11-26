@@ -130,11 +130,11 @@ README SHALL 写明实际日志目录的来源、Windows 默认路径、两种�
 - **THEN** 可用界面的编号和 README 的 Windows 路径与命令，在本地两份日文件查找相关记录，不需要本地或远端日志平台
 
 ### Requirement: Book memory recall and index outcomes are traceable
-后台 SHALL 为 Agent 自动召回、正文自动召回和显式 `book_memory_recall` 写入可区分来源的诊断终态，关联同一运行、已绑定作品和本次召回；显式工具另可关联调用。成功时 SHALL 记录已存正文证据、计划、参考资料及作者约定各自的条数，区分空结果、失败和取消。处理索引时 SHALL 区分复用、首次建立、实际持久化刷新和内存降级；读异常、格式无效和写失败 SHALL 可区分。诊断本身不得改变召回结果、写章或作者约定的提交行为。
+后台 SHALL 为 写章工具按明确目标章取材和主 Agent 显式调用的 `book_memory_recall` 写入可区分来源的诊断终态，关联同一运行、已绑定作品和本次召回；显式工具另可关联调用。成功时 SHALL 记录已存正文证据、计划、参考资料及作者约定各自的条数，区分空结果、失败和取消。处理索引时 SHALL 区分复用、首次建立、实际持久化刷新和内存降级；读异常、格式无效和写失败 SHALL 可区分。诊断本身不得改变召回结果、写章或作者约定的提交行为。
 
 #### Scenario: Distinguish an empty recall from an unavailable recall
-- **WHEN** 两次有效召回分别有命中和无匹配，另有一次失败或取消；入口覆盖 Agent、写章与显式回忆工具
-- **THEN** 日志明确关联每个来源及结果，成功空结果的证据和约定计数均为零，失败或取消不记为成功空结果；显式工具可以按调用 ID 对照
+- **WHEN** 两次有效召回分别有命中和无匹配，另有一次失败或取消；入口覆盖写章取材与显式回忆工具
+- **THEN** 日志明确关联每个来源及结果，成功空结果的证据和约定计数均为零，失败或取消不记为成功空结果；显式工具可以按调用 ID 对照；未调用工具、未写章的首轮不产生预先召回终态
 
 #### Scenario: Observe lazy refresh only after a successful sidecar write
 - **WHEN** 首次召回建立索引，随后又在现稿未变、外部编辑以及删除来源后分别召回
@@ -145,14 +145,14 @@ README SHALL 写明实际日志目录的来源、Windows 默认路径、两种�
 - **THEN** 日志分别显示读取、格式或写入降级，仍可报告从现稿召回的正确计数；不记录成刷新成功、不阻止读取或正常写章，也不把显式约定保存失败记成成功
 
 ### Requirement: Dispatched model context identifies the book memory it carried
-后台 SHALL 仅在含有非空自动召回内容的模型请求实际交给传输层后记录该次携带事实，区分 Agent 请求与正文生成请求。事件 SHALL 关联召回与本次模型 `spanId`，有界地记录发送的类别计数、唯一来源的安全文档及修订指纹、已知的来源章序。诊断 MUST NOT 将计划、命中、开始构建请求或实际派发当作模型采用。新增事件 SHALL 沿用仅本地、worker 白名单、非阻塞写入和原有留存规则。README SHALL 说明如何按 `runId`、`recallId`、`spanId` 核对这些证据及其边界。
+后台 SHALL 仅在携带非空召回结果的模型请求实际交给传输层后记录该次携带事实，区分 Agent 已调用工具后携带的工具结果与正文生成请求按明确目标章携带的取材。显式调用可复用工具结果派发与召回诊断的调用关联，不需要另建首轮自动召回事迹。事件 SHALL 关联召回与本次模型 `spanId`，有界地记录发送的类别计数、唯一来源的安全文档及修订指纹、已知的来源章序。诊断 MUST NOT 将计划、命中、开始构建请求或实际派发当作模型采用。新增事件 SHALL 沿用仅本地、worker 白名单、非阻塞写入和原有留存规则。README SHALL 说明如何按 `runId`、`recallId`、`spanId` 核对这些证据及其边界。
 
 #### Scenario: Correlate early chapter evidence with the actual prose request
-- **WHEN** 受控测试让第 25 章的新会话在 Agent 和独立正文请求中分别带入第 2 章的有效证据
+- **WHEN** 受控测试让第 25 章的新会话经显式记忆工具取得第 2 章证据并交给后续 Agent 请求，独立正文请求按目标章取材时也实际携带该证据
 - **THEN** 本地日志能按来源和模型 `spanId` 区分两个请求，列出的来源指纹、章序、类别和计数与请求实际携带的证据一致，独立书籍的来源不得混入
 
 #### Scenario: Empty recall or no dispatch does not imply model context
-- **WHEN** 自动召回为空，或有命中但随后因预算、取消等原因未发起相应模型请求
+- **WHEN** 召回为空，或有命中但因预算、取消等原因未将结果发送给模型
 - **THEN** 可以看到召回的真实终态；没有对应的记忆携带事件，也不在只读补读、会话摘要请求中冒记携带
 
 #### Scenario: A prose retry keeps distinct transport evidence
@@ -187,7 +187,7 @@ README SHALL 写明实际日志目录的来源、Windows 默认路径、两种�
 - **THEN** 两份日志均无原始文本或密钥，后端保留有限元数据与遗漏数量；仍失败或取消时可定位最终边界，不伪造成功与写入证据
 
 ### Requirement: Story edit intent and completed book edits are diagnosable separately
-后端诊断 SHALL 区分仅提案、直接执行、承接明确方案及未形成有效范围的结果，用已允许的类别、计数与脱敏关联核对目标范围及拒绝原因。已有发布／提交记录 SHALL 是实际书内写入证据；不把确定方案、工具预校验或 Run 结束当成已经落盘。不记录作者确认文本、提案全文、拟写正文或回收内容。
+后端诊断 SHALL 区分仅提案、直接执行、承接明确方案或待办及未形成有效范围的结果，用已允许的类别、计数与脱敏关联核对目标范围及拒绝原因。已有发布／提交记录 SHALL 是实际书内写入证据；不把确定方案、工具预校验或 Run 结束当成已经落盘。不记录作者确认文本、提案全文、拟写正文或回收内容。
 
 新建资料同步 SHALL 可通过同一 Run 及工具回执关联到关联片段的实际提交。诊断 SHALL 用白名单内的状态、类型、数量、拒绝原因及脱敏标识区分已写正文、待同步、同步提交和同步失败。日常诊断日志仅保留结构信息。原文核对通过作品文件和有界、版本化的引用完成。
 
@@ -198,6 +198,24 @@ README SHALL 写明实际日志目录的来源、Windows 默认路径、两种�
 #### Scenario: Prose exists but a new note is still pending synchronization
 - **WHEN** 关联正文和大纲已保存，新主体说明同步因资料修订冲突未提交
 - **THEN** 可定位实际正文提交、待同步目标和拒绝原因。运行结果点明尚缺同步，该次同步无文档提交事件。日志中的引用、提交与原因可关联，且符合脱敏约束
+
+能力发现 SHALL 用受控工具标识、会话/Run 关联、计数及有界结果类别与实际模型请求、候选调用、逐动作范围校验、执行和可核验提交关联。任务结果 SHALL 区分完成、已满足无需写入、部分完成、未完成和运行取消／中断；不把 scope 发布、搜索结果或 Run 生命周期正常结束当作完成。诊断 MUST NOT 保存搜索词、作者措辞、上下文正文或原始工具参数。
+
+#### Scenario: Audit ordering and an unsuccessful follow-up without logging content
+- **WHEN** 同一会话执行关联增补和自然语言续办，续办的写入被拒且现稿仍有问题
+- **THEN** 能用有序事件和脱敏关联核对首次主模型派发、发现、范围核验、调用以及没有实际提交的业务结果；即使 Run 正常结束，任务也可见为未完成，写入诊断没有作者措辞、查询或稿件
+
+#### Scenario: Distinguish a chapter catalog write from an actual scene insertion
+- **WHEN** 在上下文承接的场景增补中，章节目录字段变更已提交，但插入拒绝或未派发正文生成
+- **THEN** 按 Run 和调用可分辨目录提交、未落盘的插入及正文目标结果，不把同一文档的目录提交计为正文完成；复用已有工具和落盘诊断，不记录正文或原始工具参数
+
+#### Scenario: Distinguish one local commit from a completed relocation
+- **WHEN** 同章搬移只提交旧段删除，补入候选未提交或被版本、锚点或范围校验拒绝
+- **THEN** 通过现有 Run、调用、提交和任务结果能够核对哪部分成功、哪部分仍待处理；不把一次提交记为完整搬移，不记录稿件、作者原话或原始工具参数
+
+#### Scenario: Separate a delivered whole-book skill from the chapter request it enables
+- **WHEN** 已派发整书指南但缺活动整书目标，随后 Agent 经现有工具完成登记或恢复并写章
+- **THEN** 复用现有 Run、工具结果、`model.budget_dispatched` 与提交事件，区分主 Agent 指南派发、`novel_goal_required` 的未派发正文和目标就绪后实际使用长写作用途的 `draft` 请求；独立单章保留自己的选档。只记录已派发额度与脱敏关联，不记录原始作者输入、工具参数或稿件，不把子请求触限误记成主 Agent 触限续接。
 
 ### Requirement: Model request budget is traceable at dispatch
 后台 SHALL 只在最终请求体交给传输层时，按现有关联字段记录配置能力来源、上下文窗口、声明或兜底的最大输出、请求用途、适用的有限选档依据（如首次携带整书指南或已生效整书）作为独立于配置能力来源的字段、最终输入估算和实际出站输出限额。该记录不是远端确认、服务器实际用量或模型有效上限。诊断 SHALL 只接受有界数值、有限枚举与既有安全关联字段；MUST NOT 记录密钥、请求地址、请求或响应原文、思考、工具内容及文稿。无实际派发的预算阻塞仍可走既有失败诊断，但不得产生派发预算事件。
@@ -220,6 +238,10 @@ README SHALL 写明实际日志目录的来源、Windows 默认路径、两种�
 #### Scenario: Correlate a truncated attempt with only the valid continuation work
 - **WHEN** 初始主 Agent 响应显式触限，使用新 span 续接一个通过校验的动作，另一次触限评估未派发或已触及次数上限
 - **THEN** 日志关联合法续接与原 span，初始尝试没有工具执行、未派发的评估不伪造续接派发；失败和成功原因可定位且不泄漏载荷
+
+#### Scenario: Distinguish a scoped follow-up dispatch from rejection before tool execution
+- **WHEN** 正式写作范围已有剩余任务，原模型响应因 `output_limit` 在工具执行前被拒，随后实际派发一次同轮续接；对照用例因无可执行候选不派发
+- **THEN** 复用现有预算、恢复、工具执行、文档提交和任务结果事件，按 Run、轮次和 span 核对原请求与续接的有效输出额度相同、原批次未执行、续接实际有无提交；不把未派发判定记作尝试，也不增加存储模型截断参数的事件
 
 ### Requirement: Trace insertion validation and local prose patch outcomes without content
 默认诊断 SHALL 以现有 Run、调用、章标识和允许的版本引用关联插入候选校验结果、失败类别、是否发起了定向更正及最终实际提交。质量不合格 SHALL 与断流、上限、冲突和取消分别可识别；可区分跨标点的边界重叠与已有整句回声。实际执行的正文定点调用 SHALL 区分授权拒绝、证据不足或不可核验、锚点／范围不符、版本冲突与实际提交；通用资料工具不支持正文也 SHALL 给出可识别的安全原因。同 Run 插入回声清理 SHALL 能关联实际插入回执，区分范围或授权拒绝、版本／回执过期、没有可证实的安全删除区间、实际新提交及同步复核结果。拒绝结果无提交，成功必须有实际提交证据。仅允许记录已注册标识、原因、状态和计数等安全字段，MUST NOT 记录候选、原文锚点、被删除或替换的文本、归一化重叠串、片段内容摘要、来源摘录、提示词、工具原始参数或输出。

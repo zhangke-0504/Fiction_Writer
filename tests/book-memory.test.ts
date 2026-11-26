@@ -93,7 +93,7 @@ async function conventionRun(
     },
   ]);
   manager.start(sessionId, prompt, async (ctx) => {
-    await runAgent(ctx, provider, 'fixture', [], prompt, bookMemoryTools(workspace, bookId, prompt));
+    await runAgent(ctx, provider, 'fixture', [], prompt, bookMemoryTools(workspace, bookId));
   });
   await manager.wait(sessionId);
   assert.equal(manager.get(sessionId).run?.status, 'completed', manager.get(sessionId).run?.error);
@@ -106,19 +106,29 @@ test('a new session writes chapter 25 using a middle passage from chapter 2, nev
   let runs = await restart();
   const first = await runs.create({ cwd: workspace.bookRoot(a), bookId: a }, '新会话');
   const fakeChat = '未采用的念头：主角是熔岩伪王。';
-  await conventionRun(runs, workspace, a, first.id, `请记住：${rule}。`, 'book_memory_remember', {
-    text: rule,
-  });
   await conventionRun(
     runs,
     workspace,
     a,
     first.id,
-    fakeChat,
+    '之后每一卷沿用同一叙述时态。',
     'book_memory_remember',
-    { text: fakeChat },
-    false,
+    { text: rule },
   );
+  runs.start(first.id, fakeChat, async (ctx) => {
+    await runAgent(
+      ctx,
+      new ScriptedProvider([() => answer('只讨论，不写约定。')]),
+      '',
+      [],
+      fakeChat,
+      bookMemoryTools(workspace, a),
+    );
+  });
+  await runs.wait(first.id);
+  assert.equal(runs.get(first.id).run?.status, 'completed');
+  const unspecified = await recallBookMemory(workspace, a, { query: clue });
+  assert.deepEqual(unspecified.earlierStory, []);
   const indexed = await recallBookMemory(workspace, a, { query: clue, chapterId: 'chapter-25' });
   const found = indexed.earlierStory.find((row) => row.excerpt.includes(clue))!;
   const before = await workspace.readDocument(a, chapter('chapter-2'));
@@ -189,7 +199,7 @@ test('a new session writes chapter 25 using a middle passage from chapter 2, nev
     workspace,
     a,
     second.id,
-    `请更新约定：${changed}。`,
+    '之前那条时态习惯改成由主角自己叙述。',
     'book_memory_remember',
     { id: ruleId, text: changed },
   );
@@ -201,7 +211,7 @@ test('a new session writes chapter 25 using a middle passage from chapter 2, nev
     workspace,
     a,
     second.id,
-    `请忘掉这条约定：${changed}`,
+    '刚才那条作品习惯以后不再沿用。',
     'book_memory_forget',
     { id: ruleId },
   );
@@ -232,7 +242,7 @@ test('unsaved previews are never recalled, and a recalled source edited during d
   });
   await previewed.wait(AbortSignal.timeout(5000));
   assert.equal(runs.get(session.id).run?.preview?.content, marker);
-  const before = await recallBookMemory(workspace, a, { query: marker });
+  const before = await recallBookMemory(workspace, a, { query: marker, chapterId: 'chapter-25' });
   assert.doesNotMatch(JSON.stringify(before), new RegExp(marker));
   await runs.stop(session.id);
   assert.equal(runs.get(session.id).run?.status, 'cancelled');
@@ -266,7 +276,10 @@ test('a cache-write failure still permits verified recall and a normal manuscrip
     ).error,
     undefined,
   );
-  assert.match(JSON.stringify(await recallBookMemory(workspace, a, { query: '黄铜月轮' })), /三声钟响/);
+  assert.match(
+    JSON.stringify(await recallBookMemory(workspace, a, { query: '黄铜月轮', chapterId: 'second' })),
+    /三声钟响/,
+  );
   const runs = await restart();
   const session = await runs.create({ cwd: workspace.bookRoot(a), bookId: a }, '新会话');
   await conventionRun(

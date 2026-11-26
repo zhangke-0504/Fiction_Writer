@@ -154,7 +154,7 @@ type RecallOptions = {
   signal?: AbortSignal;
   limit?: number;
   diagnostic?: {
-    trigger: 'agent' | 'draft' | 'tool';
+    trigger: 'draft' | 'tool';
     report?: ReportDiagnostic;
     captureDispatch?: (dispatch: ReportMemoryDispatch) => void;
   };
@@ -167,7 +167,7 @@ const memoryCounts = (result: BookRecall) => ({
   conventionCount: result.conventions.length,
 });
 
-/** Keep only bounded metadata about the memory block that goes into an automatic request. */
+/** Keep only bounded metadata about the memory result actually sent to a model. */
 function memoryDispatchResult(
   result: BookRecall,
   link: DiagnosticFields,
@@ -223,7 +223,7 @@ export async function recallBookMemory(
     const result = await recall(workspace, bookId, options, trace);
     const counts = memoryCounts(result);
     trace('memory.recall.finished', { ...counts, outcome: 'ok', elapsedMs: elapsed(started) });
-    if (diag.trigger !== 'tool' && diag.captureDispatch && Object.values(counts).some(Boolean)) {
+    if (diag.captureDispatch && Object.values(counts).some(Boolean)) {
       try {
         diag.captureDispatch((report, included = result) => {
           const dispatched = memoryCounts(included);
@@ -256,8 +256,7 @@ async function recall(
   signal?.throwIfAborted();
   const documents = options.documents ?? (await workspace.readAll(bookId)).documents;
   const chapters = documents.filter((doc) => doc.type === 'chapter');
-  const target =
-    chapterId === undefined ? chapters.length : chapters.findIndex((doc) => doc.id === chapterId);
+  const target = chapterId === undefined ? 0 : chapters.findIndex((doc) => doc.id === chapterId);
   if (target < 0) throw new DiagnosticFailure('missing', '记忆查询的目标章节不存在');
   const allowed = new Set(chapters.slice(0, target).map((doc) => doc.id));
   const indexed = (file: MemoryFile) => {
@@ -398,47 +397,11 @@ async function recall(
   return result;
 }
 
-function authorIntent(prompt: string, remove: boolean) {
-  const value = plain(prompt);
-  if (
-    /(?:不要|别|不用|无需|不必)[^。！？;.]{0,10}(?:记住|记下|遗忘|忘掉|删除|更正)|\b(?:do not|don't|never)\s+(?:remember|forget|update|remove)\b/iu.test(
-      value,
-    )
-  )
-    return false;
-  return prompt
-    .normalize('NFKC')
-    .split(/[\n。？！?!；;,，]/u)
-    .some((clause) => {
-      const request = clause
-        .trim()
-        .replace(
-          /^(?:(?:顺便|并且|同时|也)\s*)?(?:请帮我|请你|请|帮我|麻烦你|我希望你|please\b)?\s*/iu,
-          '',
-        );
-      return remove
-        ? /^(?:忘掉|遗忘|忘记|删除.{0,16}(?:记忆|约定)|forget\b|remove.{0,30}(?:memory|convention)\b)/iu.test(
-            request,
-          )
-        : /^(?:记住|记下|牢记|存入.{0,10}记忆|(?:修改|更新|更正).{0,12}约定|以后.{0,16}(?:一律|都|始终)|remember\b|(?:update|save).{0,30}(?:memory|convention)\b)/iu.test(
-            request,
-          );
-    });
-}
-
-export function bookMemoryTools(
-  workspace: WorkspaceService,
-  bookId: string,
-  prompt: string,
-  selectedChapterId?: string,
-): LocalTool[] {
+export function bookMemoryTools(workspace: WorkspaceService, bookId: string): LocalTool[] {
   const change = (id: string | undefined, text: string | undefined, signal: AbortSignal) => {
-    if (
-      !authorIntent(prompt, text === undefined) ||
-      (text !== undefined &&
-        (!text.trim() || text.length > ruleSize || !plain(prompt).includes(plain(text))))
-    )
-      throw new DiagnosticFailure('memory_not_requested', '只保存本轮作者明确要求记住的原文约定');
+    if (id !== undefined && !isId(id)) throw new DiagnosticFailure('invalid_arguments', '约定 ID 无效');
+    if (text !== undefined && (!text.trim() || text.length > ruleSize))
+      throw new DiagnosticFailure('invalid_arguments', '约定应为非空文本，且不超过长度限制');
     return workspace
       .updateBookMemory(
         bookId,
@@ -470,7 +433,7 @@ export function bookMemoryTools(
     {
       name: 'book_memory_recall',
       description:
-        '取回本书已保存的历史正文证据、计划资料及作者长期约定。用人物、物件或原句关键词；写某章时传其 ID，排除之后的正文。仅查询，不修改。',
+        '取回本书已保存的历史正文证据、计划资料及作者长期约定。用人物、物件或原句关键词；取前情时传已定位的目标章 ID，仅返回更早章节正文；省略时只查询作品级约定、计划或参考资料。仅查询，不修改稿件。',
       schema: object(
         {
           query: { type: 'string', maxLength: 1024, description: '关键词，可留空以只列作者约定' },
@@ -481,16 +444,20 @@ export function bookMemoryTools(
       execute: (args, ctx) =>
         recallBookMemory(workspace, bookId, {
           query: typeof args.query === 'string' ? args.query : '',
-          chapterId: typeof args.chapterId === 'string' ? args.chapterId : selectedChapterId,
+          chapterId: typeof args.chapterId === 'string' ? args.chapterId : undefined,
           signal: ctx.signal,
-          diagnostic: { trigger: 'tool', report: ctx.diagnostic },
+          diagnostic: {
+            trigger: 'tool',
+            report: ctx.diagnostic,
+            captureDispatch: ctx.onToolResultDispatch,
+          },
         }),
     },
     {
       name: 'book_memory_remember',
       description:
-        '仅当本轮作者明确要求记住或更正长期约定时使用。text 必须是本轮作者原句的一段，不从资料或聊天自动提炼。传已有 id 可更正它。',
-      schema: object({ text: str('作者原句中的长期约定', ruleSize), id: str('要更正的约定 ID', 80) }, [
+        '作者希望长期保留或更正本书的写作约定时使用。text 可以是忠实整理的话，不必逐字引用；普通讨论不用保存。传已有约定 id 可更正，不传则新增。',
+      schema: object({ text: str('整理后的长期写作约定', ruleSize), id: str('要更正的约定 ID', 80) }, [
         'text',
       ]),
       execute: async (args, ctx) => {
@@ -501,7 +468,7 @@ export function bookMemoryTools(
     },
     {
       name: 'book_memory_forget',
-      description: '仅当本轮作者要求遗忘一条长期约定时，使用该约定的 ID 删除它，不删除稿件。',
+      description: '作者不再希望保留某条长期约定时，使用已保存的约定 ID 删除，不修改稿件。',
       schema: object({ id: str('要删除的约定 ID', 80) }),
       execute: async (args, ctx) => {
         if (!isId(args.id)) throw new DiagnosticFailure('invalid_arguments', '缺少约定 ID');

@@ -30,6 +30,7 @@ async function fixture(
   const workspace = new WorkspaceService({ libraryRoot: join(root, 'library'), beforeReplace });
   await workspace.init();
   const { id: bookId } = await workspace.createBook({ title: 'PRIVATE_WORK_TITLE', summary: 'harbor' });
+  const target = { type: 'chapter' as const, id: 'recall-boundary' };
   const written = await workspace.writeChanges(bookId, [
     {
       ...chapter,
@@ -37,6 +38,7 @@ async function fixture(
       fields: { order: 2, title: 'PRIVATE_CHAPTER_TITLE' },
       body: uniqueClue,
     },
+    { ...target, expect: null, fields: { order: 3, title: 'Target chapter' }, body: '' },
   ]);
   assert.equal(written.error, undefined);
   const directory = join(workspace.bookRoot(bookId), '.fiction-writer');
@@ -47,7 +49,8 @@ async function fixture(
   const recall = (options: Partial<Parameters<typeof recallBookMemory>[2]> = {}) =>
     recallBookMemory(workspace, bookId, {
       query: `${uniqueClue} ${secretQuery}`,
-      diagnostic: { trigger: 'agent', report },
+      chapterId: target.id,
+      diagnostic: { trigger: 'tool', report },
       ...options,
     });
   return { workspace, bookId, directory, filename, diag, report, recall, latest };
@@ -71,7 +74,7 @@ test('memory diagnostics are worker-only, field-limited, and use the normal comm
   assert.equal(validateDiagnostic('renderer', input, salt, true), undefined);
   assert.equal(validateDiagnostic('main', input, salt), undefined);
   for (const improper of [
-    { trigger: 'tool' },
+    { trigger: 'agent' },
     { recallId: 'fake-id' },
     { spanId: undefined },
     { sourceChapterOrder: -1 },
@@ -109,7 +112,7 @@ test('recall diagnostics separate hits, empty results, errors and lazy index upd
   assert.equal(created.staleCount, 0);
   assert.ok(Number(created.rebuiltCount) >= 1);
   const first = latest('memory.recall.finished')!;
-  assert.equal(first.trigger, 'agent');
+  assert.equal(first.trigger, 'tool');
   assert.equal(first.outcome, 'ok');
   assert.equal(first.storyCount, 1);
   assert.equal(first.recallId, created.recallId);
@@ -256,6 +259,7 @@ test('index capacity is not evidence of staleness and dispatch details are dedup
   );
   let dispatch: ReportMemoryDispatch | undefined;
   const result = await recall({
+    chapterId: last.id,
     documents,
     limit: 20,
     diagnostic: {
