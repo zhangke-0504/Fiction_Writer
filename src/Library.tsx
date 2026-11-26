@@ -1,15 +1,49 @@
-import { useEffect, useState, type FormEvent } from 'react';
-import type { LibraryView } from '../shared/contracts';
+import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
+import type { BookSummary, LibraryView } from '../shared/contracts';
 import { api } from './bridge';
 import type { UiRefreshContext } from '../shared/diagnostics';
 import { startReload } from './diagnostics';
 import { Dialog, ErrorText, Icon, errorMessage, norm } from './ui';
-export function Library({ refresh, open }: { refresh: UiRefreshContext; open: (id: string) => void }) {
+export type LibraryPosition = { query: string; start: number; pageSize: number; firstBookId?: string };
+
+export function Library({
+  refresh,
+  open,
+  position,
+  setPosition,
+}: {
+  refresh: UiRefreshContext;
+  open: (id: string) => void;
+  position: LibraryPosition;
+  setPosition: (position: LibraryPosition) => void;
+}) {
+  const { query } = position;
   const [view, setView] = useState<LibraryView>(),
-    [query, setQuery] = useState(''),
-    [create, setCreate] = useState(false);
+    [create, setCreate] = useState(false),
+    [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [error, setError] = useState(''),
     [busy, setBusy] = useState(false);
+  const list = useRef<HTMLElement>(null);
+  const [pageSize, setPageSize] = useState(1);
+  const [createdId, setCreatedId] = useState<string>();
+
+  useLayoutEffect(() => {
+    const node = list.current!;
+    const measure = () => {
+      const style = getComputedStyle(node);
+      const rowHeight = Number.parseFloat(style.getPropertyValue('--book-row-height'));
+      const borderHeight =
+        Number.parseFloat(style.borderTopWidth) + Number.parseFloat(style.borderBottomWidth);
+      setPageSize(
+        Math.max(1, Math.floor((node.getBoundingClientRect().height - borderHeight) / rowHeight)),
+      );
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    measure();
+    return () => observer.disconnect();
+  }, []);
+
   const sync = async () => {
     const reload = startReload('library', { reason: 'user' });
     try {
@@ -47,10 +81,11 @@ export function Library({ refresh, open }: { refresh: UiRefreshContext; open: (i
     setError('');
     setBusy(true);
     try {
-      await api.request('book.create', Object.fromEntries(form));
+      const result = await api.request<Pick<BookSummary, 'id'>>('book.create', Object.fromEntries(form));
       await sync();
+      setPosition({ query: '', start: 0, pageSize });
+      setCreatedId(result.id);
       setCreate(false);
-      setQuery('');
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -66,10 +101,37 @@ export function Library({ refresh, open }: { refresh: UiRefreshContext; open: (i
       setError(errorMessage(e));
     }
   }
+  const normalizedQuery = norm(query);
   const books =
-    view?.books.filter((b) =>
-      [b.title, b.author ?? ''].some((text) => norm(text).includes(norm(query))),
+    view?.books.filter((book) =>
+      [book.title, book.author ?? ''].some((value) => norm(value).includes(normalizedQuery)),
     ) ?? [];
+  const pageCount = Math.max(1, Math.ceil(books.length / pageSize));
+  const anchorId = createdId ?? (pageSize !== position.pageSize ? position.firstBookId : undefined);
+  const anchorIndex = anchorId ? books.findIndex((book) => book.id === anchorId) : -1;
+  const page = Math.min(
+    pageCount - 1,
+    Math.floor((anchorIndex >= 0 ? anchorIndex : position.start) / pageSize),
+  );
+  const start = page * pageSize;
+  const firstBookId = books[start]?.id;
+
+  useLayoutEffect(() => {
+    if (!view) return;
+    if (
+      start !== position.start ||
+      pageSize !== position.pageSize ||
+      firstBookId !== position.firstBookId
+    )
+      setPosition({ query, start, pageSize, firstBookId });
+    if (createdId) setCreatedId(undefined);
+  }, [createdId, firstBookId, pageSize, position, query, setPosition, start, view]);
+
+  function showPage(next: number) {
+    const start = next * pageSize;
+    setPosition({ query, start, pageSize, firstBookId: books[start]?.id });
+  }
+
   return (
     <div className="library page-container">
       <div className="page-heading">
@@ -100,23 +162,25 @@ export function Library({ refresh, open }: { refresh: UiRefreshContext; open: (i
           aria-label="搜索书库"
           placeholder="搜索小说名或作者"
           value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          onChange={(e) => setPosition({ query: e.target.value, start: 0, pageSize })}
         />
       </label>
       {!create && <ErrorText text={error} />}
-      <section className="library-list surface" aria-label="个人书库">
-        {books.map((b) => (
+      <section className="library-list surface" aria-label="个人书库" ref={list}>
+        {books.slice(start, start + pageSize).map((b) => (
           <article key={b.id} className="book-row">
             <div className="book-mark">
               <Icon name="book" size={21} />
             </div>
             <div className="book-info">
-              <button className="text-button book-title" onClick={() => open(b.id)}>
+              <button className="text-button book-title" title={b.title} onClick={() => open(b.id)}>
                 {b.title}
               </button>
               <p className="book-summary">{b.summary}</p>
               {(b.author || b.genre) && (
-                <small className="muted">{[b.author, b.genre].filter(Boolean).join(' · ')}</small>
+                <small className="muted book-meta">
+                  {[b.author, b.genre].filter(Boolean).join(' · ')}
+                </small>
               )}
             </div>
             <div className="actions">
@@ -145,17 +209,38 @@ export function Library({ refresh, open }: { refresh: UiRefreshContext; open: (i
           </div>
         )}
       </section>
-      {!!view?.diagnostics.length && (
-        <details className="diagnostics">
-          <summary>书库读取提示 ({view.diagnostics.length})</summary>
-          {view.diagnostics.map((d) => (
-            <p key={d}>{d}</p>
-          ))}
-        </details>
+      <footer className="library-foot">
+        <span className="library-storage muted">
+          <Icon name="folder" size={15} /> 作品以 Markdown 保存在本机
+        </span>
+        {!!view?.diagnostics.length && (
+          <button className="text-button muted" onClick={() => setDiagnosticsOpen(true)}>
+            书库读取提示 ({view.diagnostics.length})
+          </button>
+        )}
+        {pageCount > 1 && (
+          <nav aria-label="书库分页" className="library-pagination">
+            <button disabled={page === 0} onClick={() => showPage(page - 1)}>
+              上一页
+            </button>
+            <span aria-live="polite" className="muted">
+              第 {page + 1} / {pageCount} 页
+            </span>
+            <button disabled={page + 1 === pageCount} onClick={() => showPage(page + 1)}>
+              下一页
+            </button>
+          </nav>
+        )}
+      </footer>
+      {diagnosticsOpen && (
+        <Dialog title="书库读取提示" kicker="个人书库" close={() => setDiagnosticsOpen(false)}>
+          <div className="diagnostics">
+            {view?.diagnostics.map((message, index) => (
+              <p key={index}>{message}</p>
+            ))}
+          </div>
+        </Dialog>
       )}
-      <p className="library-foot muted">
-        <Icon name="folder" size={15} /> 作品以 Markdown 保存在本机
-      </p>
       {create && (
         <Dialog
           title="新建小说"

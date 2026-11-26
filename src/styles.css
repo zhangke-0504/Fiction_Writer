@@ -18,6 +18,12 @@
 * {
   box-sizing: border-box;
 }
+html,
+body,
+#root {
+  height: 100%;
+  overflow: clip;
+}
 body {
   margin: 0;
 }
@@ -148,8 +154,6 @@ textarea {
   align-items: stretch;
   gap: 34px;
   padding: 0 24px;
-  position: sticky;
-  top: 0;
   z-index: 4;
 }
 .brand {
@@ -188,14 +192,32 @@ textarea {
   align-items: center;
 }
 .app {
-  min-height: 100vh;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+}
+.scroll-region {
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
 }
 .page-container {
   width: min(1120px, calc(100% - 64px));
   margin: 0 auto;
 }
 .library {
-  padding: 52px 0 32px;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 36px 0 20px;
+}
+.library > :not(.library-list, dialog) {
+  flex: none;
+}
+.library > .error {
+  max-height: 55px;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  margin: 0 0 10px;
 }
 .page-heading {
   display: flex;
@@ -269,13 +291,18 @@ textarea {
   border-radius: 9px;
 }
 .library-list {
-  min-height: 245px;
+  --book-row-height: 76px;
+
+  flex: 1;
+  min-height: 0;
+  overflow: clip;
 }
 .book-row {
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: 18px;
+  height: var(--book-row-height);
+  padding: 8px 18px;
 }
 .book-row + .book-row {
   border-top: 1px solid #edede5;
@@ -299,16 +326,22 @@ textarea {
   flex: 1;
 }
 .book-title {
+  display: block;
   font-weight: 700;
   font-size: 16px;
   max-width: 100%;
-  white-space: normal;
-  word-break: break-word;
 }
-.book-summary {
+.book-title,
+.book-summary,
+.book-meta {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.book-meta {
+  display: block;
+}
+.book-summary {
   margin: 3px 0 1px;
   color: var(--muted);
   font-size: 13px;
@@ -321,16 +354,28 @@ textarea {
 .library-foot {
   display: flex;
   align-items: center;
-  gap: 7px;
-  margin: 14px 0;
+  gap: 12px;
+  min-height: 34px;
+  margin-top: 12px;
   font-size: 12px;
+}
+.library-storage {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.library-pagination {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
 }
 .empty {
   text-align: center;
   display: grid;
   justify-items: center;
   align-content: center;
-  min-height: 245px;
+  height: 100%;
   color: var(--muted);
   padding: 16px;
 }
@@ -341,6 +386,25 @@ textarea {
 }
 .empty p {
   margin: 5px 0;
+}
+@media (max-height: 650px) {
+  .library {
+    padding: 16px 0 14px;
+  }
+  .library .page-heading {
+    margin-bottom: 14px;
+  }
+  .library .page-heading h1 {
+    font-size: 32px;
+    margin: 4px 0;
+  }
+  .library .tabline,
+  .library .search-box {
+    margin-bottom: 9px;
+  }
+  .library-list {
+    --book-row-height: 70px;
+  }
 }
 .empty-mini {
   font-size: 12px;
@@ -353,7 +417,10 @@ textarea {
   word-break: break-word;
 }
 .workspace {
+  display: flex;
+  flex-direction: column;
   width: min(1460px, calc(100% - 48px));
+  height: 100%;
   padding: 18px 0 22px;
 }
 .breadcrumb {
@@ -364,16 +431,30 @@ textarea {
   margin-bottom: 12px;
   min-height: 28px;
 }
+.breadcrumb > :not(.breadcrumb-title) {
+  flex: none;
+}
+.breadcrumb-title,
+.workspace-brand-text strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .workspace-frame {
   display: grid;
   grid-template-columns: minmax(155px, 215px) minmax(0, 1fr);
-  min-height: calc(100vh - 145px);
+  grid-template-rows: minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
 }
 .workspace-nav {
+  display: flex;
+  flex-direction: column;
   border-right: 1px solid var(--border);
   background: #f7f7f2;
   min-width: 0;
+  min-height: 0;
 }
 .workspace-brand {
   display: flex;
@@ -388,6 +469,12 @@ textarea {
   color: #fff;
   width: 39px;
   height: 39px;
+}
+.workspace-brand-text {
+  min-width: 0;
+}
+.workspace-brand-text strong {
+  display: block;
 }
 .workspace-brand small {
   display: block;
@@ -451,11 +538,28 @@ textarea {
   width: 28px;
   padding: 3px;
 }
+.chapters-nav {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  border-bottom: 0;
+}
 .chapters-nav .chapter-search {
   font-size: 12px;
+  flex: none;
   min-height: 29px;
   padding: 4px 7px;
   margin: 0 0 5px;
+}
+.chapter-list {
+  flex: 1;
+  min-height: 0;
+  padding: 3px;
+}
+.chapter-list:focus-visible,
+.workspace-content:focus-visible {
+  outline-offset: -2px;
 }
 .workspace-heading {
   display: flex;
@@ -466,27 +570,67 @@ textarea {
   min-height: 73px;
   flex-wrap: wrap;
 }
+.workspace-title {
+  flex: 1 1 125px;
+  min-width: 0;
+}
 .workspace-heading h1 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   margin: 3px 0 0;
   font-size: 22px;
   font-weight: 700;
+  overflow: hidden;
   overflow-wrap: anywhere;
 }
 .heading-actions {
+  flex: none;
   margin-left: auto;
 }
 .workspace-main {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
+  min-height: 0;
+}
+.workspace-heading,
+.workspace-return {
+  flex: none;
+}
+.workspace-return {
+  padding: 8px 22px 0;
 }
 .workspace-content {
   padding: 19px 22px 18px;
+  flex: 1;
+  min-height: 0;
   min-width: 0;
 }
+.workspace-return + .workspace-content {
+  padding-top: 4px;
+}
+.workspace-editor-content {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.workspace-alerts {
+  max-height: min(115px, 20vh);
+}
+.workspace-alerts:empty {
+  display: none;
+}
+.workspace-diagnostics {
+  align-self: flex-start;
+}
 .workspace-content .form-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   max-width: 760px;
 }
 .asset-groups {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
 }
 .asset-groups h2 {
@@ -512,6 +656,10 @@ textarea {
   color: var(--muted);
   margin-left: auto;
 }
+.asset-card strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .asset-body {
   white-space: pre-wrap;
   line-height: 1.75;
@@ -520,22 +668,26 @@ textarea {
 }
 .references {
   display: grid;
-  grid-template-columns: max-content 1fr;
+  grid-template-columns: max-content minmax(0, 1fr);
   gap: 8px 16px;
   color: var(--muted);
 }
 .references dd {
   margin: 0;
   color: var(--ink);
+  overflow-wrap: anywhere;
 }
 .writing-area {
   display: flex;
   flex-direction: column;
+  flex: 1;
+  min-height: 0;
   gap: 8px;
 }
 .editor-meta,
 .editor-footer {
   display: flex;
+  flex: none;
   align-items: center;
   justify-content: space-between;
   color: var(--muted);
@@ -546,13 +698,17 @@ textarea {
   background: #fdfdfb;
   border: 1px solid var(--border);
   border-radius: 7px;
-  overflow: hidden;
+  flex: 1;
+  min-height: 0;
+  overflow: clip;
   max-width: 100%;
 }
-.cm-editor {
-  min-height: 350px;
-  height: calc(100vh - 335px);
+.markdown-editor .cm-editor {
+  height: 100%;
   font-size: 15px;
+}
+.markdown-editor .cm-scroller {
+  overscroll-behavior-y: contain;
 }
 .cm-editor .cm-content {
   font-family: 'Cascadia Mono', 'Microsoft YaHei UI', monospace;
@@ -582,6 +738,8 @@ dialog {
   color: var(--ink);
   width: min(510px, calc(100% - 36px));
   max-height: calc(100vh - 40px);
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
   box-shadow: 0 24px 70px #24261c4d;
 }
 dialog::backdrop {
@@ -656,9 +814,26 @@ dialog::backdrop {
     grid-template-columns: 155px minmax(0, 1fr);
   }
   .workspace-content,
-  .workspace-heading {
+  .workspace-heading,
+  .workspace-return {
     padding-left: 13px;
     padding-right: 13px;
+  }
+}
+@media (max-height: 620px) {
+  .workspace {
+    padding: 10px 0;
+  }
+  .workspace .breadcrumb {
+    margin-bottom: 6px;
+  }
+  .workspace-brand,
+  .workspace-nav .nav-block {
+    padding-block: 8px;
+  }
+  .workspace-heading,
+  .workspace-content {
+    padding-block: 10px;
   }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -670,13 +845,14 @@ dialog::backdrop {
 .desktop-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  align-items: start;
+  grid-template-rows: minmax(0, 1fr);
 }
 .desktop-grid.with-harness {
   grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
 }
 .desktop-grid main {
   min-width: 0;
+  min-height: 0;
 }
 .topbar .pressed {
   background: var(--accent-soft);
@@ -689,16 +865,15 @@ dialog::backdrop {
 .harness {
   display: flex;
   flex-direction: column;
-  position: sticky;
-  top: 61px;
-  height: calc(100vh - 61px);
   background: #fafaf6;
   border-left: 1px solid var(--border);
   min-width: 0;
+  min-height: 0;
 }
 .harness-header,
 .session-context {
   display: flex;
+  flex: none;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -718,7 +893,8 @@ dialog::backdrop {
 }
 .session-list {
   padding: 13px;
-  overflow: auto;
+  flex: 1;
+  min-height: 0;
 }
 .session-list h3 {
   margin: 1px 0 11px;
@@ -768,6 +944,13 @@ dialog::backdrop {
 .session-context > div {
   min-width: 0;
 }
+.session-context strong {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
 .session-context small {
   display: flex;
   align-items: center;
@@ -782,8 +965,7 @@ dialog::backdrop {
 }
 .chat-feed {
   flex: 1;
-  min-height: 55px;
-  overflow: auto;
+  min-height: 0;
   padding: 0 13px 10px;
 }
 .chat-line {
@@ -869,13 +1051,18 @@ dialog::backdrop {
   margin: 7px 0;
 }
 .composer {
+  flex: none;
   padding: 10px 12px 13px;
   border-top: 1px solid var(--border);
   background: var(--paper);
 }
 .composer textarea {
   resize: vertical;
-  max-height: 130px;
+  max-height: min(130px, 24vh);
+  overscroll-behavior-y: contain;
+}
+.composer-details {
+  max-height: min(115px, 20vh);
 }
 .composer-note {
   font-size: 12px;
@@ -947,6 +1134,14 @@ dialog::backdrop {
 }
 .settings-page {
   padding: 46px 0;
+}
+@media (max-height: 620px) {
+  .settings-page {
+    padding: 18px 0 20px;
+  }
+  .settings-page .page-heading {
+    margin-bottom: 18px;
+  }
 }
 .settings-layout {
   display: grid;

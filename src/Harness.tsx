@@ -263,7 +263,7 @@ export function Harness({
         </div>
       </header>
       {showList ? (
-        <section className="session-list">
+        <section className="session-list scroll-region" aria-label="会话列表" tabIndex={0}>
           <h3>Session 历史</h3>
           <label className="search-box">
             <Icon name="search" />
@@ -324,13 +324,15 @@ export function Harness({
             </button>
           </div>
           <div
-            className="chat-feed"
+            className="chat-feed scroll-region"
             ref={feed}
             onScroll={(e) => {
               const node = e.currentTarget;
               sticky.current = node.scrollHeight - node.scrollTop - node.clientHeight < 90;
             }}
             aria-label="对话消息"
+            role="region"
+            tabIndex={0}
           >
             <ChatTranscript key={current.session.id} messages={current.messages} />
             {current.streaming && <ChatMessage line={{ role: 'assistant', text: current.streaming }} />}
@@ -363,39 +365,41 @@ export function Harness({
             )}
           </div>
           <form className="composer" onSubmit={(e) => void send(e)}>
-            <ErrorText text={error || backendError} />
-            <DiagnosticId
-              id={
-                failureId ??
-                (current.run?.status === 'failed' || current.run?.status === 'interrupted'
-                  ? current.run.id
-                  : undefined)
-              }
-            />
-            {!profile && (
-              <p className="composer-note">
-                尚未配置模型。
-                <button type="button" className="text-button" onClick={settings}>
-                  前往设置
-                </button>
-              </p>
-            )}
-            {current.session.missing && <p className="notice">工作区已删除或不可用，历史仍可查看。</p>}
-            {!!attachments.length && (
-              <div className="attachment-list">
-                {attachments.map((path) => (
-                  <button
-                    type="button"
-                    title={path}
-                    className="attachment"
-                    key={path}
-                    onClick={() => setAttachments((a) => a.filter((f) => f !== path))}
-                  >
-                    {basename(path)} <Icon name="close" size={13} />
+            <div className="composer-details scroll-region">
+              <ErrorText text={error || backendError} />
+              <DiagnosticId
+                id={
+                  failureId ??
+                  (current.run?.status === 'failed' || current.run?.status === 'interrupted'
+                    ? current.run.id
+                    : undefined)
+                }
+              />
+              {!profile && (
+                <p className="composer-note">
+                  尚未配置模型。
+                  <button type="button" className="text-button" onClick={settings}>
+                    前往设置
                   </button>
-                ))}
-              </div>
-            )}
+                </p>
+              )}
+              {current.session.missing && <p className="notice">工作区已删除或不可用，历史仍可查看。</p>}
+              {!!attachments.length && (
+                <div className="attachment-list">
+                  {attachments.map((path) => (
+                    <button
+                      type="button"
+                      title={path}
+                      className="attachment"
+                      key={path}
+                      onClick={() => setAttachments((a) => a.filter((f) => f !== path))}
+                    >
+                      {basename(path)} <Icon name="close" size={13} />
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             <textarea
               aria-label="给 Agent 的消息"
               aria-describedby={composerHint}

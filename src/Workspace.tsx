@@ -1,4 +1,13 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from 'react';
 import { api } from './bridge';
 import { startReload } from './diagnostics';
 import type { UiRefreshContext } from '../shared/diagnostics';
@@ -65,6 +74,10 @@ export function Workspace({
     [editing, setEditing] = useState<{ type: 'subject' | 'clue' | 'chapter'; item?: Manuscript }>();
   const [orphan, setOrphan] = useState<Draft>(),
     [, redraw] = useState(0);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const chapterList = useRef<HTMLElement>(null);
+  const content = useRef<HTMLDivElement>(null);
+  const assetListScroll = useRef({ subject: 0, clue: 0 });
   const doc = loaded?.doc;
   const bookReadOrigin = useRef<UiRefreshContext>({ reason: 'load' });
   const lastReadDocument = useRef<string>(undefined);
@@ -75,7 +88,14 @@ export function Workspace({
     clues = documents.filter((d) => d.type === 'clue');
   const selected = documents.find((d) => matches(d, selection)),
     current = doc && matches(doc, selection) ? doc : undefined;
-  const assetList = !selection.id && (selection.type === 'subject' || selection.type === 'clue');
+  const assetType =
+    selection.type === 'subject' || selection.type === 'clue' ? selection.type : undefined;
+  const listType = selection.id ? undefined : assetType;
+  const assetList = !!listType;
+  const { type: selectionType, id: selectionId } = selection;
+  useLayoutEffect(() => {
+    if (content.current) content.current.scrollTop = listType ? assetListScroll.current[listType] : 0;
+  }, [listType, selectionType, selectionId]);
   const draftKey = `${bookId}/${selection.type}/${selection.id}`,
     draft = drafts.get(draftKey);
   const savedInfo =
@@ -98,6 +118,7 @@ export function Workspace({
       : undefined;
   const conflict = !!draft && !!current && draft.base !== current.revision;
   const select = (ref: DocRef) => {
+    if (listType && content.current) assetListScroll.current[listType] = content.current.scrollTop;
     setError('');
     setSelection({ type: ref.type, id: ref.id });
   };
@@ -442,7 +463,9 @@ export function Workspace({
           返回书库
         </button>
         <Icon name="right" size={13} />
-        <span>{book ? title(book) : '小说工作区'}</span>
+        <span className="breadcrumb-title" title={book ? title(book) : undefined}>
+          {book ? title(book) : '小说工作区'}
+        </span>
       </div>
       <div className="workspace-frame surface">
         <aside className="workspace-nav">
@@ -450,8 +473,8 @@ export function Workspace({
             <span className="book-mark">
               <Icon name="book" size={22} />
             </span>
-            <div>
-              <strong>{book ? title(book) : '小说工作区'}</strong>
+            <div className="workspace-brand-text">
+              <strong title={book ? title(book) : undefined}>{book ? title(book) : '小说工作区'}</strong>
               <small>个人作品</small>
             </div>
           </div>
@@ -490,22 +513,32 @@ export function Workspace({
                 aria-label="查找章节"
                 placeholder="查找章节"
                 value={query}
-                onChange={(e) => setQuery(e.target.value)}
+                onChange={(e) => {
+                  setQuery(e.target.value);
+                  if (chapterList.current) chapterList.current.scrollTop = 0;
+                }}
               />
             )}
-            {chapters.map((c, i) =>
-              norm(title(c)).includes(norm(query)) ? (
-                <div className={`chapter-row ${matches(selection, c) ? 'selected' : ''}`} key={c.id}>
-                  <button className="nav-item" onClick={() => select(c)}>
-                    <span aria-hidden="true" className="chapter-number">
-                      {i + 1}
-                    </span>
-                    {title(c)}
-                  </button>
-                </div>
-              ) : null,
-            )}
-            {!chapters.length && <p className="empty-mini">还没有章节</p>}
+            <section
+              className="chapter-list scroll-region"
+              aria-label="章节列表"
+              tabIndex={0}
+              ref={chapterList}
+            >
+              {chapters.map((c, i) =>
+                norm(title(c)).includes(norm(query)) ? (
+                  <div className={`chapter-row ${matches(selection, c) ? 'selected' : ''}`} key={c.id}>
+                    <button className="nav-item" onClick={() => select(c)}>
+                      <span aria-hidden="true" className="chapter-number">
+                        {i + 1}
+                      </span>
+                      {title(c)}
+                    </button>
+                  </div>
+                ) : null,
+              )}
+              {!chapters.length && <p className="empty-mini">还没有章节</p>}
+            </section>
           </div>
         </aside>
         <section className="workspace-main" aria-label="写作区域">
@@ -513,13 +546,13 @@ export function Workspace({
             <div className="book-mark small">
               <Icon name={icons[selection.type]} />
             </div>
-            <div>
+            <div className="workspace-title">
               <p className="eyebrow">
                 {selection.type === 'chapter'
                   ? `章节 ${Math.max(1, chapters.findIndex((c) => c.id === selection.id) + 1)}`
                   : '小说工作区'}
               </p>
-              <h1>{sectionTitle}</h1>
+              <h1 title={sectionTitle}>{sectionTitle}</h1>
             </div>
             <div className="actions heading-actions">
               {assetList && (
@@ -584,51 +617,69 @@ export function Workspace({
               )}
             </div>
           </div>
-          <div className="workspace-content">
-            {!editing && <ErrorText text={error} />}
-            {orphan && (
-              <p className="notice">
-                所选文档已移除。
-                <button
-                  className="text-button"
-                  onClick={() => void navigator.clipboard.writeText(orphan.text)}
-                >
-                  复制未保存文字
-                </button>
-                <button className="text-button" onClick={() => setOrphan(undefined)}>
-                  关闭
-                </button>
-              </p>
-            )}
-            {conflict && (
-              <p className="notice">
-                磁盘上的文档已变化，未保存的文字仍保留。
-                <button
-                  className="text-button"
-                  onClick={() => {
-                    const details = draft?.info;
-                    void navigator.clipboard.writeText(
-                      details
-                        ? `小说名：${details.title}\n题材：${details.genre}\n文风：${details.style}\n\n${details.summary}`
-                        : draft!.text,
-                    );
-                  }}
-                >
-                  复制草稿
-                </button>
-                <button
-                  className="text-button"
-                  onClick={() => {
-                    drafts.delete(draftKey);
-                    setError('');
-                    redraw((n) => n + 1);
-                    refreshLocal();
-                  }}
-                >
-                  重载文件
-                </button>
-              </p>
-            )}
+          {assetType && selectionId && (
+            <div className="workspace-return">
+              <button className="text-button muted" onClick={() => openSection(assetType)}>
+                <Icon name="back" />
+                返回{labels[assetType]}列表
+              </button>
+            </div>
+          )}
+          <div
+            className={`workspace-content ${markdown ? 'workspace-editor-content' : 'scroll-region'}`}
+            ref={content}
+            role={markdown ? undefined : 'region'}
+            aria-label={
+              markdown ? undefined : listType ? `${labels[listType]}列表` : `${sectionTitle}内容`
+            }
+            tabIndex={markdown ? undefined : 0}
+          >
+            <div className={markdown ? 'workspace-alerts scroll-region' : undefined}>
+              {!editing && <ErrorText text={error} />}
+              {orphan && (
+                <p className="notice">
+                  所选文档已移除。
+                  <button
+                    className="text-button"
+                    onClick={() => void navigator.clipboard.writeText(orphan.text)}
+                  >
+                    复制未保存文字
+                  </button>
+                  <button className="text-button" onClick={() => setOrphan(undefined)}>
+                    关闭
+                  </button>
+                </p>
+              )}
+              {conflict && (
+                <p className="notice">
+                  磁盘上的文档已变化，未保存的文字仍保留。
+                  <button
+                    className="text-button"
+                    onClick={() => {
+                      const details = draft?.info;
+                      void navigator.clipboard.writeText(
+                        details
+                          ? `小说名：${details.title}\n题材：${details.genre}\n文风：${details.style}\n\n${details.summary}`
+                          : draft!.text,
+                      );
+                    }}
+                  >
+                    复制草稿
+                  </button>
+                  <button
+                    className="text-button"
+                    onClick={() => {
+                      drafts.delete(draftKey);
+                      setError('');
+                      redraw((n) => n + 1);
+                      refreshLocal();
+                    }}
+                  >
+                    重载文件
+                  </button>
+                </p>
+              )}
+            </div>
             {info && (
               <form
                 className="form-grid"
@@ -723,10 +774,6 @@ export function Workspace({
               ))}
             {(current?.type === 'subject' || current?.type === 'clue') && (
               <>
-                <button className="text-button muted" onClick={() => openSection(current.type)}>
-                  <Icon name="back" />
-                  返回{labels[current.type]}列表
-                </button>
                 <div className="asset-body">{current.body || '暂无说明'}</div>
                 {current.type === 'clue' && (
                   <dl className="references">
@@ -783,16 +830,25 @@ export function Workspace({
               </div>
             )}
             {!!view?.diagnostics.length && (
-              <details className="diagnostics">
-                <summary>文件读取提示 ({view.diagnostics.length})</summary>
-                {view.diagnostics.map((d, i) => (
-                  <p key={`${i}-${d}`}>{d}</p>
-                ))}
-              </details>
+              <button
+                className="text-button muted workspace-diagnostics"
+                onClick={() => setShowDiagnostics(true)}
+              >
+                文件读取提示 ({view.diagnostics.length})
+              </button>
             )}
           </div>
         </section>
       </div>
+      {showDiagnostics && (
+        <Dialog title="文件读取提示" kicker="小说工作区" close={() => setShowDiagnostics(false)}>
+          <div className="diagnostics">
+            {view?.diagnostics.map((message, index) => (
+              <p key={`${index}-${message}`}>{message}</p>
+            ))}
+          </div>
+        </Dialog>
+      )}
       {editing && (
         <Dialog
           title={editingTitle!}

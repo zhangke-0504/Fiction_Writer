@@ -4,7 +4,7 @@ import type { ModelProfile } from '../shared/contracts';
 import { useRuntime } from './runtime';
 import { api } from './bridge';
 import { Settings } from './Settings';
-import { Library } from './Library';
+import { Library, type LibraryPosition } from './Library';
 import { Workspace, type ActiveChapter, type Drafts } from './Workspace';
 import { Harness } from './Harness';
 import { Icon } from './ui';
@@ -15,6 +15,11 @@ function App() {
     [settings, setSettings] = useState(false);
   const [chapter, setChapter] = useState<ActiveChapter>(),
     [profiles, setProfiles] = useState<ModelProfile[]>([]);
+  const [libraryPosition, setLibraryPosition] = useState<LibraryPosition>({
+    query: '',
+    start: 0,
+    pageSize: 1,
+  });
   const editorBook = settings ? undefined : bookId;
   const { view, refresh, error } = useRuntime(editorBook);
   const drafts = useRef<Drafts>(new Map());
@@ -103,7 +108,11 @@ function App() {
         </div>
       </header>
       <div className={`desktop-grid ${open && editorBook ? 'with-harness' : ''}`}>
-        <main>
+        <main
+          className={settings ? 'scroll-region' : undefined}
+          aria-label={settings ? '设置内容' : undefined}
+          tabIndex={settings ? 0 : undefined}
+        >
           {settings ? (
             <Settings profiles={profiles} refresh={loadProfiles} />
           ) : bookId ? (
@@ -119,6 +128,8 @@ function App() {
           ) : (
             <Library
               refresh={refresh}
+              position={libraryPosition}
+              setPosition={setLibraryPosition}
               open={(id) => {
                 setOpen(false);
                 setBook(id);
