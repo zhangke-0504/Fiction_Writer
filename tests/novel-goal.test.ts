@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { NovelTools } from '../electron/agent/novel-tools.js';
+import { BookTaskScope } from '../electron/agent/task-scope.js';
 import { defaultRoundLimit, runAgent } from '../electron/agent/loop.js';
 import { RunManager } from '../electron/agent/runs.js';
 import { ScriptedProvider, type Script } from '../electron/agent/scripted.js';
@@ -23,6 +24,20 @@ const tool = (id: string, name: string, args: object) => ({
 const goal = (action: 'register' | 'check', ids?: string[]) =>
   tool(`${action}-${ids?.length ?? 0}`, 'book_get_context', { novelGoal: { action, chapterIds: ids } });
 const activate = () => tool('skill', 'skill_load', { name: 'generate-novel' });
+const enroll =
+  (id: string, count: number | 'resume' = 3) =>
+  () =>
+    tool('enroll', 'book_task_scope', {
+      items: [
+        {
+          operation: count === 'resume' ? 'novel.resume' : 'novel.register',
+          id,
+          ...(count !== 'resume' && { count }),
+          purpose: '交付完整整书',
+        },
+      ],
+    });
+const approve = () => tool('verdict', 'check_book_scope', { allowed: true });
 async function fixture(t: TestContext, authored: number) {
   const root = await mkdtemp(join(tmpdir(), 'fw-goal-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -77,15 +92,23 @@ async function run(
 ) {
   const model = new ScriptedProvider(script);
   const { runs, catalog, session, workspace, id } = f;
-  const novel = new NovelTools(workspace, id, model, catalog, { authorPrompt: prompt });
+  const turn = model.turn.bind(model);
+  model.turn = (req) =>
+    req.tools[0]?.name === 'check_book_scope' ? Promise.resolve(approve()) : turn(req);
   runs.start(session.id, prompt, async (ctx) => {
+    const scope = new BookTaskScope(ctx, prompt, model);
+    const novel = new NovelTools(workspace, id, model, catalog, { authorPrompt: prompt, scope });
     await runAgent(
       ctx,
       model,
       '',
       [],
       modelPrompt,
-      [...catalog.tools((name) => novel.skillApplied(name)), ...novel.tools()],
+      [
+        scope.tool(async () => (await workspace.readAll(id)).documents),
+        ...catalog.tools((name) => novel.skillApplied(name)),
+        ...novel.tools(),
+      ],
       novel,
     );
     await novel.assertFinished(ctx);
@@ -98,6 +121,7 @@ for (const authored of [0, 2]) {
   test(`backend verifies the entire frozen goal instead of a model's done claim (${authored} of 3 saved)`, async (t) => {
     const f = await fixture(t, authored);
     const result = await run(f, '写3章完整小说', [
+      enroll(f.id),
       activate,
       () => goal('register', chapterIds),
       ({ history }) => {
@@ -119,14 +143,17 @@ for (const authored of [0, 2]) {
   });
 }
 
-test('a saved catalog and the model claim are not success without a registered goal', async (t) => {
-  const result = await run(await fixture(t, 0), '写完小说', [activate, () => text('已经全部生成')]);
+test('a saved catalog and the model claim are not success before goal activation', async (t) => {
+  const f = await fixture(t, 0);
+  const result = await run(f, '写完小说', [enroll(f.id), activate, () => text('已经全部生成')]);
   assert.equal(result.status, 'failed');
-  assert.match(result.error ?? '', /未登记/);
+  assert.match(result.error ?? '', /尚未激活/);
 });
 
 test('a supplied count cannot be silently reduced at initial registration', async (t) => {
-  const result = await run(await fixture(t, 3), '希望大概写10章左右', [
+  const f = await fixture(t, 3);
+  const result = await run(f, '希望大概写10章左右', [
+    enroll(f.id, 10),
     activate,
     () => goal('register', chapterIds),
     ({ history }) => {
@@ -142,6 +169,7 @@ test('already saved chapters are reused and only the next empty chapter is draft
   const generate = (id: string) =>
     tool(`draft-${id}`, 'book_generate_chapter', { mode: 'draft', chapterId: id });
   const result = await run(f, '写3章完整小说', [
+    enroll(f.id),
     activate,
     () => goal('register', chapterIds),
     () => generate('one'),
@@ -179,31 +207,39 @@ test('a truncated first whole-book action recovers the full goal and writes only
   const { provider, scripted, wires } = messagesRecoveryFixture(
     t,
     (req) => req.system.startsWith('OUTER'),
-    new ScriptedProvider([() => text('她从信里读懂暗号。船转向家乡，平安进港。')]),
+    new ScriptedProvider([approve, () => text('她从信里读懂暗号。船转向家乡，平安进港。')]),
   );
   const truncated = tool('rejected', 'book_apply_changes', {
     operations: [{ type: 'chapter', action: 'delete', id: 'one' }],
   });
   scripted.push(
+    enroll(f.id),
     activate,
     () => ({ ...truncated, text: 'PRIVATE_TRUNCATED_OUTLINE', native: 'truncated-fixture' }),
     () => goal('register', chapterIds),
     () => tool('next-chapter', 'book_generate_chapter', { mode: 'draft', chapterId: 'three' }),
     () => text('三章已核对。'),
   );
-  const novel = new NovelTools(f.workspace, f.id, provider, f.catalog, { authorPrompt: prompt });
   f.runs.start(
     f.session.id,
     prompt,
     async (ctx) => {
-      const scope = novel.prepareEdit(ctx, (await f.workspace.readAll(f.id)).documents);
+      const scope = new BookTaskScope(ctx, prompt, provider);
+      const novel = new NovelTools(f.workspace, f.id, provider, f.catalog, {
+        authorPrompt: prompt,
+        scope,
+      });
       await runAgent(
         ctx,
         provider,
-        'OUTER' + scope,
+        'OUTER',
         [],
         prompt,
-        [...f.catalog.tools((name) => novel.skillApplied(name)), ...novel.tools()],
+        [
+          scope.tool(async () => (await f.workspace.readAll(f.id)).documents),
+          ...f.catalog.tools((name) => novel.skillApplied(name)),
+          ...novel.tools(),
+        ],
         novel,
       );
       await novel.assertFinished(ctx);
@@ -218,10 +254,10 @@ test('a truncated first whole-book action recovers the full goal and writes only
   assert.equal(scripted.length, 0);
   assert.deepEqual(
     wires.map((w) => w.max_tokens),
-    [8192, 65536, 65536, 65536, 65536],
+    [8192, 8192, 65536, 65536, 65536, 65536],
   );
-  assert.match(JSON.stringify(wires[2].messages), /generate-novel/);
-  assert.match(wires[2].system, /novelGoal.register/);
+  assert.match(JSON.stringify(wires[3].messages), /generate-novel/);
+  assert.match(wires[3].system, /novelGoal.register/);
   assert.doesNotMatch(
     JSON.stringify([wires, trace.rows, state.messages]),
     /PRIVATE_TRUNCATED_OUTLINE|call-rejected/,
@@ -254,11 +290,12 @@ test('resuming takes direction from the saved author message, not an attachment 
   await run(
     f,
     original,
-    [activate, () => goal('register', chapterIds), () => text('已暂停')],
+    [enroll(f.id), activate, () => goal('register', chapterIds), () => text('已暂停')],
     `${original}\n${attachment}`,
   );
   f = await reboot(f);
   await run(f, amendment, [
+    enroll(f.id, 'resume'),
     activate,
     () => resume(true),
     ({ history }) => {
@@ -271,6 +308,7 @@ test('resuming takes direction from the saved author message, not an attachment 
   f = await reboot(f);
   const before = await f.workspace.readDocument(f.id, { type: 'chapter', id: 'one' });
   const result = await run(f, '接着写完', [
+    enroll(f.id, 'resume'),
     activate,
     () => resume(),
     ({ history }) => {
@@ -305,10 +343,16 @@ test('resuming takes direction from the saved author message, not an attachment 
 
 test('resuming cannot silently recreate a chapter that disappeared from the saved catalog', async (t) => {
   let f = await fixture(t, 2);
-  await run(f, '生成整本小说', [activate, () => goal('register', chapterIds), () => text('先停止')]);
+  await run(f, '生成整本小说', [
+    enroll(f.id),
+    activate,
+    () => goal('register', chapterIds),
+    () => text('先停止'),
+  ]);
   await f.workspace.deleteDocument(f.id, { type: 'chapter', id: 'three' });
   f = await reboot(f);
   const result = await run(f, '接着写完', [
+    enroll(f.id, 'resume'),
     activate,
     () => resume(),
     ({ history }) => {
@@ -325,13 +369,15 @@ test('resuming cannot silently recreate a chapter that disappeared from the save
       });
     },
     ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /novel_goal_conflict/);
+      assert.match(JSON.stringify(history.at(-1)), /novel_goal_required/);
       return text('目录被改动，未写入');
     },
   ]);
   assert.equal(result.status, 'failed');
   assert.match(result.error ?? '', /已缺失/);
   await assert.rejects(f.workspace.readDocument(f.id, { type: 'chapter', id: 'three' }));
+  const journal = await readFile(join(f.state, 'sessions', `${f.session.id}.jsonl`), 'utf8');
+  assert.equal(journal.split(/\r?\n/).filter((line) => line.includes('"novelTask":')).length, 1);
 });
 
 test('a registered chapter goal uses the same model round limit', async (t) => {
@@ -342,14 +388,15 @@ test('a registered chapter goal uses the same model round limit', async (t) => {
     return tool(`repeat-${i}`, 'book_get_context', { index: 'chapters' });
   };
   const result = await run(f, '写3章完整小说', [
+    enroll(f.id),
     activate,
     () => goal('register', chapterIds),
-    ...Array.from({ length: defaultRoundLimit - 2 }, (_, i) => repeat(i)),
+    ...Array.from({ length: defaultRoundLimit - 3 }, (_, i) => repeat(i)),
     () => {
       throw new Error('must not exceed the shared round limit');
     },
   ]);
-  assert.equal(repeatedRounds + 2, defaultRoundLimit);
+  assert.equal(repeatedRounds + 3, defaultRoundLimit);
   assert.equal(result.status, 'failed');
   assert.match(result.error ?? '', /往返上限/);
 });
@@ -368,6 +415,7 @@ test('the same whole-book Run can fill a required note and retry the blocked cha
   const draft = (id: string) =>
     tool(id, 'book_generate_chapter', { mode: 'draft', chapterId: 'three', subjectIds: [subject.id] });
   const result = await run(f, '写3章完整小说，保留旧稿并补领航员的说明', [
+    enroll(f.id),
     activate,
     () => goal('register', chapterIds),
     () => draft('missing-note'),
@@ -425,6 +473,7 @@ test('an interrupted goal resumes from the saved opening cards without rewriting
     (d) => d.type === 'clue' || d.type === 'subject',
   );
   const previous = await run(f, '写3章完整小说', [
+    enroll(f.id),
     activate,
     () => goal('register', chapterIds),
     () => text('首章准备不通过，已停止。'),
@@ -435,6 +484,7 @@ test('an interrupted goal resumes from the saved opening cards without rewriting
   const gen = (chapterId: string) =>
     tool('draft-' + chapterId, 'book_generate_chapter', { mode: 'draft', chapterId });
   const actual = await run(f, '继续', [
+    enroll(f.id, 'resume'),
     activate,
     () => resume(),
     ({ history }) => {

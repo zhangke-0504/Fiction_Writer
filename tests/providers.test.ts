@@ -881,6 +881,7 @@ for (const variant of [
   'read-pressure',
   'clamped',
   'ineligible',
+  'late-scope',
   'candidates',
   'failed-load',
   'blocked',
@@ -960,7 +961,7 @@ for (const variant of [
       t.mock.method(catalog, 'load', async () => 'REQUIRED_WHOLE_SKILL '.repeat(900));
     }
     let applied = false;
-    const eligible = variant !== 'ineligible';
+    let eligible = variant !== 'ineligible' && variant !== 'late-scope';
     const result = runAgent(
       harnessFixture(trace, {
         signal: cancel.signal,
@@ -975,7 +976,7 @@ for (const variant of [
       'fixture',
       [
         ...catalog.tools((name) => {
-          if (eligible && name === 'generate-novel') applied = true;
+          if (name === 'generate-novel') applied = true;
         }),
         ...(variant === 'read-pressure'
           ? [
@@ -991,13 +992,16 @@ for (const variant of [
           name: 'fixture_step',
           description: 'fixture',
           schema: object({}, []),
-          execute: async () => 'OK',
+          execute: async () => {
+            if (variant === 'late-scope') eligible = true;
+            return 'OK';
+          },
         },
       ],
       {
         roundLimit: () => 200,
-        canDeliverWholeSkill: () => eligible,
-        budgetPurpose: () => (applied ? 'long-writing' : undefined),
+        qualifiesForWholeGuideBudget: () => eligible,
+        budgetPurpose: () => (applied && eligible ? 'long-writing' : undefined),
       },
     );
     if (variant === 'blocked' || variant === 'cancelled') {
@@ -1021,9 +1025,21 @@ for (const variant of [
     const long = variant === 'clamped' ? 12_000 : 65_536;
     assert.deepEqual(
       bodies.map((row) => row.max_tokens),
-      wantsLong ? [8_192, long, long] : [8_192, 8_192, 8_192],
+      wantsLong ? [8_192, long, long] : [8_192, 8_192, variant === 'late-scope' ? long : 8_192],
     );
-    assert.equal(applied, wantsLong);
+    const regularDelivery = variant === 'ineligible' || variant === 'late-scope';
+    assert.equal(applied, wantsLong || regularDelivery);
+    if (regularDelivery) {
+      const budgets = trace.rows.filter(({ event }) => event === 'model.budget_dispatched');
+      const skills = trace.rows.filter(({ event }) => event === 'skill.applied');
+      assert.equal(skills.length, 1);
+      assert.equal(skills[0].fields.spanId, budgets[1].fields.spanId);
+      assert.equal(budgets[1].fields.budgetBasis, undefined);
+      assert.equal(
+        budgets[2].fields.budgetBasis,
+        variant === 'late-scope' ? 'active-whole-skill' : undefined,
+      );
+    }
     if (wantsLong) {
       const match = trace.rows.filter((row) => row.event === 'skill.applied');
       assert.equal(match.length, 1);

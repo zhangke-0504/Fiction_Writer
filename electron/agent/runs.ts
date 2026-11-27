@@ -5,6 +5,7 @@ import { join, normalize } from 'node:path';
 import type {
   ChapterPreview,
   ChatLine,
+  LocalWritingProgress,
   RunInfo,
   RuntimeView,
   Session,
@@ -62,6 +63,7 @@ export interface RunContext {
   /** Observe only the tool result actually sent, after handoff to transport. */
   onToolResultDispatch?: (observe: (report: ReportDiagnostic, result: ToolResult) => void) => void;
   continuation?: NovelContinuation;
+  previousLocalWork?: LocalWritingProgress;
   bookEdit?: BookEdit;
   stageEditProposal?: (value: EditPlan, basis: EditBasis) => void;
   recordEditCommit?: (proposalId: string, value: EditCommit) => Promise<void>;
@@ -264,6 +266,9 @@ export class RunManager {
       amendedDirection:
         saved.amendmentLine === undefined ? undefined : view.messages[saved.amendmentLine].text,
     };
+    const local = view.run?.progress?.local;
+    const previousLocalWork =
+      view.session.bookId && local?.remaining?.length ? structuredClone(local) : undefined;
     const run: RunInfo = { id: randomUUID(), status: 'running', effort };
     const trace = diagnosticScope(this.sessionTrace(view.session, report), { runId: run.id });
     const started = performance.now();
@@ -307,6 +312,7 @@ export class RunManager {
           session: structuredClone(view.session),
           authorLine,
           continuation,
+          previousLocalWork,
           bookEdit: structuredClone(this.bookEdits.get(id)),
           stageEditProposal: (value, proposedBasis) => {
             cancel.signal.throwIfAborted();

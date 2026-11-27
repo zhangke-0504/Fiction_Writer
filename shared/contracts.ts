@@ -110,7 +110,15 @@ export interface ChapterPreview {
   content: string;
   base: string;
 }
+export interface LocalWritingProgress {
+  done: number;
+  total: number;
+  remaining: { operation: string; id: string; part?: string; assetMode?: 'patch' | 'pending' }[];
+  omitted: number;
+}
 export interface WorkProgress {
+  whole?: { chapters?: { done: number; total: number }; complete: boolean; message?: string };
+  local?: LocalWritingProgress;
   step: string;
   done: number;
   total: number;

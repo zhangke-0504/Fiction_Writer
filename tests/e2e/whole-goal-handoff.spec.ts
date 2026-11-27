@@ -102,14 +102,24 @@ for (const mode of ['missing-goal', 'resume-record', 'rebuild-goal', 'single'] a
           case 'find':
             return use('skill_search', 'skill', { query: 'generate-novel' });
           case 'skill':
-            if (mode === 'single') return scope('chapter.draft', 'scoped-single');
-            return use('skill_load', 'load', { name: 'generate-novel' });
-          case 'load':
-            if (mode === 'missing-goal') return scope('chapter.draft', 'scoped-single');
+            if (mode === 'single') return use('skill_load', 'load', { name: 'generate-novel' });
             if (resumed && mode === 'resume-record') return scope('novel.resume', 'scoped-resume');
             return scope('novel.register', 'scoped-whole', {
               count: 3,
               ...(mode === 'rebuild-goal' && { sourceQuote: request }),
+            });
+          case 'scoped-whole':
+          case 'scoped-resume':
+            expect(result.ok).toBe(true);
+            return use('skill_load', 'load', { name: 'generate-novel' });
+          case 'load':
+            expect(wire.max_tokens).toBe(mode === 'single' ? 8192 : 24_000);
+            if (mode === 'missing-goal' || mode === 'single')
+              return scope('chapter.draft', 'scoped-single');
+            if (resumed && mode === 'resume-record')
+              return use('book_get_context', 'goal', { novelGoal: { action: 'resume' } });
+            return use('book_get_context', 'goal', {
+              novelGoal: { action: 'register', chapterIds: ids },
             });
           case 'scoped-single':
             expect(result.ok).toBe(true);
@@ -118,15 +128,9 @@ for (const mode of ['missing-goal', 'resume-record', 'rebuild-goal', 'single'] a
             expect(result).toMatchObject({ ok: false, reason: 'novel_goal_required' });
             expect(result.error).toContain('novel.register');
             expect(drafts).toEqual([]);
-            return scope('novel.register', 'scoped-whole', { count: 3 });
-          case 'scoped-whole':
-            expect(result.ok).toBe(true);
             return use('book_get_context', 'goal', {
               novelGoal: { action: 'register', chapterIds: ids },
             });
-          case 'scoped-resume':
-            expect(result.ok).toBe(true);
-            return use('book_get_context', 'goal', { novelGoal: { action: 'resume' } });
           case 'goal':
             expect(result.value).toMatchObject({
               done: 2,

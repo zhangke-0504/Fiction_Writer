@@ -258,7 +258,7 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
                 : faultPrompt,
         );
         expect(body.system).toContain('skill_search');
-        if (resumed) expect(body.system).toContain('有可续接的整书记录');
+        if (resumed) expect(body.system).toContain('有可供参考的整书记录');
         return use('tool_search', 'whole-discover', {
           query: 'book_get_context book_apply_changes book_generate_assets book_generate_chapter',
         });

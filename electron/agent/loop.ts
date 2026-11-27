@@ -115,7 +115,7 @@ export interface NarrowedWritingStep {
 interface AgentBudget {
   roundLimit: () => number;
   budgetPurpose: () => ModelRequest['budgetPurpose'];
-  canDeliverWholeSkill?: () => boolean;
+  qualifiesForWholeGuideBudget?: () => boolean;
   narrowedWritingStep?: (
     ctx: RunContext,
     prospective?: readonly ToolResult[],
@@ -423,7 +423,7 @@ async function runLoop<Context extends ReadToolContext>(
         const pendingWholeSkill =
           activePurpose !== 'long-writing' &&
           typeof budget !== 'number' &&
-          budget.canDeliverWholeSkill?.()
+          budget.qualifiesForWholeGuideBudget?.()
             ? outbound.find(
                 ({ candidate, tool, result }) =>
                   candidate.executed && tool?.isWholeSkillResult?.(result),

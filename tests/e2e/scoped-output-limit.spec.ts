@@ -186,7 +186,13 @@ for (const mode of [
             ],
           });
         }
-        if (last.tool_use_id === 'scope')
+        if (last.tool_use_id === 'scope' && mode === 'ready')
+          return send('reference-guide', 'skill_load', { name: 'generate-novel' });
+        if (last.tool_use_id === 'reference-guide') {
+          expect(wire.max_tokens).toBe(8192);
+          expect(JSON.parse(last.content!).value.name).toBe('generate-novel');
+        }
+        if (last.tool_use_id === 'scope' || last.tool_use_id === 'reference-guide')
           return send('catalog', 'book_apply_changes', { operations: changes });
         if (last.tool_use_id === 'catalog') {
           if (mode === 'no-candidate') await externallyEdit();

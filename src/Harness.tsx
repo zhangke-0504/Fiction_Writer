@@ -348,10 +348,33 @@ export function Harness({
             {progress && (
               <div className="writing-progress">
                 <strong>{progress.step}</strong>
-                <span>
-                  {progress.done} / {progress.total}
-                </span>
-                {progress.message && <p>{progress.message}</p>}
+                {progress.whole && progress.local ? (
+                  <>
+                    <p>
+                      整书：
+                      {progress.whole.chapters
+                        ? `${progress.whole.chapters.done} / ${progress.whole.chapters.total} 章`
+                        : '目标尚未激活'}
+                      {progress.whole.complete && '，所需产物已核对'}
+                      {progress.whole.chapters &&
+                        progress.whole.message &&
+                        `；${progress.whole.message}`}
+                    </p>
+                    <p>
+                      局部：{progress.local.done} / {progress.local.total} 项
+                      {progress.local.remaining.length > 0 &&
+                        `；待核对或提交：${progress.local.remaining.map(({ operation, id, part }) => [operation, id, part].filter(Boolean).join('/')).join('、')}`}
+                      {progress.local.omitted > 0 && `（另有 ${progress.local.omitted} 项）`}
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <span>
+                      {progress.done} / {progress.total}
+                    </span>
+                    {progress.message && <p>{progress.message}</p>}
+                  </>
+                )}
               </div>
             )}
             {current.run && (

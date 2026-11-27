@@ -74,16 +74,6 @@ export function readNovelTask(input: unknown, messages: ChatLine[]): NovelTaskSt
   };
 }
 
-/** A simple check for an explicit numeric limit; this never decides which skill to activate. */
-export function requestedChapterCount(prompt: string) {
-  const counts = [
-    ...prompt.normalize('NFKC').matchAll(/(?:写|写成|分成|共|大约|大概|约)\s*(\d{1,3})\s*章/giu),
-  ];
-  if (!counts.length || counts.some((match) => match[1] !== counts[0][1])) return undefined;
-  const requested = Number(counts[0][1]);
-  return requested > 0 ? requested : undefined;
-}
-
 export function inspectNovelGoal(
   { documents, diagnostics }: { documents: Manuscript[]; diagnostics: string[] },
   chapterIds: readonly string[],

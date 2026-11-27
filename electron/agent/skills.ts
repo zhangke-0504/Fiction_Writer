@@ -34,6 +34,7 @@ const aliases: Record<SkillName, readonly string[]> = {
     '全部章节',
     '所有章节',
     '多章正文',
+    '生成多章内容',
     '每章正文',
     '章节正文',
     '从大纲到正文',

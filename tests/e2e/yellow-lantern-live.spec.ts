@@ -1,4 +1,4 @@
-import { _electron as electron, expect, test, type Page } from '@playwright/test';
+import { _electron as electron, expect, test, type Page, type TestInfo } from '@playwright/test';
 import { mkdir, readFile, realpath, unlink, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import type {
@@ -11,7 +11,7 @@ import type {
   Session,
 } from '../../shared/contracts.js';
 import { isOfficialDeepSeek } from '../../electron/agent/provider-capabilities.js';
-import { readDiagnostics } from './diagnostic-files.js';
+import { readDiagnostics, type Log } from './diagnostic-files.js';
 
 const title = '黄灯侠';
 const summary = '基于DC漫画七灯军团里的黄灯来写的故事';
@@ -36,14 +36,77 @@ const supplied = !!(apiKey && liveBase && liveModel && liveProtocol);
 const rpc = <T>(page: Page, method: string, args?: unknown) =>
   page.evaluate(([m, a]) => window.fw.request<T>(m, a), [method, args] as const);
 
-// Explicit opt-in: real billing / network and a compatible encrypted local profile. Nothing is sent
-// to a provider unless both options are present. The app decrypts with its normal OS safeStorage.
-test('real-provider Yellow Lantern: ten chapters, scoped antagonist addition and conditional follow-up', async ({}, info) => {
+const intentWaitMs = Math.min(runWaitMs, 180_000);
+const intentRequestLimit = 12;
+const writingTools = new Set([
+  'book_apply_changes',
+  'book_generate_assets',
+  'book_generate_chapter',
+  'book_patch_asset',
+  'book_patch_chapter',
+  'book_clean_insert_echo',
+]);
+
+function intentBoundary(rows: Log[]) {
+  let requests = 0;
+  return rows.find(
+    ({ event, fields }) =>
+      event === 'novel.goal' ||
+      event === 'run.finished' ||
+      event === 'workspace.document.committed' ||
+      (event === 'tool.started' && writingTools.has(fields.tool)) ||
+      (event === 'model.budget_dispatched' && ++requests >= intentRequestLimit),
+  );
+}
+
+async function verifyShortIntent(page: Page, root: string, session: Session, profileId: string) {
+  const { runId } = await rpc<{ runId: string }>(page, 'session.start', {
+    id: session.id,
+    profileId,
+    prompt: '生成10章内容',
+    effort: 'high',
+  });
+  const trace = async () =>
+    (await readDiagnostics(root, 'backend')).filter(({ fields }) => fields.runId === runId);
+  try {
+    await expect
+      .poll(async () => !!intentBoundary(await trace()), {
+        timeout: intentWaitMs,
+        intervals: [50, 100],
+        message: `Run ${runId}: did not reach an intent boundary in time`,
+      })
+      .toBe(true);
+  } finally {
+    // Stop the real run at the first observed boundary. Do not wait for prose or resume it.
+    await rpc(page, 'session.stop', { id: session.id });
+  }
+  await expect
+    .poll(async () => (await trace()).some(({ event }) => event === 'run.finished'))
+    .toBe(true);
+  const rows = await trace();
+  const boundary = intentBoundary(rows);
+  expect(boundary, `Run ${runId}: the first boundary must be whole-book activation`).toMatchObject({
+    event: 'novel.goal',
+    fields: { operation: 'register', outcome: 'ok', total: 10 },
+  });
+  const earlier = rows.filter(({ logSeq }) => logSeq < boundary!.logSeq);
+  // Activation is only available with this Run's accepted novel.register and a delivered guide.
+  expect(
+    earlier.some(({ event, fields }) => event === 'writing.task_scope' && fields.outcome === 'ok'),
+  ).toBe(true);
+  expect(
+    earlier.some(({ event, fields }) => event === 'skill.applied' && fields.skill === 'generate-novel'),
+  ).toBe(true);
+}
+
+// Real billing / network: use the same explicit profile setup and isolated library for both scenarios.
+async function runLiveScenario(info: TestInfo, scenario: 'short-intent' | 'full-workflow') {
+  const intentOnly = scenario === 'short-intent';
   test.skip(
     !(configPath && profileName) && !supplied,
     'provide a live API key with model/base URL/protocol, or a compatible encrypted profile',
   );
-  test.setTimeout((maxWholeRuns + 2) * runWaitMs + 60_000);
+  test.setTimeout((intentOnly ? intentWaitMs : (maxWholeRuns + 2) * runWaitMs) + 60_000);
   const root = info.outputPath('isolated-app');
   const state = join(root, 'state');
   const isolatedProfile = join(state, 'profiles.json');
@@ -106,6 +169,10 @@ test('real-provider Yellow Lantern: ten chapters, scoped antagonist addition and
       }
       const { id: bookId } = await rpc<{ id: string }>(page, 'book.create', { title, summary });
       const session = await rpc<Session>(page, 'session.create', { bookId });
+      if (intentOnly) {
+        await verifyShortIntent(page, root, session, profileId!);
+        return;
+      }
       const view = async () =>
         (await rpc<RuntimeView>(page, 'runtime.snapshot', { bookId })).sessions.find(
           ({ session: item }) => item.id === session.id,
@@ -279,4 +346,14 @@ test('real-provider Yellow Lantern: ten chapters, scoped antagonist addition and
         if (error.code !== 'ENOENT') throw error;
       });
   }
+}
+
+test('real-provider Yellow Lantern: ten chapters, scoped antagonist addition and conditional follow-up', async ({}, info) => {
+  await runLiveScenario(info, 'full-workflow');
+});
+
+// Enable with FW_LIVE_WHOLE_INTENT=1 and the configured live profile; filter by "short whole-book intent".
+test('real-provider Yellow Lantern: short whole-book intent activates before any manuscript write', async ({}, info) => {
+  test.skip(process.env.FW_LIVE_WHOLE_INTENT !== '1', 'requires explicit opt-in and may incur charges');
+  await runLiveScenario(info, 'short-intent');
 });

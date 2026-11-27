@@ -240,6 +240,7 @@ const moveScope = () =>
 
 for (const variant of [
   'stepwise',
+  'author-restored-source',
   'batch',
   'invalid-batch',
   'denied-batch',
@@ -251,7 +252,8 @@ for (const variant of [
     const f = await fixture(t);
     assert.equal((await f.save(await f.load(seventh), beforeMove)).error, undefined);
     const initial = await f.load(seventh);
-    const stepwise = variant === 'stepwise';
+    const restored = variant === 'author-restored-source';
+    const stepwise = variant === 'stepwise' || restored;
     const invalid = variant === 'invalid-batch';
     const denied = variant === 'denied-batch';
     const unknownPart = variant === 'unknown-part';
@@ -296,8 +298,10 @@ for (const variant of [
         ...(!stepwise
           ? []
           : [
-              ({ history }: Parameters<Script>[0]) => {
+              async ({ history }: Parameters<Script>[0]) => {
                 assert.match(latest(history), /patched.*1/);
+                if (restored)
+                  assert.equal((await f.save(await f.load(seventh), beforeMove)).error, undefined);
                 return read(seventh);
               },
               async () => f.patch(await f.load(seventh), [addDialogue]),
@@ -325,21 +329,24 @@ for (const variant of [
     assert.equal(finished.status, 'completed', finished.error);
     assert.equal(
       finished.taskOutcome,
-      rejected || renameOnly ? 'incomplete' : deletionOnly ? 'partial' : 'fulfilled',
+      rejected || renameOnly ? 'incomplete' : deletionOnly || restored ? 'partial' : 'fulfilled',
     );
-    assert.equal(finished.progress?.done, rejected || renameOnly ? 0 : deletionOnly ? 1 : 2);
+    assert.equal(finished.progress?.done, rejected || renameOnly ? 0 : deletionOnly || restored ? 1 : 2);
     assert.equal(finished.progress?.total, 2);
     if (deletionOnly) {
       assert.match(finished.progress?.message ?? '', /补入车尾对话/);
       assert.doesNotMatch(finished.progress?.message ?? '', /移除走廊对话/);
     }
+    if (restored) assert.match(finished.progress?.message ?? '', /移除走廊对话/);
     assert.equal(
       (await f.load(seventh)).body,
       rejected || renameOnly
         ? beforeMove
         : deletionOnly
           ? beforeMove.replace(removeDialogue.quote, '')
-          : afterMove,
+          : restored
+            ? beforeMove.replace(destination, addDialogue.replacement)
+            : afterMove,
     );
     const patches = (await f.history())
       .map((row) => row.toolReceipt)
@@ -439,7 +446,22 @@ for (const conflict of ['target', 'source', 'cancel', 'bad-second-edit', 'unread
 }
 
 const whole = '基于设定编写10章内容';
-const activate = () => use('skill_load', { name: 'generate-novel' });
+const enrollWhole = (id: string, resume = false): Script[] => [
+  () => use('tool_search', { query: 'book_get_context book_generate_chapter book_patch_chapter' }),
+  () =>
+    use('book_task_scope', {
+      items: [
+        {
+          operation: resume ? 'novel.resume' : 'novel.register',
+          id,
+          ...(resume ? {} : { count: 10 }),
+          purpose: '交付整书',
+        },
+      ],
+    }),
+  () => use('check_book_scope', { allowed: true }),
+  () => use('skill_load', { name: 'generate-novel' }),
+];
 const goal = (action: 'register' | 'resume' | 'check' = 'register') =>
   use('book_get_context', {
     novelGoal: {
@@ -464,43 +486,52 @@ const proofFor = (doc: Manuscript) => [{ chapterId: doc.id, revision: doc.revisi
 test('ten freshly written chapters permit only a verified factual correction of chapter ten', async (t) => {
   const f = await fixture(t, 0);
   let completedDrafts: Manuscript[] | undefined;
-  const op = f.start(whole, [
-    activate,
-    () => goal(),
-    ...draftSteps(1, 10),
-    async () => {
-      completedDrafts = (await f.ws.readAll(f.id)).documents;
-      assert.equal(completedDrafts.filter((d) => d.type === 'chapter' && d.body.trim()).length, 10);
-      return read(10);
-    },
-    () => read(8),
-    async () =>
-      f.patch(await f.load(10), [{ quote: missing, replacement: invented }], proofFor(await f.load(8))),
-    ({ history, tools, system }) => {
-      assert.equal(tools[0]?.name, 'submit_chapter_patch_review');
-      assert.match(system, /未证实事实/);
-      assert.match(latest(history), /证据标记_SOURCE_ONLY/);
-      return decision(false);
-    },
-    async ({ history }) => {
-      assert.match(latest(history), /patch_evidence/);
-      assert.equal((await f.load(10)).body, lastDraft);
-      return f.patch(await f.load(10), undefined, proofFor(await f.load(8)));
-    },
-    ({ history, tools }) => {
-      assert.equal(tools[0]?.name, 'submit_chapter_patch_review');
-      assert.match(latest(history), /旧句标记_OLD_ONLY.*新句标记_NEW_ONLY/);
-      return decision(true);
-    },
-    ({ history }) => {
-      assert.match(latest(history), /"patched":1,"factCorrection":true/);
-      return goal('check');
-    },
-    ({ history }) => {
-      assert.match(latest(history), /"done":10,"total":10.*"complete":true/);
-      return text('10 章已保存；第十章伤因已修正；脱身经过无依据，仍待定。');
-    },
-  ]);
+  const op = f.start(
+    whole,
+    [
+      ...enrollWhole(f.id),
+      () => goal(),
+      ...draftSteps(1, 10),
+      async () => {
+        completedDrafts = (await f.ws.readAll(f.id)).documents;
+        assert.equal(completedDrafts.filter((d) => d.type === 'chapter' && d.body.trim()).length, 10);
+        return read(10);
+      },
+      () => read(8),
+      async () =>
+        f.patch(
+          await f.load(10),
+          [{ quote: missing, replacement: invented }],
+          proofFor(await f.load(8)),
+        ),
+      ({ history, tools, system }) => {
+        assert.equal(tools[0]?.name, 'submit_chapter_patch_review');
+        assert.match(system, /未证实事实/);
+        assert.match(latest(history), /证据标记_SOURCE_ONLY/);
+        return decision(false);
+      },
+      async ({ history }) => {
+        assert.match(latest(history), /patch_evidence/);
+        assert.equal((await f.load(10)).body, lastDraft);
+        return f.patch(await f.load(10), undefined, proofFor(await f.load(8)));
+      },
+      ({ history, tools }) => {
+        assert.equal(tools[0]?.name, 'submit_chapter_patch_review');
+        assert.match(latest(history), /旧句标记_OLD_ONLY.*新句标记_NEW_ONLY/);
+        return decision(true);
+      },
+      ({ history }) => {
+        assert.match(latest(history), /"patched":1,"factCorrection":true/);
+        return goal('check');
+      },
+      ({ history }) => {
+        assert.match(latest(history), /"done":10,"total":10.*"complete":true/);
+        return text('10 章已保存；第十章伤因已修正；脱身经过无依据，仍待定。');
+      },
+    ],
+    undefined,
+    true,
+  );
   const result = await op.wait();
   assert.equal(result.status, 'completed', result.error);
   assert.deepEqual(result.progress && [result.progress.done, result.progress.total], [10, 10]);
@@ -527,28 +558,38 @@ for (const kind of ['reused', 'author-edited', 'resumed'] as const) {
     const f = await fixture(t, kind === 'reused' ? 10 : 9);
     if (kind === 'resumed') {
       const initial = await f
-        .start(whole, [activate, () => goal(), () => text('第十章尚未写入。')])
+        .start(
+          whole,
+          [...enrollWhole(f.id), () => goal(), () => text('第十章尚未写入。')],
+          undefined,
+          true,
+        )
         .wait();
       assert.equal(initial.status, 'failed');
     }
-    const op = f.start(kind === 'resumed' ? '接着写完。' : whole, [
-      activate,
-      () => goal(kind === 'resumed' ? 'resume' : 'register'),
-      ...(kind === 'reused' ? [] : draftSteps(10, 10)),
-      async () => {
-        if (kind === 'author-edited') {
-          const draft = await f.load(10);
-          assert.equal((await f.save(draft, draft.body + '\n作者另加一句。')).error, undefined);
-        }
-        return read(10);
-      },
-      () => read(8),
-      async () => f.patch(await f.load(10), undefined, proofFor(await f.load(8))),
-      ({ history }) => {
-        assert.match(latest(history), kind === 'author-edited' ? /conflict/ : /patch_not_authorized/);
-        return text('该处没有写入，列为待核对。');
-      },
-    ]);
+    const op = f.start(
+      kind === 'resumed' ? '接着写完。' : whole,
+      [
+        ...enrollWhole(f.id, kind === 'resumed'),
+        () => goal(kind === 'resumed' ? 'resume' : 'register'),
+        ...(kind === 'reused' ? [] : draftSteps(10, 10)),
+        async () => {
+          if (kind === 'author-edited') {
+            const draft = await f.load(10);
+            assert.equal((await f.save(draft, draft.body + '\n作者另加一句。')).error, undefined);
+          }
+          return read(10);
+        },
+        () => read(8),
+        async () => f.patch(await f.load(10), undefined, proofFor(await f.load(8))),
+        ({ history }) => {
+          assert.match(latest(history), kind === 'author-edited' ? /conflict/ : /patch_not_authorized/);
+          return text('该处没有写入，列为待核对。');
+        },
+      ],
+      undefined,
+      true,
+    );
     const result = await op.wait();
     assert.equal(result.status, 'completed', result.error);
     assert.equal(op.asked.filter((s) => s === 'submit_chapter_patch_review').length, 0);
@@ -562,27 +603,32 @@ for (const kind of ['reused', 'author-edited', 'resumed'] as const) {
 for (const variant of ['invalid-evidence', 'invalid-verdict', 'companion-text', 'not-read'] as const) {
   test('an attempted new-draft correction fails closed: ' + variant, async (t) => {
     const f = await fixture(t, 9);
-    const op = f.start(whole, [
-      activate,
-      () => goal(),
-      ...draftSteps(10, 10),
-      () => read(10),
-      ...(variant === 'not-read' ? [] : [() => read(8)]),
-      async () => {
-        const evidence = proofFor(await f.load(8));
-        if (variant === 'invalid-evidence') evidence[0].quote = '明知并不存在的来源短句';
-        return f.patch(await f.load(10), undefined, evidence);
-      },
-      ...(variant === 'invalid-verdict'
-        ? [() => use('submit_chapter_patch_review', { allowed: 'yes' })]
-        : variant === 'companion-text'
-          ? [() => ({ ...decision(true), text: reviewNote })]
-          : []),
-      ({ history }) => {
-        assert.match(latest(history), /patch_evidence/);
-        return text('勘误证据不足，没有写入。');
-      },
-    ]);
+    const op = f.start(
+      whole,
+      [
+        ...enrollWhole(f.id),
+        () => goal(),
+        ...draftSteps(10, 10),
+        () => read(10),
+        ...(variant === 'not-read' ? [] : [() => read(8)]),
+        async () => {
+          const evidence = proofFor(await f.load(8));
+          if (variant === 'invalid-evidence') evidence[0].quote = '明知并不存在的来源短句';
+          return f.patch(await f.load(10), undefined, evidence);
+        },
+        ...(variant === 'invalid-verdict'
+          ? [() => use('submit_chapter_patch_review', { allowed: 'yes' })]
+          : variant === 'companion-text'
+            ? [() => ({ ...decision(true), text: reviewNote })]
+            : []),
+        ({ history }) => {
+          assert.match(latest(history), /patch_evidence/);
+          return text('勘误证据不足，没有写入。');
+        },
+      ],
+      undefined,
+      true,
+    );
     const result = await op.wait();
     assert.equal(result.status, 'completed', result.error);
     assert.equal((await f.load(10)).body, lastDraft);

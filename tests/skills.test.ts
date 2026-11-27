@@ -20,6 +20,8 @@ test('skill discovery ranks Chinese variants without loading instructions', asyn
       'generate-novel',
     ],
     ['从大纲到正文，把这部故事改编成长篇', 'generate-novel'],
+    ['根据设定生成10章内容', 'generate-novel'],
+    ['生成多章内容', 'generate-novel'],
     ['续写指定章节', 'write-chapter'],
     ['同步人物设定，检查伏笔和剧情一致', 'story-consistency'],
   ]) {
