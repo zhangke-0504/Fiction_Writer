@@ -28,7 +28,7 @@ const link = '[铜印归还](../chapters/turn.md#arrival)';
 const defaultBody = `## 稳定设定\n\n守灯人常在渡口巡查。${'潮'.repeat(900)}\n\n${planned}\n\n${otherSentence}\n\n关联：${link}\n`;
 const update = (kind: 'subject' | 'clue', id: string) => ({ kind, action: 'update', targets: [{ id }] });
 
-async function fixture(t: TestContext, body = defaultBody, allowScope = true) {
+async function fixture(t: TestContext, body = defaultBody, allowScope = true, direction?: string) {
   const root = await mkdtemp(join(tmpdir(), 'fw-asset-patch-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const notify: string[][] = [];
@@ -102,7 +102,7 @@ async function fixture(t: TestContext, body = defaultBody, allowScope = true) {
     },
   };
   const author = allowScope ? '只把资料里铜印归还处的计划表述改成已发生。' : '只看资料，不改稿。';
-  const scope = new BookTaskScope(ctx, author, model);
+  const scope = new BookTaskScope(ctx, direction ?? author, model);
   const novel = new NovelTools(ws, book.id, model, new SkillCatalog('skills'), { scope });
   const documents = async () => (await ws.readAll(book.id)).documents;
   const exposed = novel.tools();
@@ -175,6 +175,241 @@ const patch = ({ revision }: Manuscript, quote = planned, replacement = happened
   replacement,
 });
 const failure = (diagnosticReason: string) => ({ diagnosticReason });
+
+test('a new-note sync cannot be registered without a current creation and scene receipt', async (t) => {
+  const f = await fixture(t);
+  await assert.rejects(
+    f.scope
+      .tool(f.documents)
+      .execute(
+        { items: [{ operation: 'subject.sync', id: actor.id, purpose: '同步本轮新建主体的场景状态' }] },
+        f.ctx,
+      ),
+    failure('context_required'),
+  );
+  assert.equal(f.checked.length, 0);
+  assert.deepEqual(f.scope.items, []);
+  assert.deepEqual(f.notify, []);
+});
+
+test('a missing chapter draft returns the catalog-before-prose dependency without partial registration', async (t) => {
+  const f = await fixture(t);
+  await assert.rejects(
+    f.scope.tool(f.documents).execute(
+      {
+        items: [
+          { operation: 'chapter.catalog', id: 'new-chapter', purpose: '新章目录' },
+          { operation: 'chapter.draft', id: 'new-chapter', purpose: '新章正文' },
+        ],
+      },
+      f.ctx,
+    ),
+    {
+      diagnosticReason: 'missing',
+      message: /new-chapter.*chapter\.catalog.*book_apply_changes.*chapter\.draft/u,
+    },
+  );
+  assert.equal(f.checked.length, 0);
+  assert.deepEqual(f.scope.items, []);
+  await assert.rejects(f.ws.readDocument(f.book.id, { type: 'chapter', id: 'new-chapter' }));
+});
+
+test('other missing documents and denied scope decisions do not instruct the Agent to create a chapter', async (t) => {
+  const f = await fixture(t, defaultBody, false);
+  const register = (operation: string, id: string) =>
+    f.scope.tool(f.documents).execute({ items: [{ operation, id, purpose: '核对目标' }] }, f.ctx);
+  for (const [operation, id] of [
+    ['chapter.patch', 'missing-chapter'],
+    ['subject.update', 'missing-note'],
+  ])
+    await assert.rejects(register(operation, id), {
+      diagnosticReason: 'missing',
+      message: /^(?!.*chapter\.catalog)/u,
+    });
+  await assert.rejects(register('chapter.draft', chapter.id), {
+    diagnosticReason: 'invalid_options',
+    message: /^(?!.*chapter\.catalog)/u,
+  });
+  assert.equal(f.checked.length, 1);
+  assert.deepEqual(f.scope.items, []);
+  assert.deepEqual(f.notify, []);
+});
+
+for (const variant of [
+  'changed-scene',
+  'changed-asset',
+  'author-restricted',
+  'independent-pending',
+] as const) {
+  test(`a recorded scene sync never becomes a whole-note update: ${variant}`, async (t) => {
+    const note = { type: 'subject', id: 'new-seal' } as const;
+    const addedScene = '鸦羽人擦过铜印，石墙上亮起三道金纹。';
+    const savedPlan = '后期登场：铜印本应落在没有灯光的仓库。';
+    const stable = '铜印上有一枚无法磨去的鸟形刻痕。';
+    const noteBody = `## 稳定设定\n${stable}\n\n## 计划\n- ${savedPlan}\n\n## 档案\n保留旧编号。`;
+    const restricted = variant === 'author-restricted';
+    const f = await fixture(
+      t,
+      defaultBody,
+      true,
+      '新增铜印并在归还章写下金纹。' +
+        (restricted ? '正文落盘后不要再改资料。' : '以实际片段同步新资料。'),
+    );
+    const review = f.model.turn.bind(f.model);
+    let syncRequests = 0;
+    const response = (text: string, name?: string, args?: object) => ({
+      role: 'assistant' as const,
+      text,
+      calls: name ? [{ id: 'fixture-' + name, name, args: JSON.stringify(args) }] : [],
+    });
+    f.model.turn = async (request) => {
+      const { tools, history } = request;
+      const tool = tools[0]?.name;
+      if (!tool) return response(addedScene);
+      if (tool === 'book_read_chapter') return response('现有定位足够。');
+      if (tool === 'submit_story_descriptions')
+        return response('', tool, { items: [{ id: note.id, body: noteBody }] });
+      if (tool === 'check_book_scope') {
+        const checked = await review(request);
+        if (
+          restricted &&
+          JSON.parse((history[0] as { text: string }).text).candidates[0].operation === 'subject.sync'
+        )
+          return response('', tool, { allowed: false });
+        return checked;
+      }
+      if (tool === 'submit_story_sync') {
+        syncRequests++;
+        assert.equal(
+          variant,
+          'independent-pending',
+          'denials/conflicts must stop before a sync request',
+        );
+        return response('', tool, {
+          evidence: [{ source: 1, status: 'appearance', excerpt: 1 }],
+          edits: [],
+        });
+      }
+      assert.fail(`Unexpected request: ${tool}`);
+    };
+    const register = (...items: object[]) =>
+      f.scope.tool(f.documents, f.novel.scopeSyncTargets).execute({ items }, f.ctx);
+    const sync = { operation: 'subject.sync', id: note.id, purpose: '只核对已提交金纹和被取代的计划' };
+    await register(
+      { operation: 'subject.create', id: note.id, purpose: '创建铜印' },
+      { operation: 'chapter.insert', id: chapter.id, purpose: '补写金纹现身', stage: 'reveal' },
+    );
+    await f.execute('book_generate_assets', {
+      kind: note.type,
+      action: 'create',
+      targets: [{ id: note.id, fields: { name: '铜印', kind: 'item' } }],
+    });
+    const originalNote = await f.ws.readDocument(f.book.id, note);
+    await assert.rejects(register(sync), failure('context_required'));
+    const originalChapter = await f.ws.readDocument(f.book.id, chapter);
+    await f.read(originalChapter);
+    await f.execute('book_generate_chapter', {
+      chapterId: chapter.id,
+      mode: 'insert',
+      subjectIds: [note.id],
+      insertion: {
+        revision: originalChapter.revision,
+        quote: originalChapter.body.trim(),
+        place: 'after',
+      },
+    });
+    const currentChapter = await f.ws.readDocument(f.book.id, chapter);
+    assert.match(currentChapter.body, /三道金纹/u);
+    const call = () => f.execute('book_generate_assets', update(note.type, note.id));
+    f.notify.length = 0;
+    if (restricted) {
+      await assert.rejects(register(sync), failure('invalid_options'));
+      assert.match(f.checked.at(-1)!, /不要再改资料/);
+      await assert.rejects(call(), failure('asset_update_route'));
+      assert.equal(f.scope.item('subject.sync', note.id), undefined);
+    } else {
+      await assert.rejects(
+        register({ ...sync, operation: 'subject.update' }),
+        failure('asset_update_route'),
+      );
+      if (variant === 'independent-pending') {
+        await f.register(originalNote, { assetPending: true });
+        await assert.rejects(call(), failure('asset_update_route'));
+      }
+      await register(sync);
+      assert.deepEqual(JSON.parse(f.checked.at(-1)!).candidates[0].syncEvidence, {
+        createdRevision: originalNote.revision,
+        currentAssetRevision: originalNote.revision,
+        sceneCount: 1,
+        passages: [expectScene()],
+      });
+      function expectScene() {
+        const [target] = f.novel.scopeSyncTargets([originalNote, currentChapter])[0].passages;
+        return {
+          target,
+          chapterId: chapter.id,
+          stage: 'reveal',
+          committedRevision: currentChapter.revision,
+          currentRevision: currentChapter.revision,
+          excerpt: addedScene,
+        };
+      }
+      if (variant === 'independent-pending') {
+        const recovery = await f.novel.narrowedWritingStep(f.ctx);
+        assert.ok(recovery?.accepts('book_generate_assets', update(note.type, note.id)));
+        assert.ok(
+          !recovery?.accepts('book_generate_assets', {
+            ...update(note.type, note.id),
+            targets: [{ id: note.id, fields: { name: '越界的名称' } }],
+          }),
+        );
+        await f.register(await f.load());
+        await assert.rejects(
+          f.execute('book_generate_assets', {
+            kind: note.type,
+            action: 'update',
+            targets: [{ id: note.id }, { id: actor.id }],
+          }),
+          failure('asset_update_route'),
+        );
+        assert.deepEqual(f.notify, []);
+        const result = (await call()) as { assets: { revision: string }[]; pendingSync: unknown[] };
+        const actual = await f.ws.readDocument(f.book.id, note);
+        assert.equal(result.assets[0].revision, actual.revision);
+        assert.deepEqual(result.pendingSync, []);
+        assert.deepEqual(actual.fields, originalNote.fields);
+        assert.ok(actual.body.includes(stable) && actual.body.includes('保留旧编号。'));
+        assert.ok(actual.body.includes(addedScene) && !actual.body.includes(savedPlan));
+        await f.novel.assertFinished(f.ctx);
+        assert.equal(f.result().outcome, 'partial');
+        assert.deepEqual(f.notify, [[`subject/${note.id}`]]);
+        assert.equal(syncRequests, 1);
+        return;
+      }
+      const changed = variant === 'changed-asset' ? originalNote : currentChapter;
+      assert.equal((await f.save(changed, changed.body + '\n\n作者手动修改。')).error, undefined);
+      if (variant === 'changed-asset') {
+        const revised = await f.ws.readDocument(f.book.id, note);
+        await f.read(revised);
+        const exact = patch(revised, '保留旧编号。', '核对编号后归档。');
+        await f.register(revised, { assetPatch: exact });
+        await f.replace(revised, exact);
+      }
+      f.notify.length = 0;
+      await assert.rejects(call(), failure('conflict'));
+      await assert.rejects(register(sync), failure('conflict'));
+      assert.match((await f.ws.readDocument(f.book.id, changed)).body, /作者手动修改/u);
+    }
+    assert.equal(syncRequests, 0);
+    assert.deepEqual(f.notify, []);
+    await f.novel.assertFinished(f.ctx);
+    assert.equal(f.result().outcome, 'partial');
+    assert.deepEqual(
+      f.result().progress?.local?.remaining.filter(({ operation }) => operation.endsWith('.sync')),
+      [{ operation: 'subject.sync', id: note.id }],
+    );
+  });
+}
 
 for (const ref of [actor, clue]) {
   test(`a ${ref.type} exact patch uses only its current dispatched slice and an actual commit`, async (t) => {

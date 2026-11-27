@@ -10,7 +10,8 @@ import { diagnosticText, readDiagnostics } from './diagnostic-files';
 import type { BookView, Manuscript, RuntimeView, WriteReport } from '../../shared/contracts';
 
 const odyssey = '基于神话故事奥德赛来写10章内容';
-const antagonistRequest = '增加一个跟2个以上已有主体有关联的反派及他的伏笔，在故事中期登场';
+const antagonistRequest =
+  '增加一个跟2个以上已有主体有关联的反派及他的伏笔，在故事中期登场；并将新建主体说明中的「打算让掌柜不敢作证」精确替换为「计划让掌柜不敢作证」';
 const antagonist = { id: 'gray-keeper', fields: { name: '灰冠守夜人', kind: 'character' } };
 const newClueId = 'gray-triple-cut';
 const insertionProse = '灰冠守夜人夺走古弓，以为掌柜不敢作人证，却在船沿留下三道灰痕。';
@@ -84,6 +85,8 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
   const allSubjects = mode === 'full' ? [hero, ...retainedSubjects.map(({ target }) => target)] : [hero];
   const chapterForEntry = 5;
   let outlineRevision = '';
+  let entryActorRevision = '';
+  let entrySceneRevision = '';
   const extraClue = {
     id: newClueId,
     fields: {
@@ -134,8 +137,28 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
           ...(mode !== 'single' && { subjectIds: [hero.id], clueIds: [clue.id] }),
         });
       const last = body.messages.at(-1)?.content.at(-1);
-      if (body.tools?.length === 1 && body.tools[0].name === 'check_book_scope')
+      if (body.tools?.length === 1 && body.tools[0].name === 'check_book_scope') {
+        const { candidates } = JSON.parse(last!.text!);
+        const sync = candidates.filter(({ operation }: { operation: string }) =>
+          operation.endsWith('.sync'),
+        );
+        for (const candidate of sync) {
+          expect(candidate.syncEvidence).toMatchObject({
+            createdRevision: expect.stringMatching(/^[a-f0-9]{64}$/u),
+            sceneCount: 1,
+            passages: [
+              {
+                chapterId: id(chapterForEntry),
+                committedRevision: entrySceneRevision,
+                currentRevision: entrySceneRevision,
+              },
+            ],
+          });
+          if (candidate.id === antagonist.id)
+            expect(candidate.syncEvidence.currentAssetRevision).toBe(entryActorRevision);
+        }
         return use('check_book_scope', 'scope-verdict', { allowed: true });
+      }
       if (body.tools?.length === 1 && body.tools[0].name === 'submit_story_sync') {
         const { asset, sources } = JSON.parse(last!.text!);
         expect(sources).toHaveLength(1);
@@ -242,7 +265,7 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
         if (last?.text === discussion) return reply('先构思归乡与身份的冲突，不写文件。');
         if (last?.text === antagonistRequest)
           return use('tool_search', 'entry-discover', {
-            query: 'book_get_context book_generate_assets book_generate_chapter',
+            query: 'book_get_context book_patch_asset book_generate_assets book_generate_chapter',
           });
         if (mode === 'single') {
           expect(last?.text).toBe('只写第三章');
@@ -369,23 +392,94 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
           outlineUpdated: true,
           chapterId: id(chapterForEntry),
         });
-        return use('book_task_scope', 'entry-sync-scope', {
+        entrySceneRevision = result.value.revision;
+        expect(result.value.pendingSync).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              key: `subject/${antagonist.id}`,
+              operation: 'subject.sync',
+              next: 'book_task_scope',
+            }),
+          ]),
+        );
+        return use('book_get_context', 'entry-actor-read', {
+          type: 'subject',
+          documentId: antagonist.id,
+        });
+      }
+      if (marker === 'entry-actor-read') {
+        entryActorRevision = result.value.document.revision;
+        expect(result.value.document.body).toContain('打算让掌柜不敢作证');
+        return use('book_task_scope', 'entry-patch-scope', {
           items: [
-            { operation: 'subject.update', id: antagonist.id, purpose: '按实际登场同步新建反派资料' },
-            { operation: 'clue.update', id: newClueId, purpose: '按实际埋设同步新建伏笔，不冒称回收' },
+            {
+              operation: 'subject.update',
+              id: antagonist.id,
+              purpose: '精确替换作者指定的主体短文',
+              assetPatch: {
+                revision: entryActorRevision,
+                quote: '打算让掌柜不敢作证',
+                replacement: '计划让掌柜不敢作证',
+              },
+            },
           ],
         });
       }
-      if (marker === 'entry-sync-scope') {
-        expect(result.ok).toBe(true);
-        return use('book_generate_assets', 'entry-sync-actor', {
+      const syncActor = (marker: string) =>
+        use('book_generate_assets', marker, {
           kind: 'subject',
           action: 'update',
           targets: [{ id: antagonist.id }],
         });
+      if (marker === 'entry-patch-scope') {
+        expect(result.ok).toBe(true);
+        return syncActor('entry-wrong-route');
+      }
+      if (marker === 'entry-wrong-route') {
+        expect(result).toMatchObject({
+          ok: false,
+          reason: 'asset_update_route',
+          error: expect.stringContaining('book_patch_asset'),
+        });
+        return use('book_patch_asset', 'entry-actor-patch', {
+          kind: 'subject',
+          id: antagonist.id,
+          revision: entryActorRevision,
+          quote: '打算让掌柜不敢作证',
+          replacement: '计划让掌柜不敢作证',
+        });
+      }
+      if (marker === 'entry-actor-patch') {
+        expect(result.ok).toBe(true);
+        entryActorRevision = result.value.revision;
+        return use('book_task_scope', 'entry-sync-scope', {
+          items: [
+            { operation: 'subject.sync', id: antagonist.id, purpose: '按实际登场同步新建反派资料' },
+            { operation: 'clue.sync', id: newClueId, purpose: '按实际埋设同步新建伏笔，不冒称回收' },
+          ],
+        });
+      }
+      if (marker === 'entry-sync-scope') {
+        expect(result.value.targets).toMatchObject([
+          {
+            operation: 'subject.sync',
+            id: antagonist.id,
+            next: { tool: 'book_generate_assets', action: 'update' },
+          },
+          {
+            operation: 'clue.sync',
+            id: newClueId,
+            next: { tool: 'book_generate_assets', action: 'update' },
+          },
+        ]);
+        return syncActor('entry-sync-actor');
       }
       if (marker === 'entry-sync-actor') {
         expect(result.ok).toBe(true);
+        return syncActor('entry-sync-reuse');
+      }
+      if (marker === 'entry-sync-reuse') {
+        expect(result.value.assets).toMatchObject([{ id: antagonist.id, reused: true }]);
         return use('book_generate_assets', 'entry-sync-clue', {
           kind: 'clue',
           action: 'update',
@@ -692,14 +786,24 @@ test('two natural-language sends complete the Odyssey and insert a related antag
     const prior = (await status(page, bookId))!.id;
     const originalOutline = await readDoc('outline', 'outline');
     await send(page, antagonistRequest);
-    await expect
-      .poll(async () => {
-        const r = await status(page, bookId);
-        return r?.id !== prior && r?.status;
-      })
-      .toBe('completed');
-    const entryId = (await status(page, bookId))!.id;
+    try {
+      await expect
+        .poll(async () => {
+          const r = await status(page, bookId);
+          return r?.id !== prior && r?.status;
+        })
+        .toBe('completed');
+    } catch (error) {
+      throw new Error(`${mock.errors.join('\n')}\n${String(error)}`);
+    }
+    const entryRun = await status(page, bookId);
+    expect(entryRun).toMatchObject({
+      taskOutcome: 'fulfilled',
+      progress: { done: 6, total: 6, complete: true },
+    });
+    const entryId = entryRun!.id;
     const connected = await files(page, bookId);
+
     expect(connected.diagnostics).toEqual([]);
     expect(connected.documents.filter((d) => d.type === 'chapter').map(({ id }) => id)).toEqual(
       mock.chapterIds,
@@ -709,6 +813,8 @@ test('two natural-language sends complete the Odyssey and insert a related antag
         old.revision,
       );
     const actor = await readDoc('subject', antagonist.id);
+    expect(actor.body).toContain('计划让掌柜不敢作证');
+    expect(actor.body).not.toContain('打算让掌柜不敢作证');
     for (const ref of ['hero-fixture', 'landlord', 'old-bow'])
       expect(actor.body).toContain(`subjects/${ref}.md`);
     expect((await readDoc('clue', newClueId)).fields).toMatchObject({
@@ -777,6 +883,23 @@ test('two natural-language sends complete the Odyssey and insert a related antag
     expect(
       entryEvents.some((e) => e.event === 'writing.context.blocked' || e.event === 'novel.goal'),
     ).toBe(false);
+    const commitEvents = entryEvents.filter(({ event }) => event === 'workspace.document.committed');
+    const wrongRoute = entryEvents.find(
+      ({ event, fields }) => event === 'tool.finished' && fields.reason === 'asset_update_route',
+    );
+    expect(wrongRoute).toBeDefined();
+    expect(commitEvents.some(({ fields }) => fields.callId === wrongRoute!.fields.callId)).toBe(false);
+    const synced = entryEvents.filter(
+      ({ event, fields }) => event === 'writing.edit.sync' && fields.outcome === 'ok',
+    );
+    expect(synced).toHaveLength(2);
+    for (const { fields } of synced)
+      expect(commitEvents.filter((row) => row.fields.callId === fields.callId)).toHaveLength(1);
+    const reused = entryEvents.find(
+      ({ event, fields }) => event === 'writing.edit.sync' && fields.outcome === 'reused',
+    );
+    expect(reused).toBeDefined();
+    expect(commitEvents.some(({ fields }) => fields.callId === reused!.fields.callId)).toBe(false);
     await safeDiaries(root);
   } finally {
     await app?.close().catch(() => {});

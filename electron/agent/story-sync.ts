@@ -11,10 +11,17 @@ import type { RunContext } from './runs.js';
 import { clueSections, noteSections, storyPart } from './story-notes.js';
 
 export type SceneStage = EditPassage['stage'];
-type Scene = { id: string; chapter: Manuscript; stage: SceneStage; text: string };
+type Scene = {
+  id: string;
+  chapter: Manuscript;
+  committedRevision: string;
+  stage: SceneStage;
+  text: string;
+};
 export type NoteSyncTarget = {
   key: string;
   document?: Manuscript;
+  createdRevision: string;
   expected: string;
   passages: string[];
   sceneSources: Scene[];
@@ -98,8 +105,9 @@ export function noteSyncTargets(
       const entry = history.find((c) => c.target === id && c.revisions[`chapter/${p.chapterId}`]);
       const text =
         chapter && entry?.scene?.assets.includes(key) ? sceneText(entry, history, chapter) : undefined;
-      if (chapter && text) {
-        reads.push({ id, chapter, stage: p.stage, text });
+      const committedRevision = entry?.revisions[`chapter/${p.chapterId}`];
+      if (chapter && text && committedRevision) {
+        reads.push({ id, chapter, committedRevision, stage: p.stage, text });
         revisions[id] = chapter.revision;
       } else ready = false;
     }
@@ -146,6 +154,7 @@ export function noteSyncTargets(
       {
         key,
         document,
+        createdRevision: create.revisions[key],
         recheckChapters,
         expected,
         passages: committed.map(([id]) => id),
@@ -200,6 +209,23 @@ export function preservesSyncEvidence(prior: NoteSyncTarget, after: NoteSyncTarg
       )
     );
   });
+}
+
+/** Only the candidate's verified receipt facts go to the existing scope readback. */
+export function noteSyncScopeFacts(target: NoteSyncTarget) {
+  return {
+    createdRevision: target.createdRevision,
+    currentAssetRevision: target.expected,
+    sceneCount: target.sceneSources.length,
+    passages: target.sceneSources.slice(0, 4).map(({ id, chapter, stage, committedRevision, text }) => ({
+      target: id,
+      chapterId: chapter.id,
+      stage,
+      committedRevision,
+      currentRevision: chapter.revision,
+      excerpt: Array.from(text.slice(0, 320)).slice(0, 160).join(''),
+    })),
+  };
 }
 
 const statusValues = ['trace', 'appearance', 'setup', 'payoff', 'omitted'] as const;

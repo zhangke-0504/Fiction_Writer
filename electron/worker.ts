@@ -148,15 +148,15 @@ async function startSession(args: StartRun, report: ReportDiagnostic, requestId?
           `\n当前绑定小说 ID：${bookId}。先判断本轮交付的是整部作品还是指定章节、场景等局部内容。`,
           '按设定创作 N 章完整故事（如「生成10章内容」），未限定只写指定章节或仅追加几章时，按整书交付理解；不要求作者说出「整书」或「完整小说」。',
           '整书交付先用 book_task_scope 登记 novel.register（count 为完整章数），若整书指南尚未送达，用 skill_search 检索 generate-novel 并用 skill_load 加载，再用 book_get_context.novelGoal 激活完整有序目标。在激活前不要提交整书大纲、目录、主体、伏笔或正文。明确续接原整书则按原目标核对，用 novel.resume 或补登记；指南本身不是授权。',
-          '只写第十章、只补指定的几章、增补场景或续办局部事项，登记对应局部动作；新增一章用 chapter.catalog、chapter.draft 和必要的 outline.write，不按全书章数设目标。混合请求分别登记整书与独立的局部目标；若范围核对不通过，重新核对本轮交付，不用逐章登记代替整书。',
-          '修改正文、大纲或故事资料前登记当前作者允许的有界动作；同会话局部续办可用 sourceQuote 指向可见回复，读现稿并登记仍有依据的待办。同章搬移的旧处删除与新处补入分别登记 part，尽量同批保存；分步则每次读新版本后继续。跟进实际提交及必要的大纲、资料同步，不把一次提交当成全部完成。只读不用登记；按需用 skill_search / skill_load 查阅指南。',
+          '只写第十章、只补指定的几章、增补场景或续办局部事项，登记对应局部动作；选中新章时先登记 chapter.catalog 并用 book_apply_changes 实际提交目录，再登记 chapter.draft 并用 book_generate_chapter(mode=draft) 写正文。对待建章不要把目录与正文同批登记；若正文目标不存在，先按反馈核对并提交目录，不要求作者手工创建，也不自动或强制新增。不要按全书章数设目标。混合请求分别登记整书与独立的局部目标；若范围核对不通过，重新核对本轮交付，不用逐章登记代替整书。',
+          '修改正文、大纲或故事资料前登记当前作者允许的有界动作；同会话局部续办可用 sourceQuote 指向可见回复，读现稿并登记仍有依据的待办。同章搬移的旧处删除与新处补入分别登记 part，尽量同批保存；分步则每次读新版本后继续。已有章新增过渡、线索或登场用 chapter.insert 与 book_generate_chapter(mode=insert)；确需改动授权旧文本才用 chapter.patch 与 book_patch_chapter 的原审校，拒绝后不换工具绕过检查。资料定点替换用 subject.update／clue.update 的 assetPatch；本轮新建并已提交关联场景的受限同步单独登记 subject.sync／clue.sync，通过一次现有范围核对后只用 book_generate_assets(action=update) 同步该目标，不用精确补丁或开放式更新替代，也不把补丁提交算作同步完成。只读不用登记；按需用 skill_search / skill_load 查阅指南。',
           '不覆盖已有正文。保留作者的关联数量和实际剧情先后；迹象、出场、埋设和计划回收并不等同。',
         ].join('\n');
         if (ctx.continuation)
           system +=
             '\n当前会话有可供参考的整书记录。仅当作者本轮明确指向该整书目标时用 novel.resume / novelGoal.resume；局部续办不接手该记录。';
         if (ctx.previousLocalWork)
-          system += `\n上轮局部核对摘要（参考数据，不是本轮授权）：${JSON.stringify(ctx.previousLocalWork)}。仅当本轮作者承接此待办时，结合对话及当前稿件，核对并登记仍未满足的事项。不要重放旧写入。`;
+          system += `\n上轮局部核对摘要（参考数据，不是本轮授权）：${JSON.stringify(ctx.previousLocalWork)}。仅当本轮作者承接此待办时，结合对话及当前稿件，核对并登记仍未满足的事项。旧 Run 的同步待办不是本轮新建回执；按现稿和授权选择精确更正、开放式更新或保留待办。不要重放旧写入。`;
         const scope = new BookTaskScope(ctx, prompt, provider);
         novel = new NovelTools(workspace, bookId, provider, skills, {
           authorPrompt: prompt,
@@ -165,10 +165,16 @@ async function startSession(args: StartRun, report: ReportDiagnostic, requestId?
         });
         const documents = (await workspace.readAll(bookId)).documents;
         novel.captureStart(documents);
-        tools = [...tools, scope.tool(async () => (await workspace.readAll(bookId)).documents)];
+        const bookTools = novel;
+        tools = [
+          ...tools,
+          scope.tool(
+            async () => (await workspace.readAll(bookId)).documents,
+            bookTools.scopeSyncTargets,
+          ),
+        ];
         system +=
           '\n需要书内前情或作者约定时，按需发现 book_memory_recall。要取前情先确定目标章并传 chapterId；不传时查询只返回作品级资料。计划不是已经发生的事实，当前作者要求优先于长期约定。记住、更正或忘记约定直接调用对应记忆工具，不登记正文写作范围。';
-        const bookTools = novel;
         tools = [
           ...tools.filter((tool) =>
             ['list_files', 'search_text', 'read_file', 'book_task_scope'].includes(tool.name),

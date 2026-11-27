@@ -92,6 +92,7 @@ import {
   sceneText,
   syncStoryNote,
   type SceneStage,
+  type NoteSyncTarget,
 } from './story-sync.js';
 import { observedCommit } from './tool-receipts.js';
 import { diagnosticScope, noDiagnostic } from '../../shared/diagnostics.js';
@@ -321,7 +322,7 @@ export class NovelTools {
         done,
         complete: done === progress.total,
       });
-      return `\n本轮承接同会话已确认方案（不是整书任务或全局权限）。活动范围：${JSON.stringify(this.edit.plan)}。未提交的目标：${JSON.stringify(this.edit.remaining(documents))}。已写入的不重做。资产调用按方案的 kind/action/id，fields 与关联由方案提供。按需读取正文和大纲当前修订，用 book_generate_chapter mode=insert、insertion.targetId 匹配方案位置，附本章唯一原文锚点和当前大纲 revision。每处成功后的大纲 revision 会更新；不要用通用覆盖。正文必须实际写入；该 Run 新段若仍有边界回声，用其成功插入回执请求 book_clean_insert_echo，拒绝时报告，不扩大授权。已写正文相关的新资料用 book_generate_assets action=update 同步，只传资料类型和 ID。待同步：${JSON.stringify(this.syncStatus(documents))}。`;
+      return `\n本轮承接同会话已确认方案（不是整书任务或全局权限）。活动范围：${JSON.stringify(this.edit.plan)}。未提交的目标：${JSON.stringify(this.edit.remaining(documents))}。已写入的不重做。资产调用按方案的 kind/action/id，fields 与关联由方案提供。按需读取正文和大纲当前修订，用 book_generate_chapter mode=insert、insertion.targetId 匹配方案位置，附本章唯一原文锚点和当前大纲 revision。每处成功后的大纲 revision 会更新；不要用通用覆盖。正文必须实际写入；该 Run 新段若仍有边界回声，用其成功插入回执请求 book_clean_insert_echo，拒绝时报告，不扩大授权。已写正文相关的新资料用 book_generate_assets action=update 同步，只传资料类型和 ID。待同步：${JSON.stringify(this.syncStatus(this.syncTargets(documents), ctx))}。`;
     }
     if (this.editMode === 'proposal')
       return '\n作者本轮只问方案，不写入作品。用索引查真实主体和章节 ID，定向查目标章、已有设定和大纲后，用 book_propose_edits 登记一份范围完整的建议，最终可见方案会随回复给出。中期多个迹象和后期实际登场要分别列章；登场与伏笔计划回收可以是不同章。列出新资料、真实关联与章锚点，不要提前执行。';
@@ -380,13 +381,34 @@ export class NovelTools {
     );
     return noteSyncTargets(history ?? edit.commits, documents, allowed, passages);
   }
-  private syncStatus(documents: Manuscript[]) {
-    return this.syncTargets(documents)
-      .filter((t) => !t.synced)
-      .map(({ key, passages, ready }) => ({ key, passages, ready }));
+  scopeSyncTargets = (documents: Manuscript[]) => this.syncTargets(documents, undefined, true);
+
+  private syncStatus(targets: readonly NoteSyncTarget[], ctx: RunContext) {
+    return targets
+      .filter(({ synced }) => !synced)
+      .map((target) => {
+        const { key, passages, ready, document } = target;
+        const type = document?.type;
+        const scope = this.input.scope;
+        const operation: 'subject.sync' | 'clue.sync' = key.startsWith('subject/')
+          ? 'subject.sync'
+          : 'clue.sync';
+        const canSync =
+          !scope ||
+          (document &&
+            (type === 'subject' || type === 'clue') &&
+            scope.assetUpdateRoute(type, document.id, ctx, target) === 'sync');
+        return {
+          key,
+          passages,
+          ready,
+          operation,
+          next: !ready ? 'conflict' : canSync ? 'book_generate_assets(update)' : 'book_task_scope',
+        };
+      });
   }
   private reportPendingSync(documents: Manuscript[], ctx: RunContext) {
-    for (const { key, passages, ready } of this.syncStatus(documents))
+    for (const { key, passages, ready } of this.syncStatus(this.syncTargets(documents), ctx))
       ctx.diagnostic?.('writing.edit.sync', {
         documentRef: key,
         outcome: 'pending',
@@ -415,9 +437,13 @@ export class NovelTools {
       message: remaining.length ? `尚待核对或提交：${remaining.join('、')}` : undefined,
     });
   }
-  private async reconcileAssets(input: AssetInput, ctx: RunContext) {
-    const documents = (await this.workspace.readAll(this.bookId)).documents;
-    const targets = this.syncTargets(documents);
+  private async reconcileAssets(
+    input: AssetInput,
+    ctx: RunContext,
+    currentTargets?: readonly NoteSyncTarget[],
+  ) {
+    const targets =
+      currentTargets ?? this.syncTargets((await this.workspace.readAll(this.bookId)).documents);
     const requested = input.targets.map(({ id }) =>
       targets.find((t) => t.key === `${input.kind}/${id}`),
     );
@@ -431,14 +457,19 @@ export class NovelTools {
     )
       throw new ToolFailure('invalid_options', '资料同步批次只能包含本次增补关联的新资料 ID。');
     const assets = [];
+    const patchBases = new Map<string, { document: Manuscript; revision: string }>();
     for (const target of requested) {
       const t = target!;
       try {
-        const saved = await syncStoryNote(this.workspace, this.bookId, ctx, this.provider, t);
+        const write = editWriteContext(ctx);
+        const saved = await syncStoryNote(this.workspace, this.bookId, write.ctx, this.provider, t);
         if (!saved.reused) {
+          const revision = write.revisions([saved])[t.key];
+          saved.revision = revision;
+          if (t.document) patchBases.set(t.key, { document: t.document, revision });
           const commit: EditCommit = {
             target: t.key,
-            revisions: { [t.key]: saved.revision },
+            revisions: { [t.key]: revision },
             synced: t.revisions,
           };
           if (this.edit) await this.edit.record(ctx, commit);
@@ -460,11 +491,14 @@ export class NovelTools {
         throw error;
       }
     }
+    const documents = (await this.workspace.readAll(this.bookId)).documents;
+    for (const document of documents) {
+      const base = patchBases.get(docKey(document));
+      if (base?.revision === document.revision)
+        this.input.scope?.preserveAssetPatch(base.document, document);
+    }
     await this.publishEdit(ctx);
-    return {
-      assets,
-      pendingSync: this.syncStatus((await this.workspace.readAll(this.bookId)).documents),
-    };
+    return { assets, pendingSync: this.syncStatus(this.syncTargets(documents), ctx) };
   }
   qualifiesForWholeGuideBudget = () => this.editMode === 'direct' && this.wholeWork;
   skillApplied(name: SkillName) {
@@ -570,9 +604,13 @@ export class NovelTools {
     });
 
     if (scope && scoped) {
-      const { remaining, done, total } = scope.summarize(docs);
-      const sync = this.syncStatus(docs);
-      const status = `本轮任务已核对 ${done}/${total} 项；待做：${
+      const targets = this.syncTargets(docs);
+      const { remaining, done, total } = scope.summarize(docs, targets);
+      const sync = this.syncStatus(targets, ctx).filter(
+        ({ key, operation }) => !scope.item(operation, key.split('/')[1]),
+      );
+      const bySyncKey = new Map(targets.map((target) => [target.key, target]));
+      const status = `本轮任务已核对 ${done}/${total + sync.length} 项；待做：${
         [
           ...remaining.map(({ operation, id, part }) => `${operation}/${id}${part ? '/' + part : ''}`),
           ...sync.map(({ key }) => `同步 ${key}`),
@@ -583,19 +621,16 @@ export class NovelTools {
       if (!remaining.length && !sync.length) return plan(status, true);
 
       const unread = (doc: Manuscript) => reads.readSet.get(docKey(doc))?.revision !== doc.revision;
-      const syncKeys = new Set(sync.map(({ key }) => key));
-      for (const { key, ready } of sync) {
-        const [kind, id] = key.split('/');
-        if (ready && (kind === 'subject' || kind === 'clue') && scope.allows(`${kind}.update`, id, ctx))
-          offerAsset(kind, id, 'update', true);
-      }
       for (const { operation, id, part } of remaining) {
         if (!scope.allows(operation, id, ctx, part)) continue;
         const [kind, action] = operation.split('.');
         const key = `${kind}/${id}`;
         const doc = byKey.get(key);
         if (kind === 'subject' || kind === 'clue') {
-          if (action === 'update' && doc && !syncKeys.has(key)) {
+          const route = scope.assetUpdateRoute(kind, id, ctx, bySyncKey.get(key));
+          if (action === 'sync' && route === 'sync') {
+            offerAsset(kind, id, 'update', true);
+          } else if (action === 'update' && doc && route === 'open') {
             if (unread(doc)) readDoc(key);
             else offerAsset(kind, id, action);
           } else if (action === 'create' && !doc) offerAsset(kind, id, action);
@@ -689,7 +724,7 @@ export class NovelTools {
         if (error instanceof ToolFailure) return;
         throw error;
       }
-      const sync = this.syncStatus(docs);
+      const sync = this.syncStatus(this.syncTargets(docs), ctx);
       const { done, total } = this.editProgress(docs);
       const status = `确认方案已核对 ${done}/${total} 项；待做：${[...remaining, ...sync.map(({ key }) => `同步 ${key}`)].slice(0, 6).join('、') || '无'}`;
       if (!remaining.size && !sync.length) return plan(status, true);
@@ -871,20 +906,15 @@ export class NovelTools {
   }
   private localProgress(documents: Manuscript[]) {
     if (!this.input.scope) return;
-    const check = this.input.scope.summarize(documents);
-    const pending = this.syncTargets(documents).filter((item) => !item.synced);
-    // Only the open update routed to this same synchronization represents the same work.
+    const targets = this.syncTargets(documents);
+    const check = this.input.scope.summarize(documents, targets);
+    const pending = targets.filter((item) => !item.synced);
+    // Only the independently registered sync action represents this synchronization target.
     const separate = pending.filter(
       ({ key }) =>
         !check.remaining.some((item) => {
           const [kind, id] = key.split('/');
-          return (
-            item.operation === `${kind}.update` &&
-            item.id === id &&
-            !item.assetPatch &&
-            !item.assetPending &&
-            !item.currentEvidence
-          );
+          return item.operation === `${kind}.sync` && item.id === id;
         }),
     );
     const total = check.total + separate.length;
@@ -1490,11 +1520,12 @@ export class NovelTools {
         if (preservesSyncEvidence(prior, next, chapterId)) retained.push(key);
         else if (
           this.input.scope
-            ? this.input.scope.allows(
-                `${key.split('/')[0]}.update` as ScopeOperation,
-                key.split('/')[1],
+            ? this.input.scope.assetUpdateRoute(
+                prior.document.type === 'subject' ? 'subject' : 'clue',
+                prior.document.id,
                 ctx,
-              )
+                next,
+              ) === 'sync'
             : this.noteSyncAllowed(key)
         )
           pending.push(key);
@@ -1536,7 +1567,7 @@ export class NovelTools {
         insertionRef,
         revision: actual,
         cleaned: true,
-        pendingSync: this.syncStatus(nextDocs),
+        pendingSync: this.syncStatus(this.syncTargets(nextDocs), ctx),
       };
     } catch (error) {
       const reason = classified(error, ctx.signal);
@@ -1719,16 +1750,7 @@ export class NovelTools {
           'patch_not_authorized',
           '此精确修订不匹配本轮的 assetPatch 登记；文档级更新或只待办不能代替。',
         );
-      if (
-        this.createdHere.has(key) &&
-        this.syncTargets((await this.workspace.readAll(this.bookId)).documents).some(
-          (target) => target.key === key,
-        )
-      )
-        throw new ToolFailure(
-          'asset_update_route',
-          '本轮插入关联的资料同步仍使用 book_generate_assets(update)。',
-        );
+
       const changed = () =>
         new ToolFailure('conflict', '资料已变化；请回读当前短文后重新登记，不重用旧补丁。');
       const doc = await this.workspace.readDocument(this.bookId, ref).catch((error: unknown) => {
@@ -1743,8 +1765,17 @@ export class NovelTools {
           '请按资料类型和 ID 回读当前版本的完整短原文；搜索命中不是原文。',
         );
       ctx.signal.throwIfAborted();
+      const witness = body.slice(Math.max(0, start - 24), start + patch.replacement.length + 24);
       const write = editWriteContext(
-        scope.track({ ...ctx, diagnostic: report }, [{ operation, id, assetPatch: patch }]),
+        scope.track({ ...ctx, diagnostic: report }, [
+          {
+            operation,
+            id,
+            assetPatch: patch,
+            assetPatchWitness:
+              witness && body.indexOf(witness) === body.lastIndexOf(witness) ? witness : undefined,
+          },
+        ]),
       );
       const result = await this.workspace.writeChanges(
         this.bookId,
@@ -1756,6 +1787,11 @@ export class NovelTools {
       if (result.reason === 'conflict') throw changed();
       if (result.error) throw new ToolFailure(result.reason ?? 'unknown', result.error, result);
       const revision = write.revisions([ref])[key];
+      const prior = this.directCommits
+        .filter((entry) => entry.target === key && entry.revisions[key])
+        .at(-1);
+      if (this.createdHere.has(key) && prior?.revisions[key] === patch.revision)
+        this.directCommits.push({ target: key, revisions: { [key]: revision } });
       report('asset.patch.finished', { docType: kind, outcome: 'ok', count: 1, revision });
       return { kind, id, revision, patched: 1 };
     } catch (error) {
@@ -1768,6 +1804,30 @@ export class NovelTools {
       throw error;
     }
   }
+  private assetUpdateHint(
+    kind: 'subject' | 'clue',
+    id: string,
+    route: ReturnType<BookTaskScope['assetUpdateRoute']>,
+  ) {
+    const key = `${kind}/${id}`;
+    switch (route) {
+      case 'patch':
+        return `${key} 仅有定点登记；符合当前修订及精确参数时用 book_patch_asset，不能同步或全文更新。`;
+      case 'pending':
+        return `${key} 只登记为待办，没有可执行的资料更新。`;
+      case 'needs_sync_scope':
+        return `${key} 有本轮已提交的关联场景。如作者允许同步，先独立登记 ${kind}.sync，再用 book_generate_assets(update) 只传 ID；不能用开放式更新代替。`;
+      case 'sync_conflict':
+        return `${key} 的同步来源或目标资料已变化或无法核对；暂留待办，不改走全文更新。`;
+      case 'sync':
+        return `${key} 已登记受限同步，用 book_generate_assets(update) 只传 ID。`;
+      case 'open':
+        return `${key} 已登记开放式更新，回读当前资料后用 book_generate_assets(update)。`;
+      default:
+        return `${key} 没有本轮有效的资料更新登记。`;
+    }
+  }
+
   private async apply(operations: Mutation[], ctx: RunContext) {
     this.requireEditAction();
     if (this.edit)
@@ -1777,18 +1837,22 @@ export class NovelTools {
       );
     const target = this.requireGoal();
     const scope = this.input.scope;
-    if (
-      scope &&
-      !target &&
-      operations.some(
+    if (scope && !target) {
+      const asset = operations.find(
         ({ type, action, id }) =>
           (type === 'subject' || type === 'clue') && action === 'update' && isId(id),
-      )
-    )
-      throw new ToolFailure(
-        'asset_update_route',
-        '普通范围任务不能用 book_apply_changes 更新主体或伏笔：短文用 book_patch_asset，开放式说明用 book_generate_assets(update)，各自须有对应登记。',
       );
+      if (asset && (asset.type === 'subject' || asset.type === 'clue')) {
+        const { documents } = await this.workspace.readAll(this.bookId);
+        const sync = this.scopeSyncTargets(documents).find(({ key }) => key === docKey(asset));
+        const route = scope.assetUpdateRoute(asset.type, asset.id, ctx, sync);
+        throw new ToolFailure(
+          'asset_update_route',
+          'book_apply_changes 不支持普通范围任务的资料更新。' +
+            this.assetUpdateHint(asset.type, asset.id, route),
+        );
+      }
+    }
     if (
       scope &&
       !target &&
@@ -1949,22 +2013,50 @@ export class NovelTools {
     this.requireEditAction();
     const taskScope = this.input.scope;
     const operation = `${input.kind}.${input.action}` as ScopeOperation;
-    if (
-      taskScope &&
-      input.action === 'update' &&
-      input.targets.some(({ id }) => {
-        const item = taskScope.item(operation, id);
-        return item?.assetPatch || item?.assetPending;
-      })
-    )
-      throw new ToolFailure(
-        'asset_update_route',
-        '定点登记或只待办不授权全文更新。仅匹配本轮精确登记的短文可用 book_patch_asset；其余暂留待办。',
-      );
+    const expectedRevisions = new Map<string, string>();
+    if (taskScope && input.action === 'update') {
+      const { documents } = await this.workspace.readAll(this.bookId);
+      const sync = this.scopeSyncTargets(documents);
+      const routes = input.targets.map(({ id }) => ({
+        id,
+        route: taskScope.assetUpdateRoute(
+          input.kind,
+          id,
+          ctx,
+          sync.find(({ key }) => key === `${input.kind}/${id}`),
+        ),
+      }));
+      const blocked = routes.find(({ route }) => route !== 'sync' && route !== 'open');
+      if (blocked) {
+        const { id, route } = blocked;
+        const hint = this.assetUpdateHint(input.kind, id, route);
+        const reason =
+          route === 'sync_conflict'
+            ? 'conflict'
+            : route === 'unregistered'
+              ? 'invalid_options'
+              : 'asset_update_route';
+        throw new ToolFailure(reason, hint);
+      }
+      if (routes.some(({ route }) => route === 'sync')) {
+        if (routes.some(({ route }) => route !== 'sync'))
+          throw new ToolFailure('asset_update_route', '受限同步与开放式更新须分别调用；本批未提交。');
+        ctx = taskScope.track(
+          ctx,
+          routes.map(({ id }) => ({ operation: `${input.kind}.sync`, id })),
+        );
+        return this.reconcileAssets(input, ctx, sync);
+      }
+      for (const { id } of input.targets) {
+        const doc = documents.find((entry) => entry.type === input.kind && entry.id === id);
+        if (!doc || this.reads.readSet.get(docKey(doc))?.revision !== doc.revision)
+          throw new ToolFailure('context_required', '更新前须读取相应资料的当前版本。');
+        expectedRevisions.set(id, doc.revision);
+      }
+    }
     const permitted =
       !!taskScope && input.targets.every(({ id }) => taskScope.allows(operation, id, ctx));
     const whole = !!this.target && input.action !== 'update';
-    const expectedRevisions = new Map<string, string>();
     if (taskScope)
       ctx = taskScope.track(
         ctx,
@@ -1981,18 +2073,9 @@ export class NovelTools {
       throw new ToolFailure('invalid_arguments', '关联的不同既有主体数不足登记要求。');
     if (taskScope && !permitted && !whole)
       throw new ToolFailure('invalid_options', '这些资料与动作不在本轮有效执行范围。');
-    if (input.action === 'update' && (this.edit || taskScope)) {
+    if (input.action === 'update' && this.edit) {
       const synced = await this.reconcileAssets(input, ctx);
       if (synced) return synced;
-    }
-    if (taskScope && input.action === 'update') {
-      const { documents } = await this.workspace.readAll(this.bookId);
-      for (const { id } of input.targets) {
-        const doc = documents.find((entry) => entry.type === input.kind && entry.id === id);
-        if (!doc || this.reads.readSet.get(docKey(doc))?.revision !== doc.revision)
-          throw new ToolFailure('context_required', '更新前须读取相应资料的当前版本。');
-        expectedRevisions.set(id, doc.revision);
-      }
     }
     if (this.edit) {
       const edit = this.edit;
@@ -2087,8 +2170,11 @@ export class NovelTools {
         permitted || (!!taskScope && whole),
         expectedRevisions,
       );
-      if (input.action === 'create')
-        for (const saved of result.assets) recordCreation(saved, saved.revision);
+      if (input.action === 'create') {
+        const observed = scopedWrite?.revisions(result.assets);
+        for (const saved of result.assets)
+          recordCreation(saved, observed?.[docKey(saved)] ?? saved.revision);
+      }
       if (target) {
         for (const saved of result.assets) this.referenceFailures.delete(docKey(saved));
         await checkpoint();
@@ -2221,7 +2307,7 @@ export class NovelTools {
             inserted: true,
             outlineUpdated: true,
             reused: true,
-            pendingSync: this.syncStatus(documents),
+            pendingSync: this.syncStatus(this.syncTargets(documents), ctx),
           };
         if (!plan.insertion?.outline || !outline || !chapter)
           throw new ToolFailure(
@@ -2252,7 +2338,10 @@ export class NovelTools {
             inserted: true,
             outlineUpdated: true,
             reused: true,
-            pendingSync: this.syncStatus((await this.workspace.readAll(this.bookId)).documents),
+            pendingSync: this.syncStatus(
+              this.syncTargets((await this.workspace.readAll(this.bookId)).documents),
+              ctx,
+            ),
           };
         }
         try {
@@ -2454,7 +2543,10 @@ export class NovelTools {
           outlineRevision,
           ...(insertionRef && { insertionRef }),
           ...((edit || scope) && {
-            pendingSync: this.syncStatus((await this.workspace.readAll(this.bookId)).documents),
+            pendingSync: this.syncStatus(
+              this.syncTargets((await this.workspace.readAll(this.bookId)).documents),
+              ctx,
+            ),
           }),
         }),
       };
@@ -2596,7 +2688,7 @@ export class NovelTools {
       {
         name: 'book_apply_changes',
         description:
-          '普通范围任务仅提交已登记的大纲或章节目录，不接受章节正文或主体／伏笔更新。正文定点用 book_patch_chapter；资料短文用 book_patch_asset，开放式更新用 book_generate_assets(update)。本轮已登记整书范围时，先用 book_get_context.novelGoal 激活目标；如需修改既有资料，显式用 book_get_context.includeBodies 读资料页，未完整提供的按 ID 分页补读；已读且未变化的无需重读。可批量提交；引用用真实 ID，可选关系字段用 null 清除。AI 生成或补齐主体／伏笔说明用 book_generate_assets；整书不能在这里新建或填写它们。',
+          '普通范围任务仅提交已登记的大纲或章节目录，不接受章节正文或主体／伏笔更新。正文定点用 book_patch_chapter；资料短文用 book_patch_asset；受限同步和开放式更新按各自登记用 book_generate_assets(update)。本轮已登记整书范围时，先用 book_get_context.novelGoal 激活目标；如需修改既有资料，显式用 book_get_context.includeBodies 读资料页，未完整提供的按 ID 分页补读；已读且未变化的无需重读。可批量提交；引用用真实 ID，可选关系字段用 null 清除。AI 生成或补齐主体／伏笔说明用 book_generate_assets；整书不能在这里新建或填写它们。',
         schema: object({
           operations: {
             type: 'array',
@@ -2635,7 +2727,7 @@ export class NovelTools {
       {
         name: 'book_generate_assets',
         description:
-          '生成或补齐一小批同类主体／伏笔的 Markdown 说明，适用于整书和单独任务。create 的新主体使用 targets:[{id, fields:{name,kind}, relatedSubjectIds}]，新伏笔使用 targets:[{id, fields:{title,subjectIds,setupChapterId,payoffChapterId}}]；不要混用两类 fields。fill 只补空或占位。关联增补后的 pendingSync 用 update，只传相应 ID，按实际片段同步。普通 update 用于明确授权的开放式说明更新，不接受只待办或定点登记；已定位的短文用 book_patch_asset。已有字段在 fill/update 时保留。用真实章节和主体 ID，不在参数里写说明正文。',
+          '生成或补齐一小批同类主体／伏笔的 Markdown 说明，适用于整书和单独任务。create 的新主体使用 targets:[{id, fields:{name,kind}, relatedSubjectIds}]，新伏笔使用 targets:[{id, fields:{title,subjectIds,setupChapterId,payoffChapterId}}]；不要混用两类 fields。fill 只补空或占位。本轮新建资料的 pendingSync 先按实际片段单独登记 subject.sync／clue.sync，再用 update，只传对应 ID。同步和开放式更新不混批；普通 update 只用于明确授权的开放式说明更新。只待办不写，短文精确替换用 book_patch_asset。已有字段在 fill/update 时保留。用真实章节和主体 ID，不在参数里写说明正文。',
         schema: object(
           {
             kind: { type: 'string', enum: ['subject', 'clue'] },

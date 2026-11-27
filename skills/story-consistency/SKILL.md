@@ -4,6 +4,9 @@ description: 维护主体、伏笔、全书大纲之间的显式与剧情关联�
 ---
 
 - 作品文件是事实来源。用 `book_get_context` 读取大纲、现有人物/物品/场景和伏笔；先用目录或 `book_search_text` 定位真实 ID，再按当前修订定向回读实际所需原文，不依赖旧聊天；没有变更不重复扫全书。
+- 作者允许且确实选择新增章节时，先单独登记 `chapter.catalog` 并用 `book_apply_changes` 提交目录；文档存在后再登记 `chapter.draft` 和生成正文。待建章的正文登记应按工具反馈重走顺序，不要求作者手动建章，也不因允许而强制建章。
+- 已有章增加过渡或线索用 `chapter.insert` 和当前版本锚点；只有确需修改作者授权的已存短文才用 `chapter.patch` 并保留原审校。失败后不换工具扩大权限，不用整章覆盖或原样重试。
+- 对本轮新建且确有已提交关联场景的资料，先根据该场景提交和当前修订单独登记 `subject.sync`／`clue.sync`，经现有范围核对后用 `book_generate_assets(action=update)` 按 ID 同步相关状态与被取代的计划。短文精确替换仍用 `assetPatch` 与 `book_patch_asset`；精确补丁、只待办、旧资料更新及开放式更新均不代替受限同步。
 - 修改主体或伏笔时检查它在大纲中的安排，并检查关联主体、伏笔和章节。改大纲时反向检查受影响的主体和伏笔。需要完整资料时显式传 `includeBodies: true` 读取资料页；未包含全文的文档按 ID 和返回的 `nextOffset`／`revision` 继续读取。
 - 不要全书重写。区分明确引用与自由文本中的剧情事实。沿用稳定 ID；新关联采用 `[显示名称](subjects/id.md)`、`foreshadowing/id.md`、`chapters/id.md`，章节/伏笔的结构化关系使用现有 ID。
 - AI 新建、补齐或更新主体／伏笔说明用 `book_generate_assets`，明确目标 ID 与动作，不从工具安排推断对现稿的授权。已有说明默认保留；若只是补指定说明，不触碰章节正文字节。

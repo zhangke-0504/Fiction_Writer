@@ -399,6 +399,22 @@ test('loading a whole-book guide cannot turn adding chapter eleven into a whole-
       case 'wrong-goal':
         expect(result).toMatchObject({ ok: false, reason: 'invalid_options' });
         return enroll(
+          'early-draft-scope',
+          { operation: 'chapter.catalog', id: chapter(11).id, purpose: '建立第十一章目录' },
+          { operation: 'chapter.draft', id: chapter(11).id, purpose: '过早登记第十一章正文' },
+        );
+      case 'early-draft-scope':
+        expect(result).toMatchObject({
+          ok: false,
+          reason: 'missing',
+          error: expect.stringMatching(/ch-11.*chapter\.catalog.*book_apply_changes.*chapter\.draft/u),
+        });
+        return use('early-catalog', 'book_apply_changes', {
+          operations: [{ ...chapter(11), action: 'create', fields: { title: '第十一章', order: 11 } }],
+        });
+      case 'early-catalog':
+        expect(result).toMatchObject({ ok: false, reason: 'invalid_options' });
+        return enroll(
           'local-scope',
           { operation: 'chapter.catalog', id: chapter(11).id, purpose: '建立第十一章目录' },
           { operation: 'outline.write', id: outline.id, purpose: '补充第十一章大纲' },
@@ -456,7 +472,16 @@ test('loading a whole-book guide cannot turn adding chapter eleven into a whole-
     ).toEqual(old.filter(({ id }) => id !== outline.id));
     expect((await api.read(chapter(11))).body).toBe(generated);
     expect((await api.read(outline)).body).toContain('<!-- chapter:ch-11 -->');
-    const receipts = (await api.receipts(result)).filter(({ commitCount }) => commitCount);
+    const allReceipts = await api.receipts(result);
+    expect(allReceipts.find((row) => row.callRef === callRef('early-draft-scope'))).toMatchObject({
+      reason: 'missing',
+      commitCount: 0,
+    });
+    expect(allReceipts.find((row) => row.callRef === callRef('early-catalog'))).toMatchObject({
+      reason: 'invalid_options',
+      commitCount: 0,
+    });
+    const receipts = allReceipts.filter(({ commitCount }) => commitCount);
     expect(receipts.map(({ tool, commitCount }) => [tool, commitCount])).toEqual([
       ['book_apply_changes', 2],
       ['book_generate_chapter', 1],
