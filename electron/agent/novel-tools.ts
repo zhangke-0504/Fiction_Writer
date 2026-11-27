@@ -10,7 +10,14 @@ import type {
   WriteReport,
 } from '../../shared/contracts.js';
 import type { WorkspaceService, Guard } from '../workspace.js';
-import { chapterPlacementFingerprint, digest, docKey, isId, renderDocument } from '../documents.js';
+import {
+  chapterPlacementFingerprint,
+  digest,
+  docKey,
+  isId,
+  renderDocument,
+  storyLinks,
+} from '../documents.js';
 import { draftChapter, DraftCommitFailure, InsertionQualityFailure } from './draft.js';
 import type { ChapterPlan } from './chapter-boundary.js';
 import {
@@ -640,14 +647,7 @@ export class NovelTools {
         }
         if (operation === 'outline.write' || operation === 'chapter.catalog') {
           // The existing outline writer validates references against current, read revisions.
-          const basis =
-            operation === 'outline.write'
-              ? docs.find(
-                  (entry) => ['outline', 'subject', 'clue'].includes(entry.type) && unread(entry),
-                )
-              : doc && unread(doc)
-                ? doc
-                : undefined;
+          const basis = doc && unread(doc) ? doc : undefined;
           if (basis) {
             readDoc(docKey(basis));
             continue;
@@ -831,14 +831,9 @@ export class NovelTools {
           );
         });
     }
-    const outlineBasis = needsOutline
-      ? docs.filter(
-          (doc) =>
-            ['outline', 'subject', 'clue'].includes(doc.type) &&
-            reads.readSet.get(docKey(doc))?.revision !== doc.revision,
-        )
-      : [];
-    if (needsOutline && !outlineBasis.length) {
+    const unreadOutline =
+      needsOutline && outline && reads.readSet.get(docKey(outline))?.revision !== outline.revision;
+    if (needsOutline && !unreadOutline) {
       add('book_apply_changes', '只提交一份完整且简短的大纲，不覆写已有正文或大纲', (a) => {
         const op = Array.isArray(a.operations) && a.operations.length === 1 && asRecord(a.operations[0]);
         return (
@@ -869,7 +864,7 @@ export class NovelTools {
       !check.missingAssetRefs.some((d) => d.type === 'clue')
     )
       offerAsset('clue', undefined, 'create');
-    if (check.ready && check.firstUnwritten && !this.chapterFailures.has(check.firstUnwritten)) {
+    if (check.catalogReady && check.firstUnwritten && !this.chapterFailures.has(check.firstUnwritten)) {
       add(
         'book_generate_chapter',
         `仅写下一空白章 ${check.firstUnwritten}`,
@@ -877,7 +872,7 @@ export class NovelTools {
       );
       readDoc(`chapter/${check.firstUnwritten}`);
     }
-    for (const d of outlineBasis) readDoc(docKey(d));
+    if (unreadOutline) readDoc(docKey(outline));
     return plan(status);
   };
   private documentReadKey(doc: Guard, offset: number) {
@@ -1920,7 +1915,19 @@ export class NovelTools {
     const { documents } = before;
     const existing = new Map(documents.map((doc) => [docKey(doc), doc]));
     const guards: Guard[] = [];
-    if (operations.some((m) => m.type !== 'chapter' || m.action === 'delete')) {
+    const outlineAndCatalog = operations.every(
+      (op) => op.action !== 'delete' && (op.type === 'outline' || op.type === 'chapter'),
+    );
+    if (outlineAndCatalog) {
+      const linked = operations.flatMap((op) =>
+        op.type === 'outline' ? storyLinks(op.body ?? '') : [],
+      );
+      // Guard delivered source revisions cited by the candidate, not unread or unrelated cards.
+      for (const ref of new Map(linked.map(({ ref }) => [docKey(ref), ref])).values()) {
+        const read = this.reads.sourceReads.get(docKey(ref));
+        if (read) guards.push({ ...ref, revision: read.revision });
+      }
+    } else if (operations.some((m) => m.type !== 'chapter' || m.action === 'delete')) {
       const unread: DocRef[] = [];
       for (const doc of documents) {
         if (!['outline', 'subject', 'clue'].includes(doc.type)) continue;
@@ -1931,7 +1938,7 @@ export class NovelTools {
       if (unread.length)
         throw new ToolFailure(
           'context_required',
-          `请先用 book_get_context 读取大纲及相关故事资产：有 ${unread.length} 项未读或已变化。不要用 index 代替全文；用 includeBodies: true 显式读取资料页并翻页，或按返回的 ID 读。`,
+          `请先用 book_get_context 读取大纲及相关故事资产：有 ${unread.length} 项未读或已变化。不要用 index 代替全文；用 includeBodies: true 显式读取资料页并翻页，或按返回的 ID 读取。`,
           { unread: unread.slice(0, 25), remaining: Math.max(0, unread.length - 25) },
         );
     }
@@ -2002,6 +2009,7 @@ export class NovelTools {
   ): WritingIntent {
     return {
       author,
+      currentAuthor: this.input.authorPrompt ?? this.input.scope?.currentAuthor,
       continued: this.inheritedDirections,
       confirmed,
       arrangement,
@@ -2470,7 +2478,7 @@ export class NovelTools {
         chapterId,
         mode,
         this.writingIntent(
-          scoped?.purpose ?? direction,
+          [scoped?.purpose, direction].filter(Boolean).join('\n'),
           editPassage?.note ??
             (entryStage === 'setup'
               ? '此处只在正文留下场景安排中的可观察迹象，不提前揭示身份、安排实际登场或回收伏笔。'
@@ -2688,7 +2696,7 @@ export class NovelTools {
       {
         name: 'book_apply_changes',
         description:
-          '普通范围任务仅提交已登记的大纲或章节目录，不接受章节正文或主体／伏笔更新。正文定点用 book_patch_chapter；资料短文用 book_patch_asset；受限同步和开放式更新按各自登记用 book_generate_assets(update)。本轮已登记整书范围时，先用 book_get_context.novelGoal 激活目标；如需修改既有资料，显式用 book_get_context.includeBodies 读资料页，未完整提供的按 ID 分页补读；已读且未变化的无需重读。可批量提交；引用用真实 ID，可选关系字段用 null 清除。AI 生成或补齐主体／伏笔说明用 book_generate_assets；整书不能在这里新建或填写它们。',
+          '提交已登记的大纲和章节目录，不接受章节正文。独立写大纲：先读取目标当前版，再按需取用主体、伏笔和前文，不必扫读全书；用真实 Markdown 链接标明采用的来源。可与已登记目录同批提交；可选关系字段用 null 清除。整书范围先激活目标；已有资料的说明走 book_generate_assets(update) 或 book_patch_asset，不在这里生成或改写。按实际提交结果汇报。',
         schema: object({
           operations: {
             type: 'array',
@@ -2727,7 +2735,7 @@ export class NovelTools {
       {
         name: 'book_generate_assets',
         description:
-          '生成或补齐一小批同类主体／伏笔的 Markdown 说明，适用于整书和单独任务。create 的新主体使用 targets:[{id, fields:{name,kind}, relatedSubjectIds}]，新伏笔使用 targets:[{id, fields:{title,subjectIds,setupChapterId,payoffChapterId}}]；不要混用两类 fields。fill 只补空或占位。本轮新建资料的 pendingSync 先按实际片段单独登记 subject.sync／clue.sync，再用 update，只传对应 ID。同步和开放式更新不混批；普通 update 只用于明确授权的开放式说明更新。只待办不写，短文精确替换用 book_patch_asset。已有字段在 fill/update 时保留。用真实章节和主体 ID，不在参数里写说明正文。',
+          '独立生成或补齐一小批同类主体／伏笔说明，每个目标按自己的关联取材；缺少其他资料不必先补。create 主体传 fields:{name,kind}，可传 relatedSubjectIds；伏笔传 fields:{title}，按需加 subjectIds 与真实埋设／回收章 ID。未排期就省略，不建占位章。fill 只补空说明，保留字段。开放式 update 和已登记的 subject.sync／clue.sync 分开调用；同步只传对应 ID；资料定点用 book_patch_asset。不要在参数里写正文，按已提交回执汇报。',
         schema: object(
           {
             kind: { type: 'string', enum: ['subject', 'clue'] },
@@ -2852,7 +2860,7 @@ export class NovelTools {
       {
         name: 'book_generate_chapter',
         description:
-          '流式生成空白章、续写、明确重写或在旧章锚点只插入新段落。insert 在旧章补写场景，先读该章拿版本和唯一短原文。已有角色和伏笔可直接按 ID 引用，无需新建资料或改目录。若需要更新本章大纲才附局部增补，已有相关安排时不用重复加。正常插入成功可返回 insertionRef，只有本轮凭该回执可请求清理新增片段的确定回声。用 subjectIds / clueIds 指定内容依赖。若没有已写过渡且后章已有正文，提供 nextBoundary。整书先用 novelGoal.register/resume 激活完整目标，再按序 draft 空白章；独立单章不需要整书目标。replace 需本轮明确授权。',
+          '每次流式生成一章。独立 draft 只需已保存的目标目录，可复用相关大纲、前文、主体和阶段可见的伏笔；subjectIds / clueIds 是选材线索，不是必需项。仅当前作者明确要求的证据不可用才因缺料停止。依次生成多章，下一章复用实际提交的前文。insert 先读目标版本与唯一原文锚点，可按需附本章大纲增补；成功后可凭 insertionRef 请求清理新增段回声。后接章已有正文时保留 nextBoundary；replace 仍需明确授权。整书先激活目标，再顺序写空白章。',
         schema: object(
           {
             chapterId: idSchema,
@@ -2883,14 +2891,14 @@ export class NovelTools {
               maxItems: 32,
               uniqueItems: true,
               items: idSchema,
-              description: '本章明确需要的主体 ID',
+              description: '有助本章取材的真实主体 ID（可选）',
             },
             clueIds: {
               type: 'array',
               maxItems: 32,
               uniqueItems: true,
               items: idSchema,
-              description: '本章明确需要的伏笔 ID；用已有埋设／回收位置决定可见信息',
+              description: '有助本章取材的真实伏笔 ID（可选）；按目标章限制披露',
             },
             nextBoundary: object({
               chapterId: idSchema,

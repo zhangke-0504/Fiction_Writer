@@ -3,9 +3,9 @@ import type { DocRef, Manuscript } from '../../shared/contracts.js';
 import { docKey, isId, storyLinks } from '../documents.js';
 import type { BookRecall } from './book-memory.js';
 import { storyVisibility } from './story-visibility.js';
+import { explicitlyRequiresEvidence, mentionsSource } from './writing-evidence.js';
 import { activeCluePhase, nextChapterBoundary, type ChapterPlan } from './chapter-boundary.js';
 import {
-  clueSections,
   hasStoryDescription,
   noteExcerpt,
   noteSections,
@@ -164,6 +164,7 @@ export function chapterContext(
     plan?: ChapterPlan;
     mode?: ChapterAction;
     direction?: string;
+    author?: string;
     insertion?: { offset: number; outlineAddition?: string };
   } = {},
 ) {
@@ -174,12 +175,36 @@ export function chapterContext(
   const prior = chapters.slice(0, index).filter((doc) => doc.body.trim());
   const successor = chapters.slice(index + 1).find((doc) => doc.body.trim());
   const clues = documents.filter((doc) => doc.type === 'clue');
-  const discover = chapterAssetRequirements(documents);
-  const refs = discover(target, plan);
-  const direct = discover(target, plan, false);
-  const required = new Set(refs.map(docKey));
+  const byKey = new Map(documents.map((doc) => [docKey(doc), doc]));
+  const outline = documents.find((doc) => doc.type === 'outline');
+  const spans = markedSpans(outline?.body ?? '');
+  const planned = chapterOutline(spans, target);
+  // An outline written before the catalog may not contain chapter markers yet.
+  const openingPlan =
+    !spans.some(({ type }) => type) && outline ? noteExcerpt(outline.body, 0, 2400) : undefined;
   const visibility = storyVisibility(clues, chapters, target);
   const { safe, visible } = visibility;
+  const direction = [
+    options.author,
+    options.direction,
+    target.body,
+    prior.at(-1)?.body.slice(-2400),
+    ...planned.map(({ text }) => text),
+    openingPlan?.text,
+  ]
+    .filter(Boolean)
+    .join('\n');
+  const cues = visible(direction).normalize('NFKC').toLowerCase();
+  const assetDocs = documents.filter((doc) => doc.type === 'subject' || doc.type === 'clue');
+  const isRequired = (ref: DocRef) =>
+    explicitlyRequiresEvidence(options.author, ref, byKey.get(docKey(ref)));
+  const direct = new Map<string, DocRef>();
+  const add = ({ type, id }: DocRef) => direct.set(docKey({ type, id }), { type, id });
+  chapterAssetRequirements(documents)(target, plan, false).forEach(add);
+  if (options.author) assetLinks(options.author).forEach(add);
+  if (openingPlan) assetLinks(visible(openingPlan.text)).forEach(add);
+  for (const doc of assetDocs) if (isRequired(doc) || mentionsSource(cues, storyLabel(doc))) add(doc);
+  const refs = [...direct.values()];
   const chapterSpans = new Map<string, NoteExcerpt[]>();
   const chapterRange = (doc: Manuscript, from: number, to: number, focus?: [number, number]) => {
     let spans = chapterSpans.get(doc.id);
@@ -197,7 +222,6 @@ export function chapterContext(
   };
   const missing: WritingIssue[] = [];
   const material: WritingBlock[] = [];
-  const byKey = new Map(documents.map((doc) => [docKey(doc), doc]));
   const safeTitle = (doc: Manuscript) => (safe(storyLabel(doc)) ? storyLabel(doc) : doc.id);
   const titleBody = visible(target.body);
   const targetValue: Target = {
@@ -222,7 +246,15 @@ export function chapterContext(
   const boundary = nextChapterBoundary(
     successor,
     documents,
-    refs,
+    refs.flatMap((ref) => [
+      ref,
+      ...(ref.type === 'clue'
+        ? (byKey.get(docKey(ref))?.fields.subjectIds ?? []).map((id): DocRef => ({
+            type: 'subject',
+            id,
+          }))
+        : []),
+    ]),
     plan,
     options.direction ?? '',
     options.mode !== undefined &&
@@ -242,13 +274,16 @@ export function chapterContext(
       },
       sources: [source(book, [0, Math.min(book.body.length, 4000)])],
     });
-  const outline = documents.find((doc) => doc.type === 'outline');
-  for (const span of chapterOutline(markedSpans(outline?.body ?? ''), target)) {
+  for (const span of openingPlan ? [openingPlan] : planned) {
     const text = visible(span.text);
     if (outline && text)
       material.push({
         group: 'outline',
-        value: { text, source: source(outline, span.range), status: '本章计划' },
+        value: {
+          text,
+          source: source(outline, span.range),
+          status: openingPlan ? '作品大纲（计划）' : '本章计划',
+        },
         sources: [source(outline, span.range)],
       });
   }
@@ -291,10 +326,20 @@ export function chapterContext(
       },
     } satisfies WritingBlock;
   };
+  const requestsPayoff = (ref: DocRef, doc: Manuscript) =>
+    ref.type === 'clue' &&
+    !!options.author
+      ?.split(/[，,。；;！!？?\n]/u)
+      .some(
+        (clause) =>
+          /回收|揭晓|揭露|揭示|\b(?:payoff|pay off|reveal)\b/iu.test(clause) &&
+          explicitlyRequiresEvidence(clause, ref, doc),
+      );
   const clueBlock = (doc: Manuscript, must: boolean) => {
     const phase = activeCluePhase(doc, chapters, target);
     if (
       phase.ambiguous ||
+      (must && !phase.revealAllowed && requestsPayoff(doc, doc)) ||
       (doc.fields.setupChapterId && !phase.setup) ||
       (doc.fields.payoffChapterId && !phase.payoff) ||
       (phase.setup && phase.payoff && chapterOrder(phase.setup) > chapterOrder(phase.payoff))
@@ -337,8 +382,16 @@ export function chapterContext(
         : ('visible' as const);
   const issueFor = (ref: DocRef, doc?: Manuscript): WritingIssue => {
     if (!doc) return { kind: 'missing_asset', ref, chapterId: target.id };
-    const part = partFor(doc);
     const phase = doc.type === 'clue' ? activeCluePhase(doc, chapters, target) : undefined;
+    if (phase && !phase.revealAllowed && requestsPayoff(ref, doc))
+      return {
+        kind: 'no_visible_evidence',
+        ref,
+        chapterId: target.id,
+        part: 'reveal',
+        revision: doc.revision,
+      };
+    const part = partFor(doc);
     const invalid =
       phase &&
       (phase.ambiguous ||
@@ -360,17 +413,24 @@ export function chapterContext(
     };
   };
   const subjectRefs = new Map(
-    direct.filter(({ type }) => type === 'subject').map((ref) => [docKey(ref), ref]),
+    refs.filter(({ type }) => type === 'subject').map((ref) => [docKey(ref), ref]),
   );
-  for (const ref of direct.filter(({ type }) => type === 'clue')) {
+  const takeClue = (ref: DocRef) => {
     const doc = byKey.get(docKey(ref));
-    const block = doc && clueBlock(doc, true);
-    if (!doc || !block) missing.push(issueFor(ref, doc));
-    else {
-      material.push(block);
-      for (const id of doc.fields.subjectIds ?? [])
-        subjectRefs.set(`subject/${id}`, { type: 'subject', id });
+    const must = isRequired(ref);
+    const block = doc && clueBlock(doc, must);
+    if (!doc || !block) {
+      if (must) missing.push(issueFor(ref, doc));
+      return;
     }
+    material.push(block);
+    for (const id of doc.fields.subjectIds ?? [])
+      subjectRefs.set(`subject/${id}`, { type: 'subject', id });
+  };
+  for (const ref of refs) if (ref.type === 'clue') takeClue(ref);
+  for (const doc of clues.filter((entry) => !direct.has(docKey(entry))).slice(0, 16)) {
+    const phase = activeCluePhase(doc, chapters, target);
+    if (phase.setup && chapterOrder(phase.setup) <= chapterOrder(target) && phase.hidden) takeClue(doc);
   }
   if (options.insertion) {
     // A single hop through the new character's declared stable relationships keeps its linked actors in the actual scene prompt.
@@ -383,10 +443,11 @@ export function chapterContext(
     }
   }
   for (const ref of subjectRefs.values()) {
+    const must = isRequired(ref);
     const doc = byKey.get(docKey(ref));
-    const block = doc && subjectBlock(doc, true);
+    const block = doc && subjectBlock(doc, must);
     if (block) material.push(block);
-    else missing.push(issueFor(ref, doc));
+    else if (must) missing.push(issueFor(ref, doc));
   }
   if (missing.length) {
     const issues = missing.slice(0, 12);
@@ -435,18 +496,6 @@ export function chapterContext(
       sources: [source(doc, row.abridged ? undefined : [0, doc.body.length])],
       required: i === prior.length - 1,
     });
-  }
-  for (const doc of documents
-    .filter((entry) => entry.type === 'subject' && !required.has(docKey(entry)))
-    .slice(0, 25)) {
-    const block = subjectBlock(doc, false);
-    if (block) material.push(block);
-  }
-  for (const doc of clues.filter((entry) => !required.has(docKey(entry))).slice(0, 16)) {
-    const phase = activeCluePhase(doc, chapters, target);
-    if (!phase.setup || chapterOrder(phase.setup) > chapterOrder(target) || !phase.hidden) continue;
-    const block = clueBlock(doc, false);
-    if (block) material.push(block);
   }
   return {
     blocks: material,

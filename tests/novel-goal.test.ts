@@ -414,39 +414,43 @@ test('the same whole-book Run can fill a required note and retry the blocked cha
   );
   const draft = (id: string) =>
     tool(id, 'book_generate_chapter', { mode: 'draft', chapterId: 'three', subjectIds: [subject.id] });
-  const result = await run(f, '写3章完整小说，保留旧稿并补领航员的说明', [
-    enroll(f.id),
-    activate,
-    () => goal('register', chapterIds),
-    () => draft('missing-note'),
-    ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /context_required.*navigator/s);
-      return tool('fill-note', 'book_generate_assets', {
-        kind: 'subject',
-        action: 'fill',
-        targets: [{ id: subject.id }],
-      });
-    },
-    () =>
-      tool('candidate', 'submit_story_descriptions', {
-        items: [{ id: subject.id, body: '## 稳定设定\n潮差超过两尺时不离港。CONTINUITY_FIXTURE' }],
-      }),
-    ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /"ok":true/);
-      assert.doesNotMatch(JSON.stringify(history.at(-1)), /CONTINUITY_FIXTURE/);
-      return draft('after-fill');
-    },
-    ({ history, tools }) => {
-      assert.deepEqual(tools, []);
-      assert.match(JSON.stringify(history), /CONTINUITY_FIXTURE/);
-      return text('等潮水平缓下来，他们才驶出海湾。');
-    },
-    () => goal('check'),
-    ({ history }) => {
-      assert.match(JSON.stringify(history.at(-1)), /"complete":true/);
-      return text('完成。');
-    },
-  ]);
+  const result = await run(
+    f,
+    '写三章完整小说，保留旧稿并补领航员的说明；必须按领航员已保存的设定写，不要自创。',
+    [
+      enroll(f.id),
+      activate,
+      () => goal('register', chapterIds),
+      () => draft('missing-note'),
+      ({ history }) => {
+        assert.match(JSON.stringify(history.at(-1)), /context_required.*navigator/s);
+        return tool('fill-note', 'book_generate_assets', {
+          kind: 'subject',
+          action: 'fill',
+          targets: [{ id: subject.id }],
+        });
+      },
+      () =>
+        tool('candidate', 'submit_story_descriptions', {
+          items: [{ id: subject.id, body: '## 稳定设定\n潮差超过两尺时不离港。CONTINUITY_FIXTURE' }],
+        }),
+      ({ history }) => {
+        assert.match(JSON.stringify(history.at(-1)), /"ok":true/);
+        assert.doesNotMatch(JSON.stringify(history.at(-1)), /CONTINUITY_FIXTURE/);
+        return draft('after-fill');
+      },
+      ({ history, tools }) => {
+        assert.deepEqual(tools, []);
+        assert.match(JSON.stringify(history), /CONTINUITY_FIXTURE/);
+        return text('等潮水平缓下来，他们才驶出海湾。');
+      },
+      () => goal('check'),
+      ({ history }) => {
+        assert.match(JSON.stringify(history.at(-1)), /"complete":true/);
+        return text('完成。');
+      },
+    ],
+  );
   assert.equal(result.status, 'completed', result.error);
   assert.equal(
     (await f.workspace.readDocument(f.id, { type: 'chapter', id: 'one' })).body,
@@ -511,5 +515,68 @@ test('an interrupted goal resumes from the saved opening cards without rewriting
   assert.deepEqual(
     (await f.workspace.readAll(f.id)).documents.filter((d) => d.type === 'clue' || d.type === 'subject'),
     initial,
+  );
+});
+
+test('whole-book completion waits for anchors but generation may save an unscheduled clue', async (t) => {
+  const f = await fixture(t, 3);
+  const ref = { type: 'clue', id: 'unbound-note' } as const;
+  const body = '## 可见线索\n船员看见船舱封条缺了一角。\n\n## 回收真相\n缺角是船医留下的路标。\n';
+  const result = await run(f, '完成这部三章小说，保留旧稿，新增一条船舱封条的伏笔并补排期。', [
+    enroll(f.id),
+    activate,
+    () => goal('register', chapterIds),
+    () =>
+      tool('create-clue', 'book_generate_assets', {
+        kind: 'clue',
+        action: 'create',
+        targets: [{ id: ref.id, fields: { title: '船舱封条' } }],
+      }),
+    ({ tools }) => {
+      assert.equal(tools[0]?.name, 'submit_story_descriptions');
+      return tool('candidate', 'submit_story_descriptions', { items: [{ id: ref.id, body }] });
+    },
+    async ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"ok":true.*unbound-note/s);
+      const saved = await f.workspace.readDocument(f.id, ref);
+      assert.equal(saved.fields.setupChapterId, undefined);
+      assert.equal(saved.fields.payoffChapterId, undefined);
+      return goal('check');
+    },
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"complete":false/);
+      assert.match(
+        JSON.stringify(history.at(-1)),
+        /"missingAssetRefs":\[\{"type":"clue","id":"unbound-note"\}\]/,
+      );
+      return tool('sources', 'book_get_context', { includeBodies: true });
+    },
+    () =>
+      tool('bind', 'book_apply_changes', {
+        operations: [
+          {
+            ...ref,
+            action: 'update',
+            fields: { setupChapterId: 'one', payoffChapterId: 'three' },
+          },
+        ],
+      }),
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"ok":true/);
+      return goal('check');
+    },
+    ({ history }) => {
+      assert.match(JSON.stringify(history.at(-1)), /"complete":true/);
+      return text('已保存并排期。');
+    },
+  ]);
+  assert.equal(result.status, 'completed', result.error);
+  const saved = await f.workspace.readDocument(f.id, ref);
+  assert.equal(saved.body, body);
+  assert.equal(saved.fields.setupChapterId, 'one');
+  assert.equal(saved.fields.payoffChapterId, 'three');
+  assert.equal(
+    (await f.workspace.readDocument(f.id, { type: 'chapter', id: 'one' })).body,
+    '作者原稿 1',
   );
 });

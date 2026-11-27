@@ -462,6 +462,48 @@ for (const ref of [actor, clue]) {
   });
 }
 
+test('an independent outline needs its target and only guards sources it actually references', async (t) => {
+  const f = await fixture(t, defaultBody, true, '只更新大纲');
+  await f.scope.tool(f.documents).execute(
+    {
+      items: [{ operation: 'outline.write', id: outline.id, purpose: '只更新大纲' }],
+    },
+    f.ctx,
+  );
+  const target = await f.ws.readDocument(f.book.id, outline);
+  await f.read(target);
+  const body = '# 独立故事大纲';
+  await f.execute('book_apply_changes', {
+    operations: [{ ...outline, action: 'update', body }],
+  });
+  assert.equal((await f.ws.readDocument(f.book.id, outline)).body, body);
+});
+
+test('an outline guards delivered source revisions without requiring unread links to be read', async (t) => {
+  const f = await fixture(t, defaultBody, true, '只更新大纲');
+  await f.scope
+    .tool(f.documents)
+    .execute({ items: [{ operation: 'outline.write', id: outline.id, purpose: '只更新大纲' }] }, f.ctx);
+  await f.read(await f.ws.readDocument(f.book.id, outline));
+  const body = '# 使用守灯人\n\n[守灯人](subjects/keeper.md)';
+  const write = (candidate: string) =>
+    f.execute('book_apply_changes', {
+      operations: [{ ...outline, action: 'update', body: candidate }],
+    });
+  await write(body);
+  const before = await f.ws.readDocument(f.book.id, outline);
+  assert.equal(before.body, body);
+  const source = await f.load(actor);
+  await f.read(source, 0, 30);
+  assert.equal((await f.save(source, source.body + '\n\nSOURCE_CHANGED_AFTER_READ')).error, undefined);
+  const candidate = body + '\n\n下一步行动。';
+  await assert.rejects(write(candidate), failure('conflict'));
+  assert.deepEqual(await f.ws.readDocument(f.book.id, outline), before);
+  await f.read(await f.load(actor), 0, 30);
+  await write(candidate);
+  assert.equal((await f.ws.readDocument(f.book.id, outline)).body, candidate);
+});
+
 test('a precise binding cannot authorize other anchors, replacements, owners, generic routes or recovery writes', async (t) => {
   const f = await fixture(t);
   const doc = await f.load();

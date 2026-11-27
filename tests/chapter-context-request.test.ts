@@ -107,7 +107,7 @@ async function fixture(
   const start = (
     chapterId: string,
     script: Script[],
-    opts: { plan?: ChapterPlan; inputBudget?: number; direction?: string } = {},
+    opts: { plan?: ChapterPlan; inputBudget?: number; direction?: string; author?: string } = {},
   ) => {
     const { provider, requests } = captureWritingRequests(script, opts.inputBudget);
     const trace = collectDiagnostics();
@@ -121,7 +121,10 @@ async function fixture(
           provider,
           chapterId,
           'draft',
-          { author: '写这一章，不改其它章。', arrangement: opts.direction },
+          {
+            author: opts.author ?? '写这一章，不改其它章。',
+            arrangement: opts.direction,
+          },
           { plan: opts.plan },
         );
       },
@@ -183,7 +186,10 @@ for (const legacy of [false, true])
 test('an empty or too large mandatory subject fails before dispatch', async (t) => {
   for (const initialNote of ['待补', '必要设定 ' + '甲'.repeat(6000)]) {
     const f = await fixture(t, { initialNote });
-    const op = f.start('setup', [], { inputBudget: 3000 });
+    const op = f.start('setup', [], {
+      inputBudget: 3000,
+      author: '根据罗蓝的设定写本章',
+    });
     const result = await op.wait();
     assert.equal(result.status, 'failed');
     assert.match(result.error!, /subject\/luo/);
@@ -286,8 +292,9 @@ test('diagnostics account for actually admitted blocks, omit raw content, and ne
   const groups = success.trace.rows.filter(({ event }) => event === 'writing.context.group');
   assert.ok(groups.every(({ fields }) => fields.spanId === summary?.fields.spanId));
   const subjects = groups.find(({ fields }) => fields.group === 'subject');
-  assert.equal(subjects?.fields.includedRequired, 2);
-  assert.equal(subjects?.fields.omittedOptional, 1);
+  assert.equal(subjects?.fields.includedRequired, 0);
+  assert.equal(subjects?.fields.omittedOptional, 0);
+  assert.equal(subjects?.fields.includedOptional, 2);
   const provenance = success.trace.rows.filter(
     ({ event, fields }) => event === 'writing.context.source' && fields.group === 'subject',
   );
@@ -303,15 +310,13 @@ test('diagnostics account for actually admitted blocks, omit raw content, and ne
     /REQUIRED_GLOVE_RULE|OPTIONAL_DETAIL|ANSWER_AFTER_FIFTH_CHAPTER|不进入日志的隐私内容|subject\/luo/,
   );
   assert.deepEqual(success.trace.rejected, []);
-  const blocked = f.start('payoff', [], { plan: { subjectIds: ['unrelated-empty'] } });
-  assert.equal((await blocked.wait()).status, 'failed');
-  assert.equal(blocked.requests.length, 0);
-  assert.equal(
-    blocked.trace.rows.find(({ event }) => event === 'writing.context.blocked')?.fields.reason,
-    'context_required',
-  );
-  assert.ok(blocked.trace.rows.every(({ event }) => event !== 'writing.context.dispatched'));
-  assert.deepEqual(blocked.trace.rejected, []);
+  const optional = f.start('payoff', [() => checkText('她接过信封。')], {
+    plan: { subjectIds: ['unrelated-empty'] },
+  });
+  assert.equal((await optional.wait()).status, 'completed');
+  assert.equal(optional.requests.length, 1);
+  assert.ok(optional.trace.rows.some(({ event }) => event === 'writing.context.dispatched'));
+  assert.deepEqual(optional.trace.rejected, []);
 });
 
 test('chapter state notes require saved evidence, and nested reveal headings are not treated as surface text', async (t) => {
@@ -390,24 +395,20 @@ test('a saved card remains ready when a later reveal repeats common words and a 
   assert.equal(reveal.status, 'completed', reveal.error);
 });
 
-test('readiness distinguishes existing-but-private notes and does not blame dependencies of a blocked clue', async (t) => {
+test('private or malformed automatically discovered notes are optional, but explicit use remains required', async (t) => {
   const f = await fixture(t, {
     initialNote: '## 稳定设定\n\n<!-- reveal:seal -->\n这段是带阶段的既有说明。',
   });
   const view = await f.workspace.readAll(f.bookId);
   const doc = view.documents.find(({ id }) => id === 'setup')!;
-  assert.throws(
-    () => chapterContext(view.documents, doc),
-    (error) => {
-      assert.ok(error instanceof WritingContextFailure);
-      assert.deepEqual(
-        error.issues.map((issue) => issue.kind),
-        ['no_visible_evidence'],
-      );
-      assert.doesNotMatch(writingIssueDetails(error).issues[0].next, /用 fill/);
-      return true;
-    },
+  const optional = chapterContext(view.documents, doc);
+  assert.ok(
+    !optional.blocks.some(
+      ({ group, value }) => group === 'subject' && JSON.stringify(value).includes('PRIVATE_AT_SETUP'),
+    ),
   );
+  assert.ok(optional.blocks.some(({ group }) => group === 'clue'));
+
   const clue = view.documents.find(({ id }) => id === 'seal')!;
   const edited = view.documents.map((d) =>
     d === clue
@@ -420,8 +421,13 @@ test('readiness distinguishes existing-but-private notes and does not blame depe
         ? { ...d, body: note }
         : d,
   );
+  const optionalMalformed = chapterContext(edited, doc);
+  assert.ok(!optionalMalformed.blocks.some(({ group }) => group === 'clue'));
   assert.throws(
-    () => chapterContext(edited, doc),
+    () =>
+      chapterContext(edited, doc, undefined, {
+        author: '必须使用 seal 伏笔的信息写本章。',
+      }),
     (error) => {
       assert.ok(error instanceof WritingContextFailure);
       assert.deepEqual(
@@ -433,28 +439,83 @@ test('readiness distinguishes existing-but-private notes and does not blame depe
   );
 });
 
-test('nonempty private sources and empty sources are logged separately without their prose', async (t) => {
-  const f = await fixture(t, { initialNote: '## 稳定设定\n\n<!-- reveal:seal -->\nPRIVATE_AT_SETUP' });
-  const first = f.start('setup', []);
-  await first.wait();
-  const empty = f.start('setup', [], { plan: { subjectIds: ['unrelated-empty'] } });
-  await empty.wait();
+test('private and blank optional sources are omitted without blocking chapter generation', async (t) => {
+  const f = await fixture(t, {
+    initialNote: '## 稳定设定\n\n<!-- reveal:seal -->\nPRIVATE_AT_SETUP',
+  });
+  const first = f.start('setup', [() => checkText('她在柜台前停下。')]);
+  const firstResult = await first.wait();
+  assert.equal(firstResult.status, 'completed', firstResult.error);
+  const firstPayload = JSON.stringify(first.requests[0]?.wire.history ?? []);
+  assert.doesNotMatch(firstPayload, /PRIVATE_AT_SETUP/);
+  assert.match(firstPayload, /VISIBLE_ENVELOPE/);
+
+  const second = await fixture(t);
+  const empty = second.start('setup', [() => checkText('她在柜台前停下。')], {
+    plan: { subjectIds: ['unrelated-empty'] },
+  });
+  const emptyResult = await empty.wait();
+  assert.equal(emptyResult.status, 'completed', emptyResult.error);
   const trace = [...first.trace.rows, ...empty.trace.rows];
-  assert.ok(
-    trace.some(
-      ({ event, fields }) =>
-        event === 'writing.context.issue' &&
-        fields.issueKind === 'no_visible_evidence' &&
-        fields.writingStage === 'selection',
-    ),
-  );
-  assert.ok(
-    trace.some(
-      ({ event, fields }) =>
-        event === 'writing.context.issue' && fields.issueKind === 'empty_description',
-    ),
-  );
-  assert.ok(!trace.some(({ event }) => event === 'writing.context.dispatched'));
+  assert.ok(trace.some(({ event }) => event === 'writing.context.dispatched'));
   assert.doesNotMatch(JSON.stringify(trace), /PRIVATE_AT_SETUP|unrelated-empty/);
   assert.deepEqual([...first.trace.rejected, ...empty.trace.rejected], []);
+});
+
+test('an unrelated constraint and a tool suggestion do not make a blank cast card required', async (t) => {
+  const f = await fixture(t, { initialNote: '待补' });
+  const op = f.start(
+    'setup',
+    [
+      ({ history }) => {
+        assert.doesNotMatch(JSON.stringify(history), /"id"\s*:\s*"luo"/);
+        return checkText('罗蓝在码头停下。');
+      },
+    ],
+    {
+      author: '根据大纲写罗蓝到港口，设定可以参考。',
+      direction: '必须依据罗蓝的设定写。',
+      plan: { subjectIds: ['luo'] },
+    },
+  );
+  const result = await op.wait();
+  assert.equal(result.status, 'completed', result.error);
+  assert.equal(
+    (await f.workspace.readDocument(f.bookId, { type: 'chapter', id: 'setup' })).body,
+    '罗蓝在码头停下。',
+  );
+});
+
+test('only the author, not an optional hint, can make an unripe clue payoff a dependency', async (t) => {
+  const f = await fixture(t);
+  const { documents } = await f.workspace.readAll(f.bookId);
+  const target = documents.find(({ id }) => id === 'setup')!;
+  const plan = { clueIds: ['seal'] };
+  const optional = chapterContext(documents, target, undefined, {
+    plan,
+    author: '写本章，可以参考尾号的去向。',
+    direction: '必须用 seal 伏笔，计划回收。',
+  });
+  assert.match(JSON.stringify(optional.blocks), /VISIBLE_ENVELOPE/);
+  assert.doesNotMatch(JSON.stringify(optional.blocks), /ANSWER_AFTER_FIFTH_CHAPTER/);
+  const withheld = chapterContext(documents, target, undefined, {
+    plan,
+    author: '本章先不回收「尾号的去向」伏笔。',
+  });
+  assert.match(JSON.stringify(withheld.blocks), /VISIBLE_ENVELOPE/);
+  assert.doesNotMatch(JSON.stringify(withheld.blocks), /ANSWER_AFTER_FIFTH_CHAPTER/);
+  assert.throws(
+    () =>
+      chapterContext(documents, target, undefined, {
+        author: '本章回收「尾号的去向」伏笔。',
+      }),
+    (error) => {
+      assert.ok(error instanceof WritingContextFailure);
+      assert.deepEqual(
+        error.issues.map(({ kind, ref, part }) => [kind, ref?.id, part]),
+        [['no_visible_evidence', 'seal', 'reveal']],
+      );
+      return true;
+    },
+  );
 });

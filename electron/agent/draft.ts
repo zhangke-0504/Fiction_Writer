@@ -144,6 +144,7 @@ export async function draftChapter(
     const context = chapterContext(view.documents, doc, undefined, {
       plan: options.plan,
       mode,
+      author: intent.currentAuthor ?? intent.author,
       direction: [intent.author, intent.confirmed, intent.arrangement].filter(Boolean).join('\n'),
       insertion:
         offset === undefined

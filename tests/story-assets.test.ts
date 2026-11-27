@@ -164,6 +164,68 @@ test('a single subject is filled using manuscript evidence without feeding its p
   );
 });
 
+for (const kind of ['subject', 'clue'] as const) {
+  test(`a single new ${kind} reuses related notes, outline and saved prose`, async (t) => {
+    const f = await fixture(t);
+    const outline = await f.workspace.readDocument(f.id, { type: 'outline', id: 'outline' });
+    const saved = await f.workspace.writeChanges(f.id, [
+      { ...outline, expect: outline.revision, body: '[铜铃](subjects/bell.md)需要保管。OUTLINE_SOURCE' },
+      {
+        type: 'clue',
+        id: 'old-clue',
+        expect: null,
+        fields: { title: '旧线索', subjectIds: ['bell'] },
+        body: '## 可见线索\n铜铃出现在归航船上。CLUE_SOURCE\n\n## 回收真相\n归航者报了平安。',
+      },
+      {
+        type: 'subject',
+        id: 'stranger',
+        expect: null,
+        fields: { name: '陌路人', kind: 'character' },
+        body: 'UNRELATED_SETTING',
+      },
+    ]);
+    assert.equal(saved.error, undefined);
+    const ref = { type: kind, id: 'new-target' };
+    const documents = (await f.workspace.readAll(f.id)).documents;
+    const linked =
+      kind === 'subject'
+        ? { fields: { name: '铜铃保管者', kind: 'character' } }
+        : { fields: { title: '铜铃的裂缝', subjectIds: ['bell'] } };
+    const prompt =
+      kind === 'subject' ? '只新增一个与铜铃相关的主体。' : '只新增一条铜铃伏笔，先不排期。';
+    const op = f.start(prompt, [
+      () =>
+        send('book_generate_assets', { kind, action: 'create', targets: [{ id: ref.id, ...linked }] }),
+      (request) => {
+        const wire = JSON.stringify(request.history);
+        for (const marker of ['OUTLINE_SOURCE', 'CLUE_SOURCE', 'BEFORE_GUARD', 'SOURCE_ITEM_SETTING'])
+          assert.ok(wire.includes(marker), marker);
+        for (const source of documents.filter(({ id }) =>
+          ['outline', 'old-clue', 'early', 'bell'].includes(id),
+        ))
+          assert.ok(wire.includes(source.revision), source.id);
+        assert.doesNotMatch(wire, /UNRELATED_SETTING/);
+        return propose(ref.id, kind === 'subject' ? generated : clue);
+      },
+      ({ history }) => {
+        assert.match(JSON.stringify(history.at(-1)), /"ok":true/);
+        return finish();
+      },
+    ]);
+    const outcome = await op.wait();
+    assert.equal(outcome.run?.status, 'completed', outcome.run?.error);
+    const target = await f.workspace.readDocument(f.id, ref);
+    assert.equal(target.body.trim(), kind === 'subject' ? generated : clue);
+    assert.equal(target.fields.setupChapterId, undefined);
+    assert.equal(target.fields.payoffChapterId, undefined);
+    assert.deepEqual(
+      (await f.workspace.readAll(f.id)).documents.filter(({ id }) => id !== ref.id),
+      documents,
+    );
+  });
+}
+
 test('a standalone clue uses subject notes and both current chapter anchors', async (t) => {
   const f = await fixture(t);
   const op = f.start('新增一条铜铃的伏笔', [
@@ -453,3 +515,163 @@ for (const allowed of [true, false]) {
     assert.equal(actual.body, allowed ? revised + '\n' : original.body);
   });
 }
+
+for (const kind of ['subject', 'clue'] as const) {
+  test(`${kind} batch keeps each target's evidence separate and tolerates a blank optional association`, async (t) => {
+    const f = await fixture(t);
+    const outline = await f.workspace.readDocument(f.id, { type: 'outline', id: 'outline' });
+    const outlineBody = [
+      '新船员接替罗蓝。[罗蓝](subjects/keeper.md) BATCH_KEEPER_ONLY',
+      '新匠人接管铜铃。[铜铃](subjects/bell.md) BATCH_BELL_ONLY',
+    ].join('\n\n');
+    assert.equal(
+      (
+        await f.workspace.writeChanges(f.id, [
+          { ...outline, expect: outline.revision, body: outlineBody },
+        ])
+      ).error,
+      undefined,
+    );
+    const targets =
+      kind === 'subject'
+        ? [
+            {
+              id: 'new-keeper',
+              fields: { name: '新船员', kind: 'character' },
+              relatedSubjectIds: ['keeper'],
+            },
+            {
+              id: 'new-bell',
+              fields: { name: '新匠人', kind: 'character' },
+              relatedSubjectIds: ['bell'],
+            },
+          ]
+        : [
+            {
+              id: 'clue-keeper',
+              fields: { title: '罗蓝来信', subjectIds: ['keeper'] },
+            },
+            {
+              id: 'clue-bell',
+              fields: { title: '铜铃的回声', subjectIds: ['bell'] },
+            },
+          ];
+    const results =
+      kind === 'subject'
+        ? [
+            {
+              id: 'new-keeper',
+              body: '## 稳定设定\n罗蓝的接替者。',
+            },
+            {
+              id: 'new-bell',
+              body: '## 稳定设定\n铜铃的新保管者。',
+            },
+          ]
+        : [
+            {
+              id: 'clue-keeper',
+              body: '## 可见线索\n罗蓝留下了一封信。\n\n## 回收真相\n信中写着离开的日期。',
+            },
+            {
+              id: 'clue-bell',
+              body: '## 可见线索\n铜铃发出一声轻响。\n\n## 回收真相\n裂痕记录着上次归还。',
+            },
+          ];
+    const prompt =
+      kind === 'subject'
+        ? '新增两个主体：新船员与罗蓝有关，新匠人与铜铃有关。'
+        : '新增两条伏笔：一条关联罗蓝，一条关联铜铃。';
+    const op = f.start(prompt, [
+      () => send('book_generate_assets', { kind, action: 'create', targets }),
+      (request) => {
+        isolatedRequest(request, 'OUTER_CHAT_ONLY');
+        const history = request.history as { text: string }[];
+        const payload = history[0].text.slice(history[0].text.indexOf('{'));
+        const context = JSON.parse(payload) as { outline: { targetId: string; text: string }[] };
+        const byTarget = new Map(context.outline.map(({ targetId, text }) => [targetId, text]));
+        const firstId = kind === 'subject' ? 'new-keeper' : 'clue-keeper';
+        const secondId = kind === 'subject' ? 'new-bell' : 'clue-bell';
+        assert.match(byTarget.get(firstId) ?? '', /BATCH_KEEPER_ONLY/);
+        assert.doesNotMatch(byTarget.get(firstId) ?? '', /BATCH_BELL_ONLY/);
+        assert.match(byTarget.get(secondId) ?? '', /BATCH_BELL_ONLY/);
+        assert.doesNotMatch(byTarget.get(secondId) ?? '', /BATCH_KEEPER_ONLY/);
+        return send('submit_story_descriptions', { items: results });
+      },
+      () => finish(),
+    ]);
+    const outcome = await op.wait();
+    assert.equal(outcome.run?.status, 'completed', outcome.run?.error);
+    for (const result of results) {
+      const doc = await f.workspace.readDocument(f.id, { type: kind, id: result.id });
+      assert.ok(doc.body.includes(result.body.split('\n')[0]));
+      if (kind === 'subject' && result.id === 'new-keeper')
+        assert.match(doc.body, /subjects\/keeper\.md/);
+    }
+    assert.deepEqual(
+      op.requests.map(({ lane }) => lane),
+      ['agent', 'asset', 'agent'],
+    );
+  });
+}
+
+test('a blank optional related subject does not block, but an explicitly required note does', async (t) => {
+  const f = await fixture(t);
+  const args = {
+    kind: 'subject',
+    action: 'create',
+    targets: [
+      {
+        id: 'new-keeper',
+        fields: { name: '新船员', kind: 'character' },
+        relatedSubjectIds: ['keeper'],
+      },
+    ],
+  };
+  const op = f.start('新增一个与罗蓝相关的主体。', [
+    () => send('book_generate_assets', args),
+    (request) => {
+      assert.match(JSON.stringify(request.history), /keeper/);
+      assert.doesNotMatch(JSON.stringify(request.history), /SOURCE_ITEM_SETTING/);
+      return propose('new-keeper', '## 稳定设定\n新船员会保管铜铃。');
+    },
+    () => finish(),
+  ]);
+  const optional = await op.wait();
+  assert.equal(
+    optional.run?.status,
+    'completed',
+    JSON.stringify({
+      error: optional.run?.error,
+      lanes: op.requests.map(({ lane }) => lane),
+      last: op.requests.at(-1)?.wire.history,
+    }),
+  );
+  assert.deepEqual(
+    op.requests.map(({ lane }) => lane),
+    ['agent', 'asset', 'agent'],
+  );
+  assert.ok((await f.workspace.readDocument(f.id, { type: 'subject', id: 'new-keeper' })).body);
+
+  const requiredFixture = await fixture(t);
+  const required = requiredFixture.start('新增一个主体，必须依据罗蓝已保存的设定。', [
+    () => send('book_generate_assets', args),
+    () => finish(),
+  ]);
+  const blocked = await required.wait();
+  assert.equal(blocked.run?.status, 'completed', blocked.run?.error);
+  assert.match(
+    JSON.stringify(required.requests.at(-1)?.wire.history),
+    /subject\/keeper|context_required|罗蓝/,
+  );
+  assert.deepEqual(
+    required.requests.map(({ lane }) => lane),
+    ['agent', 'agent'],
+  );
+  await assert.rejects(
+    requiredFixture.workspace.readDocument(requiredFixture.id, {
+      type: 'subject',
+      id: 'new-keeper',
+    }),
+  );
+});

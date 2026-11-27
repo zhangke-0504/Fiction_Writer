@@ -9,6 +9,8 @@ export type ChapterAction = 'draft' | 'append' | 'replace' | 'insert';
 export type AssetAction = 'create' | 'fill' | 'update';
 export type WritingIntent = {
   author?: string;
+  /** Raw current message, without model-authored scope purposes or history. */
+  currentAuthor?: string;
   continued?: readonly string[];
   confirmed?: string;
   arrangement?: string;
@@ -182,7 +184,7 @@ export function buildWritingRequest(
     options.correction,
     scope.kind === 'chapter'
       ? 'earlierStory 是已保存的前文，plans 是尚未发生的安排，后接条件不是已发生事实。'
-      : '只用 submit_story_descriptions 返回候选，不输出分析、整章正文或其他调用。',
+      : '按 targetId 为各目标分别使用对应资料；仅 book 是共用的。未提供可用说明时不把猜测写成已有事实。只用 submit_story_descriptions 返回候选，不输出分析、整章正文或其他调用。',
   ]
     .filter(Boolean)
     .join('\n\n');

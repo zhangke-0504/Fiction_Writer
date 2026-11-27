@@ -151,6 +151,10 @@ export class BookTaskScope {
     return targets;
   }
 
+  get currentAuthor() {
+    return this.author;
+  }
+
   instruction(operation: ScopeOperation, id: string, targets?: readonly ScopeTarget[]) {
     const items = (targets ?? [{ operation, id }]).flatMap((target) => {
       const item = this.item(target.operation, target.id, target.part);

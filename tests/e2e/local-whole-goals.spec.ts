@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { callRef, type ToolReceipt } from '../../electron/agent/tool-receipts.js';
 import type {
   BookView,
+  DocRef,
   Manuscript,
   ModelProfile,
   RunInfo,
@@ -47,7 +48,12 @@ type Wire = {
 type FixtureContext = { bookId: string };
 type Scenario = (wire: Wire, context: FixtureContext) => string | Action | Promise<string | Action>;
 
-async function harness(root: string, next: Scenario, lastChapterBody = oldProse + chapterTail) {
+async function harness(
+  root: string,
+  next: Scenario,
+  lastChapterBody = oldProse + chapterTail,
+  seed = true,
+) {
   const errors: unknown[] = [];
   let context: FixtureContext;
   const server = createServer(async (req, res) => {
@@ -102,34 +108,36 @@ async function harness(root: string, next: Scenario, lastChapterBody = oldProse 
     const session = await rpc<Session>(page, 'session.create', { bookId });
     const read = (doc: { type: string; id: string }) =>
       rpc<Manuscript>(page, 'book.doc.read', { bookId, doc });
-    context = { bookId };
     const change = async (changes: object[]) => {
       const result = await rpc<WriteReport>(page, 'book.changes.write', { bookId, changes });
       expect(result.error).toBeUndefined();
     };
-    const before = await read(outline);
-    await change([
-      { ...before, expect: before.revision, body: outlineBody },
-      ...ten.map((ref, index) => ({
-        ...ref,
-        expect: null,
-        fields: { title: '航海 ' + (index + 1), order: index + 1 },
-        body: index === 9 ? lastChapterBody : '水手保存了航海日记第 ' + (index + 1) + ' 页。',
-      })),
-      {
-        ...actor,
-        expect: null,
-        fields: { name: '档案员', kind: 'character' },
-        body: '## 稳定设定\n档案员保管航海日记。',
-      },
-      { ...missing, expect: null, fields: { name: '信使', kind: 'character' }, body: '' },
-      {
-        ...clue,
-        expect: null,
-        fields: { title: '报时钟', setupChapterId: chapter(2).id, payoffChapterId: chapter(10).id },
-        body: '## 可见线索\n' + oldNote + '\n\n## 回收真相\n钝钟令船员辨认了归途。',
-      },
-    ]);
+    context = { bookId };
+    if (seed) {
+      const before = await read(outline);
+      await change([
+        { ...before, expect: before.revision, body: outlineBody },
+        ...ten.map((ref, index) => ({
+          ...ref,
+          expect: null,
+          fields: { title: '航海 ' + (index + 1), order: index + 1 },
+          body: index === 9 ? lastChapterBody : '水手保存了航海日记第 ' + (index + 1) + ' 页。',
+        })),
+        {
+          ...actor,
+          expect: null,
+          fields: { name: '档案员', kind: 'character' },
+          body: '## 稳定设定\n档案员保管航海日记。',
+        },
+        { ...missing, expect: null, fields: { name: '信使', kind: 'character' }, body: '' },
+        {
+          ...clue,
+          expect: null,
+          fields: { title: '报时钟', setupChapterId: chapter(2).id, payoffChapterId: chapter(10).id },
+          body: '## 可见线索\n' + oldNote + '\n\n## 回收真相\n钝钟令船员辨认了归途。',
+        },
+      ]);
+    }
     // Let a wrongly promoted request visibly exceed the standard budget without a remote probe.
     await app.close();
     const profilePath = join(root, 'state', 'profiles.json');
@@ -151,6 +159,7 @@ async function harness(root: string, next: Scenario, lastChapterBody = oldProse 
     const api = {
       session,
       read,
+      change,
       journal,
       view: () => rpc<BookView>(page, 'book.read', { bookId }),
       restart: async () => {
@@ -232,6 +241,479 @@ function turn(wire: Wire) {
 function verdict(name: string, allowed = true) {
   return use('verdict', name, { allowed });
 }
+
+const key = ({ type, id }: DocRef) => `${type}/${id}`;
+
+function sequenced(
+  prompt: string,
+  steps: [Action, (wire: Wire) => void | Promise<void>][],
+  extra?: Scenario,
+) {
+  const position = new Map(steps.map(([action], i) => [action.id, i]));
+  return async (wire: Wire, context: FixtureContext) => {
+    const { id, text, result, tool } = turn(wire);
+    if (tool === 'check_book_scope') return verdict(tool);
+    if (tool === 'book_read_chapter') return '本次取材够用。';
+    if (tool === 'submit_story_descriptions' || !wire.tools?.length) {
+      if (!extra) throw new Error(`Unexpected generation request: ${tool ?? 'prose'}`);
+      return extra(wire, context);
+    }
+    if (!id) {
+      expect(text).toBe(prompt);
+      return steps[0][0];
+    }
+    const at = position.get(id);
+    expect(at, `unexpected fixture result: ${id}`).toBeDefined();
+    expect(result?.ok, result?.error).toBe(true);
+    await steps[at!][1](wire);
+    return steps[at! + 1]?.[0] ?? '按实际回执完成。';
+  };
+}
+const step = (action: Action, check: (wire: Wire) => void | Promise<void> = () => {}) =>
+  [action, check] as [Action, (wire: Wire) => void | Promise<void>];
+const find = (query: string) => use('discover', 'tool_search', { query });
+const scoped = (id: string, operation: string, target: DocRef, purpose: string) =>
+  enroll(id, { operation, id: target.id, purpose });
+const readContext = (ref: DocRef) => targeted(`read-${ref.type}-${ref.id}`, ref);
+const writeOutline = (body: string) => blueprint({ ...outline, action: 'update', body });
+const writeChapter = (ref: DocRef, plan: object = {}) =>
+  use(`draft-${ref.id}`, 'book_generate_chapter', { chapterId: ref.id, mode: 'draft', ...plan });
+const savedDigest = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+
+async function expectLocalCommits(
+  api: Awaited<ReturnType<typeof harness>>,
+  root: string,
+  bookId: string,
+  run: RunInfo,
+  calls: [Action, DocRef[]][],
+) {
+  expect(run).toMatchObject({
+    status: 'completed',
+    taskOutcome: 'fulfilled',
+    progress: { complete: true },
+  });
+  const receipts = (await api.receipts(run)).filter(({ commitCount }) => commitCount);
+  const events = await api.events(run);
+  const commits = events.filter(({ event }) => event === 'workspace.document.committed');
+  expect(receipts).toHaveLength(calls.length);
+  expect(commits).toHaveLength(calls.reduce((n, [, refs]) => n + refs.length, 0));
+  const finished = events.filter(
+    ({ event, fields }) =>
+      event === 'tool.finished' && commits.some((commit) => commit.fields.callId === fields.callId),
+  );
+  expect(finished.map(({ fields }) => fields.tool)).toEqual(calls.map(([action]) => action.name));
+  expect(events.some(({ event }) => event === 'novel.goal')).toBe(false);
+  for (const [[action, refs], i] of calls.map((call, i) => [call, i] as const)) {
+    expect(receipts[i]).toMatchObject({ callRef: callRef(action.id), tool: action.name, outcome: 'ok' });
+    expect(receipts[i].commits.map(key)).toEqual(refs.map(key));
+    expect(commits.filter(({ fields }) => fields.callId === finished[i].fields.callId)).toHaveLength(
+      refs.length,
+    );
+  }
+  // Compare the last matching receipt with editor readback and the actual Markdown bytes.
+  const latest = new Map(
+    receipts.flatMap(({ commits: docs }) => docs.map((doc) => [key(doc), doc] as const)),
+  );
+  for (const doc of latest.values()) {
+    const folder =
+      doc.type === 'chapter' ? 'chapters' : doc.type === 'clue' ? 'foreshadowing' : 'subjects';
+    const name = doc.type === 'outline' ? 'outline.md' : join(folder, `${doc.id}.md`);
+    const bytes = await readFile(join(root, 'library', bookId, name));
+    expect(doc.revision).toBe(savedDigest(bytes));
+    expect((await api.read(doc)).revision).toBe(doc.revision);
+  }
+  return events;
+}
+
+for (const kind of ['subject', 'clue', 'outline', 'chapter'] as const) {
+  test(`independent empty-book ${kind} generation over Harness IPC`, async ({}, info) => {
+    const root = info.outputPath('app');
+    const ref = { type: kind, id: kind === 'outline' ? 'outline' : `new-${kind}` };
+    const prompt = {
+      subject: '只新增一个主体：雾港的信使。',
+      clue: '只新增一条伏笔，先不排期：信使总在潮汐前出现。',
+      outline: '只写一份关于雾港信使的简短大纲。',
+      chapter: '只写一个新章节，描写信使在雾港敲门。',
+    }[kind];
+    const body = {
+      subject: '## 稳定设定\n信使熟悉雾港的潮路。',
+      clue: '## 可见线索\n信使总在潮汐前出现。\n\n## 回收真相\n信使在为船员传递消息。',
+      outline: '# 雾港\n\n信使在潮汐前敲门。',
+      chapter: '信使在雾港敲了三下门。',
+    }[kind];
+    const catalog = blueprint({ ...ref, action: 'create', fields: { title: '雾港来信' } });
+    const write =
+      kind === 'outline'
+        ? writeOutline(body)
+        : kind === 'chapter'
+          ? writeChapter(ref)
+          : use('generate', 'book_generate_assets', {
+              kind,
+              action: 'create',
+              targets: [
+                {
+                  id: ref.id,
+                  fields:
+                    kind === 'subject'
+                      ? { name: '雾港信使', kind: 'character' }
+                      : { title: '潮汐前的信使' },
+                },
+              ],
+            });
+    let bookId = '';
+    const api = await harness(
+      root,
+      (wire, context) => {
+        bookId = context.bookId;
+        return sequenced(
+          prompt,
+          [
+            step(
+              find(
+                kind === 'chapter'
+                  ? 'book_apply_changes book_generate_chapter'
+                  : kind === 'outline'
+                    ? 'book_get_context book_apply_changes'
+                    : write.name,
+              ),
+            ),
+            ...(kind === 'outline' ? [step(readContext(outline))] : []),
+            ...(kind === 'chapter'
+              ? [step(scoped('catalog-scope', 'chapter.catalog', ref, prompt)), step(catalog)]
+              : []),
+            step(
+              scoped(
+                'write-scope',
+                kind === 'chapter'
+                  ? 'chapter.draft'
+                  : kind === 'outline'
+                    ? 'outline.write'
+                    : `${kind}.create`,
+                ref,
+                prompt,
+              ),
+            ),
+            step(write),
+          ],
+          (request) => {
+            expect(JSON.stringify(request.messages)).toContain(ref.id);
+            return kind === 'chapter'
+              ? body
+              : use('asset-result', 'submit_story_descriptions', { items: [{ id: ref.id, body }] });
+          },
+        )(wire, context);
+      },
+      undefined,
+      false,
+    );
+    try {
+      const before = await api.view();
+      expect(
+        before.documents.filter(({ type }) => ['chapter', 'subject', 'clue'].includes(type)),
+      ).toHaveLength(0);
+      const run = await api.submit(prompt);
+      const calls: [Action, DocRef[]][] =
+        kind === 'chapter'
+          ? [
+              [catalog, [ref]],
+              [write, [ref]],
+            ]
+          : [[write, [ref]]];
+      await expectLocalCommits(api, root, bookId, run, calls);
+      const saved = await api.read(ref);
+      expect(saved.body.trim()).toBe(body);
+      if (kind === 'clue') {
+        expect(saved.fields.setupChapterId).toBeUndefined();
+        expect(saved.fields.payoffChapterId).toBeUndefined();
+      }
+      expect((await api.view()).documents.filter((doc) => key(doc) !== key(ref))).toEqual(
+        before.documents.filter((doc) => key(doc) !== key(ref)),
+      );
+    } finally {
+      await api.close();
+    }
+  });
+}
+
+for (const kind of ['subject', 'clue'] as const) {
+  test(`a same-kind ${kind} batch uses each target's source paragraphs`, async ({}, info) => {
+    const root = info.outputPath('app');
+    const prompt =
+      kind === 'subject'
+        ? '新增两个主体：雾港船员和潮汐匠人。'
+        : '新增两条伏笔：雾港船员和潮汐匠人各一条。';
+    const rows = [
+      { id: 'mist-sailor', label: '雾港船员', source: actor, marker: 'IPC_KEEPER_ONLY' },
+      { id: 'tide-smith', label: '潮汐匠人', source: missing, marker: 'IPC_SMITH_ONLY' },
+    ];
+    const refs = rows.map(({ id }) => ({ type: kind, id }));
+    const write = use('generate-batch', 'book_generate_assets', {
+      kind,
+      action: 'create',
+      targets: rows.map(({ id, label, source }) => ({
+        id,
+        ...(kind === 'subject'
+          ? { fields: { name: label, kind: 'character' }, relatedSubjectIds: [source.id] }
+          : { fields: { title: label, subjectIds: [source.id] } }),
+      })),
+    });
+    const body = (label: string, marker: string) =>
+      kind === 'subject'
+        ? `## 稳定设定\n${label}保管日记。${marker}`
+        : `## 可见线索\n${label}收起日记。${marker}\n\n## 回收真相\n日记记录了归航日期。`;
+    let revision: string;
+    let bookId: string;
+    const scenario = sequenced(
+      prompt,
+      [
+        step(find(write.name)),
+        step(
+          enroll(
+            'asset-scope',
+            ...refs.map(({ id }) => ({ operation: `${kind}.create`, id, purpose: prompt })),
+          ),
+        ),
+        step(write),
+      ],
+      ({ messages, system }) => {
+        const request = messages.at(-1)?.content.at(-1)?.text ?? '';
+        const data = JSON.parse(request.slice(request.indexOf('{'))) as {
+          outline: {
+            targetId: string;
+            text: string;
+            source: { id: string; revision: string; range: [number, number] };
+          }[];
+        };
+        expect(system).toContain('按 targetId');
+        expect(data.outline).toHaveLength(2);
+        for (const row of rows) {
+          const selected = data.outline.find(({ targetId }) => targetId === row.id);
+          expect(selected?.source).toMatchObject({
+            id: outline.id,
+            revision,
+            range: [expect.any(Number), expect.any(Number)],
+          });
+          expect(selected?.text).toContain(row.marker);
+          expect(selected?.text).not.toContain(rows.find(({ id }) => id !== row.id)!.marker);
+        }
+        return use('assets-result', 'submit_story_descriptions', {
+          items: rows.map(({ id, label, marker }) => ({ id, body: body(label, marker) })),
+        });
+      },
+    );
+    const api = await harness(root, (wire, context) => {
+      bookId = context.bookId;
+      return scenario(wire, context);
+    });
+    try {
+      const old = await api.read(outline);
+      await api.change([
+        {
+          ...old,
+          expect: old.revision,
+          body: rows
+            .map(
+              ({ label, source, marker }) => `${label}查看[关联卡](subjects/${source.id}.md)。${marker}`,
+            )
+            .join('\n\n'),
+        },
+      ]);
+      revision = (await api.read(outline)).revision;
+      const before = await api.view();
+      const run = await api.submit(prompt);
+      await expectLocalCommits(api, root, bookId!, run, [[write, refs]]);
+      for (const row of rows) {
+        const saved = await api.read({ type: kind, id: row.id });
+        expect(saved.body).toContain(body(row.label, row.marker));
+        if (kind === 'subject') expect(saved.body).toContain(`subjects/${row.source.id}.md`);
+        else expect(saved.fields.subjectIds).toEqual([row.source.id]);
+      }
+      expect(
+        (await api.view()).documents.filter((d) => !refs.some((ref) => key(d) === key(ref))),
+      ).toEqual(before.documents);
+    } finally {
+      await api.close();
+    }
+  });
+}
+
+test('outline composition uses existing subject, clue and prose without guarding an unrelated card', async ({}, info) => {
+  const root = info.outputPath('app');
+  const prompt = '只更新大纲，参考现有档案员设定、报时钟和第二章。';
+  const body =
+    '# 新大纲\n\n[档案员](subjects/archivist.md)拿着[报时钟](foreshadowing/bell.md)回到[码头](chapters/ch-2.md)。';
+  const write = writeOutline(body);
+  let bookId: string;
+  let sources: Manuscript[];
+  const scenario = sequenced(prompt, [
+    step(find('book_get_context book_apply_changes')),
+    step(readContext(outline)),
+    step(readContext(actor)),
+    step(readContext(clue)),
+    step(readContext(chapter(2))),
+    step(scoped('outline-scope', 'outline.write', outline, prompt), async ({ messages }) => {
+      const request = JSON.stringify(messages);
+      for (const source of sources) expect(request).toContain(source.revision);
+      for (const marker of ['ARCHIVIST_SETTING', 'CLUE_OLD_FIXTURE', 'OUTLINE_PROSE_SOURCE'])
+        expect(request).toContain(marker);
+      expect(request).not.toContain('UNRELATED_CARD');
+      const unrelated = await api.read(missing);
+      await api.change([{ ...unrelated, expect: unrelated.revision, body: 'UNRELATED_CARD_CHANGED' }]);
+    }),
+    step(write),
+  ]);
+  const api = await harness(root, (wire, context) => {
+    bookId = context.bookId;
+    return scenario(wire, context);
+  });
+  try {
+    const subject = await api.read(actor);
+    const prose = await api.read(chapter(2));
+    await api.change([
+      {
+        ...subject,
+        expect: subject.revision,
+        body: '## 稳定设定\n档案员保管航海日记。ARCHIVIST_SETTING',
+      },
+      { ...prose, expect: prose.revision, body: '码头上响起钟声。OUTLINE_PROSE_SOURCE' },
+    ]);
+    sources = await Promise.all([actor, clue, chapter(2)].map(api.read));
+    const run = await api.submit(prompt);
+    await expectLocalCommits(api, root, bookId!, run, [[write, [outline]]]);
+    expect((await api.read(outline)).body).toBe(body);
+    expect((await api.read(missing)).body).toBe('UNRELATED_CARD_CHANGED');
+    expect(await Promise.all([actor, clue, chapter(2)].map(api.read))).toEqual(sources);
+  } finally {
+    await api.close();
+  }
+});
+
+test('chapter generation uses stage-safe material and the next call reuses committed prose', async ({}, info) => {
+  const root = info.outputPath('app');
+  const prompt = '只补第十一章和第十二章正文，不改现有资料。';
+  const first = chapter(11);
+  const second = chapter(12);
+  const firstBody = '档案员摸到一只钟，写下编号。FIRST_CHAPTER_COMMITTED';
+  const secondBody = '档案员认出了钟里的归航信号。SECOND_CHAPTER_COMMITTED';
+  const dormant = { type: 'clue' as const, id: 'unanchored' };
+  const distraction = { type: 'subject' as const, id: 'distant-person' };
+  const a = writeChapter(first, { subjectIds: [missing.id], clueIds: [clue.id, dormant.id] });
+  const b = writeChapter(second);
+  let bookId: string;
+  let dispatched = 0;
+  const scenario = sequenced(
+    prompt,
+    [
+      step(find(a.name)),
+      step(
+        enroll(
+          'draft-scope',
+          ...[first, second].map(({ id }) => ({ operation: 'chapter.draft', id, purpose: prompt })),
+        ),
+      ),
+      step(a),
+      step(b),
+    ],
+    async ({ messages, system }) => {
+      const request = JSON.stringify(messages);
+      expect(system).toContain('没有大纲、主体或伏笔也能');
+      expect(request).not.toContain('DISTANT_UNRELATED');
+      expect(request).not.toContain('UNSCHEDULED_SECRET');
+      if (dispatched++ === 0) {
+        expect(request).toContain('CHAPTER_PLAN');
+        expect(request).toContain('PRIOR_PROSE');
+        expect(request).toContain('CAST_SETTING');
+        expect(request).toContain('CLUE_OLD_FIXTURE');
+        expect(request).not.toContain('PAYOFF_SECRET');
+        expect(request).not.toContain('FIRST_CHAPTER_COMMITTED');
+        return firstBody;
+      }
+      const saved = await api.read(first);
+      expect(saved.body).toBe(firstBody);
+      expect(request).toContain('FIRST_CHAPTER_COMMITTED');
+      expect(request).toContain(saved.revision);
+      expect(request).toContain('PAYOFF_SECRET');
+      return secondBody;
+    },
+  );
+  const api = await harness(root, (wire, context) => {
+    bookId = context.bookId;
+    return scenario(wire, context);
+  });
+  try {
+    const oldOutline = await api.read(outline);
+    const subject = await api.read(actor);
+    const oldClue = await api.read(clue);
+    const previous = await api.read(chapter(10));
+    await api.change([
+      { ...first, expect: null, fields: { title: '第十一章', order: 11 }, body: '' },
+      { ...second, expect: null, fields: { title: '第十二章', order: 12 }, body: '' },
+      {
+        ...oldOutline,
+        expect: oldOutline.revision,
+        body: '<!-- chapter:ch-11 -->\n\n档案员来到港口。CHAPTER_PLAN',
+      },
+      { ...subject, expect: subject.revision, body: '## 稳定设定\n档案员保管航海日记。CAST_SETTING' },
+      {
+        ...oldClue,
+        expect: oldClue.revision,
+        fields: {
+          ...oldClue.fields,
+          setupChapterId: first.id,
+          payoffChapterId: second.id,
+          subjectIds: [actor.id],
+        },
+        body: `## 可见线索\n${oldNote}\n\n## 回收真相\n归航信号藏在钟里。PAYOFF_SECRET`,
+      },
+      {
+        ...previous,
+        expect: previous.revision,
+        body: previous.body + '\n\n水手在码头归档。PRIOR_PROSE',
+      },
+      {
+        ...dormant,
+        expect: null,
+        fields: { title: '未编排的线索' },
+        body: '## 可见线索\n码头有纸片。\n\n## 回收真相\n纸片写明来者身份。UNSCHEDULED_SECRET',
+      },
+      {
+        ...distraction,
+        expect: null,
+        fields: { name: '远处的人', kind: 'character' },
+        body: 'DISTANT_UNRELATED',
+      },
+    ]);
+    const before = await api.view();
+    const run = await api.submit(prompt);
+    const events = await expectLocalCommits(api, root, bookId!, run, [
+      [a, [first]],
+      [b, [second]],
+    ]);
+    expect(dispatched).toBe(2);
+    expect((await api.read(second)).body).toBe(secondBody);
+    expect(
+      (await api.view()).documents.filter((doc) => ![first.id, second.id].includes(doc.id)),
+    ).toEqual(before.documents.filter((doc) => ![first.id, second.id].includes(doc.id)));
+    const skills = events.filter(
+      ({ event, fields }) => event === 'skill.applied' && fields.skill === 'write-chapter',
+    );
+    const writes = events.filter(({ event }) => event === 'workspace.document.committed');
+    expect(skills).toHaveLength(2);
+    for (let i = 0; i < skills.length; i++) {
+      expect(skills[i].fields.callId).toBe(writes[i].fields.callId);
+      expect(skills[i].logSeq).toBeLessThan(writes[i].logSeq);
+      expect(
+        events.some(
+          ({ event, fields }) =>
+            event === 'model.budget_dispatched' && fields.spanId === skills[i].fields.spanId,
+        ),
+      ).toBe(true);
+    }
+    expect(writes[0].logSeq).toBeLessThan(skills[1].logSeq);
+  } finally {
+    await api.close();
+  }
+});
 
 for (const wholeRequest of [true, false]) {
   const prompt = wholeRequest ? '生成10章内容' : '只写第十章';

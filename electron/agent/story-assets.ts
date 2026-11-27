@@ -31,6 +31,7 @@ import {
   storyPart,
 } from './story-notes.js';
 import { storyVisibility } from './story-visibility.js';
+import { explicitlyRequiresEvidence, mentionsSource } from './writing-evidence.js';
 import {
   assetResultTool,
   buildWritingRequest,
@@ -208,115 +209,188 @@ function targetsFor(input: AssetInput, documents: Manuscript[]) {
   return targets;
 }
 
-function sourcesAndData(doc: Manuscript, text: string, range?: [number, number]) {
+function sourcesAndData(doc: Manuscript, text: string, range?: [number, number], targetId?: string) {
   const source = { type: doc.type, id: doc.id, revision: doc.revision, range };
-  return { value: { source, title: storyLabel(doc), fields: doc.fields, text }, sources: [source] };
+  return {
+    value: { ...(targetId && { targetId }), source, title: storyLabel(doc), fields: doc.fields, text },
+    sources: [source],
+  };
+}
+
+function relatedExcerpt(body: string, hit: number, maxLength: number) {
+  const separators = body.matchAll(/\r?\n[ \t]*\r?\n/gu);
+  let start = 0;
+  let end = body.length;
+  for (const sep of separators) {
+    if (sep.index > hit) {
+      end = sep.index;
+      break;
+    }
+    start = sep.index + sep[0].length;
+  }
+  const from = Math.max(start, hit - Math.floor(maxLength / 3));
+  return noteExcerpt(body, end - start <= maxLength ? start : from, Math.min(end, from + maxLength));
 }
 
 function assetContext(documents: Manuscript[], targets: Target[], intent: WritingIntent) {
   const chapters = documents.filter((doc) => doc.type === 'chapter');
   const subjects = documents.filter((doc) => doc.type === 'subject');
-  const names = targets.map(storyLabel).filter((name) => name.length > 1);
-  const links = new Set(targets.map(docKey));
-  const anchors = new Set<string>();
+  const outline = documents.find((doc) => doc.type === 'outline');
+  const book = documents.find((doc) => doc.type === 'book');
+  const common: WritingBlock[] = [];
+  const byTarget: WritingBlock[][] = [];
+  const author = intent.currentAuthor ?? intent.author;
+  const singleCue =
+    targets.length === 1
+      ? [author, intent.arrangement].filter(Boolean).join('\n').normalize('NFKC').toLowerCase()
+      : '';
+
   for (const target of targets) {
-    for (const id of target.fields.subjectIds ?? []) links.add(`subject/${id}`);
-    for (const related of target.relatedSubjects ?? []) links.add(docKey(related));
+    const parts: WritingBlock[] = [];
+    byTarget.push(parts);
+    const targetKey = docKey(target);
+    const links = new Set<string>([targetKey]);
+    const anchors = new Set<string>();
+    const explicitSubjectIds = new Set(target.fields.subjectIds ?? []);
+    for (const related of target.relatedSubjects ?? []) explicitSubjectIds.add(related.id);
+    const label = storyLabel(target).normalize('NFKC').toLowerCase();
+    for (const subject of subjects) {
+      const name = storyLabel(subject);
+      if (
+        docKey(subject) !== targetKey &&
+        (mentionsSource(label, name) || mentionsSource(singleCue, name))
+      )
+        explicitSubjectIds.add(subject.id);
+    }
+    for (const id of explicitSubjectIds) links.add(`subject/${id}`);
     for (const chapter of Object.values(clueAnchors(target, chapters)))
       if (chapter) anchors.add(chapter.id);
-  }
-  const parts: WritingBlock[] = [
-    {
+
+    parts.push({
       group: 'target',
       required: true,
-      value: targets.map((target) => ({
+      value: {
+        targetId: target.id,
         type: target.type,
         id: target.id,
         fields: target.fields,
-        ...(target.relatedSubjects && { relatedSubjectIds: target.relatedSubjects.map(({ id }) => id) }),
+        ...(target.relatedSubjects && {
+          relatedSubjectIds: target.relatedSubjects.map(({ id }) => id),
+        }),
         ...(target.existing && { previous: target.existing.body, revision: target.existing.revision }),
-      })),
-      sources: targets.flatMap(({ existing }) => (existing ? [existing] : [])),
-    },
-  ];
-  for (const subject of subjects.filter(
-    (doc) => links.has(docKey(doc)) && !targets.some((target) => docKey(target) === docKey(doc)),
-  )) {
-    const stable = storyPart(subject.body, 'stable');
-    if (!stable) {
-      const ref = { type: 'subject' as const, id: subject.id };
-      const kind = hasStoryDescription(subject.body)
-        ? ('missing_section' as const)
-        : ('empty_description' as const);
-      throw new WritingContextFailure(
-        'context_required',
-        `关联主体 ${subject.id}${kind === 'empty_description' ? '是空说明' : '已有说明但缺稳定设定'}。`,
-        [ref],
-        [{ kind, ref, part: 'stable', revision: subject.revision }],
-      );
-    }
-    parts.push({
-      group: 'subject',
-      required: true,
-      ...sourcesAndData(subject, stable.text, stable.range),
+      },
+      sources: target.existing ? [target.existing] : [],
     });
-    const label = storyLabel(subject);
-    if (label.length > 1) names.push(label);
+
+    for (const id of explicitSubjectIds) {
+      const subject = subjects.find((doc) => doc.id === id);
+      const ref = { type: 'subject' as const, id };
+      if (!subject) continue;
+      const stable = storyPart(subject.body, 'stable');
+      const must = explicitlyRequiresEvidence(author, ref, subject);
+      if (!stable) {
+        if (must) {
+          const kind = hasStoryDescription(subject.body)
+            ? ('missing_section' as const)
+            : ('empty_description' as const);
+          throw new WritingContextFailure(
+            'context_required',
+            `本轮要求依据的 ${docKey(ref)}${kind === 'empty_description' ? '是空说明' : '已有说明但缺稳定设定'}。`,
+            [ref],
+            [{ kind, ref, part: 'stable', revision: subject.revision }],
+          );
+        }
+        parts.push({
+          group: 'subject',
+          required: false,
+          ...sourcesAndData(subject, '', undefined, target.id),
+        });
+        continue;
+      }
+      parts.push({
+        group: 'subject',
+        required: must,
+        ...sourcesAndData(subject, stable.text, stable.range, target.id),
+      });
+    }
+
+    for (const chapter of chapters.filter((doc) => anchors.has(doc.id)))
+      parts.push({
+        group: 'reference',
+        required: true,
+        ...sourcesAndData(chapter, '', undefined, target.id),
+      });
+
+    const names = [
+      storyLabel(target),
+      ...[...explicitSubjectIds]
+        .map((id) => subjects.find((doc) => doc.id === id))
+        .filter((doc): doc is Manuscript => !!doc)
+        .map(storyLabel),
+    ].filter((name) => name.length > 1);
+    const cue = names.concat(
+      (targets.length === 1 ? (intent.arrangement ?? '') : '')
+        .match(/「([^」]{2,48})」/gu)
+        ?.map((word) => word.slice(1, -1)) ?? [],
+    );
+    const related = (doc: Manuscript) => {
+      const offset = cue.reduce((min, label) => {
+        const index = doc.body.indexOf(label);
+        return index < 0 ? min : Math.min(min, index);
+      }, Infinity);
+      const relation = storyLinks(doc.body).find(({ ref }) => links.has(docKey(ref)));
+      return Math.min(offset, relation?.from ?? Infinity);
+    };
+
+    if (outline) {
+      const hit = related(outline);
+      const range = Number.isFinite(hit) ? relatedExcerpt(outline.body, hit, 4200) : undefined;
+      if (range)
+        parts.push({
+          group: 'outline',
+          ...sourcesAndData(outline, range.text, range.range, target.id),
+        });
+    }
+
+    const evidence = documents
+      .filter((doc) => doc.type === 'chapter' || doc.type === 'clue' || doc.type === 'subject')
+      .filter(
+        (doc) =>
+          !links.has(docKey(doc)) &&
+          (doc.type === 'chapter' ? doc.body.trim() : hasStoryDescription(doc.body)),
+      )
+      .map((doc) => ({ doc, hit: related(doc), named: mentionsSource(singleCue, storyLabel(doc)) }))
+      .filter(
+        ({ doc, hit, named }) =>
+          named ||
+          Number.isFinite(hit) ||
+          (doc.type === 'chapter' && anchors.has(doc.id)) ||
+          (doc.type === 'clue' && doc.fields.subjectIds?.some((id) => links.has(`subject/${id}`))),
+      )
+      .sort((a, b) => Number(anchors.has(b.doc.id)) - Number(anchors.has(a.doc.id)))
+      .slice(0, 16);
+    for (const { doc, hit } of evidence) {
+      const range = Number.isFinite(hit)
+        ? relatedExcerpt(doc.body, hit, 2500)
+        : noteExcerpt(doc.body, 0, Math.min(doc.body.length, 2200));
+      if (range)
+        parts.push({
+          group: doc.type === 'chapter' ? 'previous' : doc.type === 'subject' ? 'subject' : 'clue',
+          required: targets.length === 1 && explicitlyRequiresEvidence(author, doc, doc),
+          ...sourcesAndData(doc, range.text, range.range, target.id),
+        });
+    }
   }
-  for (const chapter of chapters.filter((doc) => anchors.has(doc.id)))
-    parts.push({ group: 'reference', required: true, ...sourcesAndData(chapter, '') });
-  const book = documents.find((doc) => doc.type === 'book');
+
   if (book)
-    parts.push({
+    common.push({
       group: 'book',
       ...sourcesAndData(book, book.body.slice(0, 3500), [0, Math.min(book.body.length, 3500)]),
     });
-  const cue = names.concat(
-    (intent.arrangement ?? '').match(/「([^」]{2,48})」/gu)?.map((word) => word.slice(1, -1)) ?? [],
-  );
-  const related = (doc: Manuscript) => {
-    const offset = cue.reduce((min, label) => {
-      const index = doc.body.indexOf(label);
-      return index < 0 ? min : Math.min(min, index);
-    }, Infinity);
-    const relation = storyLinks(doc.body).find(({ ref }) => links.has(docKey(ref)));
-    return Math.min(offset, relation?.from ?? Infinity);
-  };
-  const outline = documents.find((doc) => doc.type === 'outline');
-  if (outline) {
-    const hit = related(outline);
-    const range = noteExcerpt(
-      outline.body,
-      Number.isFinite(hit) ? Math.max(0, hit - 1200) : 0,
-      Number.isFinite(hit) ? hit + 4700 : 6500,
-    );
-    if (range) parts.push({ group: 'outline', ...sourcesAndData(outline, range.text, range.range) });
-  }
-  const evidence = documents
-    .filter((doc) => doc.type === 'chapter' || doc.type === 'clue' || doc.type === 'subject')
-    .filter((doc) => !links.has(docKey(doc)) && doc.body.trim())
-    .map((doc) => ({ doc, hit: related(doc) }))
-    .filter(
-      ({ doc, hit }) =>
-        Number.isFinite(hit) ||
-        (doc.type === 'chapter' && anchors.has(doc.id)) ||
-        (doc.type === 'clue' && doc.fields.subjectIds?.some((id) => links.has(`subject/${id}`))),
-    )
-    .sort((a, b) => Number(anchors.has(b.doc.id)) - Number(anchors.has(a.doc.id)))
-    .slice(0, 16);
-  for (const { doc, hit } of evidence) {
-    const range = noteExcerpt(
-      doc.body,
-      Number.isFinite(hit) ? Math.max(0, hit - 850) : 0,
-      Number.isFinite(hit) ? hit + 1650 : 2200,
-    );
-    if (range)
-      parts.push({
-        group: doc.type === 'chapter' ? 'previous' : doc.type === 'subject' ? 'subject' : 'clue',
-        ...sourcesAndData(doc, range.text, range.range),
-      });
-  }
-  return parts;
+  // Try the leading evidence of every target before adding secondary excerpts for any one target.
+  for (let i = 0; byTarget.some((blocks) => i < blocks.length); i++)
+    for (const blocks of byTarget) if (blocks[i]) common.push(blocks[i]);
+  return common;
 }
 
 function candidatesFrom(text: string, expected: Target[], type: AssetKind) {
@@ -423,15 +497,6 @@ export async function generateStoryAssets(
           })),
         },
       );
-    if (
-      whole &&
-      input.kind === 'clue' &&
-      input.action === 'create' &&
-      (!target.fields.setupChapterId || !target.fields.payoffChapterId)
-    )
-      throw new ToolFailure('unbound_foreshadowing', `${docKey(target)} 需要真实埋设章和回收章 ID。`, {
-        refs,
-      });
   }
   const spanId = randomUUID();
   const trace = diagnosticScope(ctx.diagnostic ?? noDiagnostic, {
@@ -585,7 +650,6 @@ export async function generateStoryAssets(
     ctx.signal,
     writingSources(compiled.included),
     trace,
-    whole,
   );
   if (report.error) throw new ToolFailure(report.reason ?? 'unknown', report.error, report);
   return {
