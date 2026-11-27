@@ -6,9 +6,11 @@ import type {
   ChatLine,
   Effort,
   ModelProfile,
+  RunInfo,
   RuntimeView,
   Session,
   StartRun,
+  TaskOutcome,
 } from '../shared/contracts';
 const statuses = {
   running: '运行中',
@@ -17,8 +19,45 @@ const statuses = {
   cancelled: '已停止',
   interrupted: '已中断',
 };
+const taskOutcomes: Record<TaskOutcome, string> = {
+  fulfilled: '已完成',
+  no_write_needed: '已满足，无需写入',
+  partial: '部分完成',
+  incomplete: '未完成',
+  cancelled: statuses.cancelled,
+  interrupted: statuses.interrupted,
+};
 const roles = { user: '你', assistant: 'Agent', tool: '工具', status: '状态' };
 const basename = (path: string) => path.split(/[\\/]/).at(-1) || path;
+
+function runStatusLabel(run: RunInfo) {
+  if (run.status === 'completed' && run.taskOutcome) return taskOutcomes[run.taskOutcome];
+  return statuses[run.status];
+}
+
+function runStatusText(run: RunInfo) {
+  let text = runStatusLabel(run);
+  if (run.effort === 'default') text += ' · 使用模型默认思考设置';
+  if (run.error) text += `：${run.error}`;
+  if (run.status === 'running') return text;
+
+  const { whole, local } = run.progress ?? {};
+  const remaining = local?.remaining?.map(({ operation, id, part }) =>
+    [operation, id, part].filter(Boolean).join('/'),
+  );
+  if (local?.omitted) remaining?.push(`另有 ${local.omitted} 项`);
+
+  return [
+    text,
+    run.status === 'failed' && run.taskOutcome && `本轮交付${taskOutcomes[run.taskOutcome]}`,
+    whole?.complete && '整书已齐',
+    whole?.message && !whole.complete && !run.error?.includes(whole.message) && whole.message,
+    whole && local?.remaining?.length === 0 && local.omitted === 0 && '局部事项已满足',
+    remaining?.length && `待核对或提交：${remaining.join('、')}`,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
 
 function ChatMessage({ line }: { line: ChatLine }) {
   return (
@@ -227,7 +266,6 @@ export function Harness({
       }
     });
   const showList = list || !current;
-  const progress = current?.run?.progress;
   return (
     <aside className="harness" aria-label="Harness 面板" hidden={!open}>
       <header className="harness-header">
@@ -285,7 +323,7 @@ export function Harness({
               <button className="session-link text-button" onClick={() => selectSession(session.id)}>
                 <strong>{session.label}</strong>
                 <small title={session.cwd}>
-                  {session.missing ? '工作区不可用' : run ? statuses[run.status] : basename(session.cwd)}
+                  {session.missing ? '工作区不可用' : run ? runStatusLabel(run) : basename(session.cwd)}
                 </small>
               </button>
               <button
@@ -345,45 +383,9 @@ export function Harness({
                 <p>直接说你想做什么：讨论故事、维护资料、写一章或写整本。</p>
               </div>
             )}
-            {progress && (
-              <div className="writing-progress">
-                <strong>{progress.step}</strong>
-                {progress.whole && progress.local ? (
-                  <>
-                    <p>
-                      整书：
-                      {progress.whole.chapters
-                        ? `${progress.whole.chapters.done} / ${progress.whole.chapters.total} 章`
-                        : '目标尚未激活'}
-                      {progress.whole.complete && '，所需产物已核对'}
-                      {progress.whole.chapters &&
-                        progress.whole.message &&
-                        `；${progress.whole.message}`}
-                    </p>
-                    <p>
-                      局部：{progress.local.done} / {progress.local.total} 项
-                      {progress.local.remaining.length > 0 &&
-                        `；待核对或提交：${progress.local.remaining.map(({ operation, id, part }) => [operation, id, part].filter(Boolean).join('/')).join('、')}`}
-                      {progress.local.omitted > 0 && `（另有 ${progress.local.omitted} 项）`}
-                    </p>
-                  </>
-                ) : (
-                  <>
-                    <span>
-                      {progress.done} / {progress.total}
-                    </span>
-                    {progress.message && <p>{progress.message}</p>}
-                  </>
-                )}
-              </div>
-            )}
             {current.run && (
               <p className={`run-status ${running ? 'running' : ''}`} role="status">
-                {current.run.status === 'completed' && current.run.taskOutcome
-                  ? '本轮运行已结束'
-                  : statuses[current.run.status]}
-                {current.run.effort === 'default' ? ' · 使用模型默认思考设置' : ''}
-                {current.run.error ? `：${current.run.error}` : ''}
+                {runStatusText(current.run)}
               </p>
             )}
           </div>

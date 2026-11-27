@@ -156,6 +156,31 @@ async function harness(
         .slice(0, -1)
         .filter(Boolean)
         .map((line) => JSON.parse(line) as { novelTask?: unknown; toolReceipt?: ToolReceipt });
+    const start = async (prompt: string) => {
+      const { runId } = await rpc<{ runId: string }>(page, 'session.start', {
+        id: session.id,
+        profileId,
+        prompt,
+      });
+      return runId;
+    };
+    const currentRun = async () =>
+      (await rpc<RuntimeView>(page, 'runtime.snapshot')).sessions.find(
+        ({ session: s }) => s.id === session.id,
+      )?.run;
+    const finish = async (runId: string) => {
+      await expect
+        .poll(async () =>
+          (await readDiagnostics(root, 'backend')).some(
+            ({ event, fields }) => event === 'run.finished' && fields.runId === runId,
+          ),
+        )
+        .toBe(true);
+      if (errors.length) throw errors[0];
+      const run = await currentRun();
+      expect(run?.id).toBe(runId);
+      return run!;
+    };
     const api = {
       session,
       read,
@@ -167,33 +192,17 @@ async function harness(
         app = await launch();
         page = await app.firstWindow();
       },
-      showProgress: async (prompt: string) => {
+      openHarness: async (prompt: string) => {
         await page.getByRole('button', { name: '编辑 灯塔日志', exact: true }).click();
         await page.getByRole('button', { name: 'Harness', exact: true }).click();
         const panel = page.getByRole('complementary', { name: 'Harness 面板' });
         await panel.getByRole('button', { name: new RegExp('^' + prompt.slice(0, 16)) }).click();
-        return panel.locator('.writing-progress');
+        return panel;
       },
-      submit: async (prompt: string) => {
-        const { runId } = await rpc<{ runId: string }>(page, 'session.start', {
-          id: session.id,
-          profileId,
-          prompt,
-        });
-        await expect
-          .poll(async () =>
-            (await readDiagnostics(root, 'backend')).some(
-              ({ event, fields }) => event === 'run.finished' && fields.runId === runId,
-            ),
-          )
-          .toBe(true);
-        if (errors.length) throw errors[0];
-        const run = (await rpc<RuntimeView>(page, 'runtime.snapshot')).sessions.find(
-          ({ session: s }) => s.id === session.id,
-        )?.run;
-        expect(run?.id).toBe(runId);
-        return run!;
-      },
+      start,
+      currentRun,
+      finish,
+      submit: async (prompt: string) => finish(await start(prompt)),
       events: async (run: RunInfo) =>
         (await readDiagnostics(root, 'backend')).filter(({ fields }) => fields.runId === run.id),
       receipts: async (run: RunInfo) =>
@@ -719,11 +728,12 @@ for (const wholeRequest of [true, false]) {
   const prompt = wholeRequest ? '生成10章内容' : '只写第十章';
   test(`short writing intent over Harness IPC: ${prompt}`, async ({}, info) => {
     const last = chapter(10);
+    const goalReply = Promise.withResolvers<void>();
     const draftScope = { operation: 'chapter.draft', id: last.id, purpose: '写第十章正文' };
     const draft = () => use('draft', 'book_generate_chapter', { chapterId: last.id, mode: 'draft' });
     const api = await harness(
       info.outputPath('app'),
-      (wire, { bookId }) => {
+      async (wire, { bookId }) => {
         const { id, text, result, tool } = turn(wire);
         if (tool === 'check_book_scope') {
           const { candidates, currentAuthor } = JSON.parse(text);
@@ -772,6 +782,7 @@ for (const wholeRequest of [true, false]) {
               chapterIds,
               firstUnwritten: last.id,
             });
+            await goalReply.promise;
             return draft();
           case 'draft':
             expect(result.ok, result.error).toBe(true);
@@ -784,13 +795,31 @@ for (const wholeRequest of [true, false]) {
     );
     try {
       const before = (await api.view()).documents.filter(({ id }) => id !== last.id);
-      const run = await api.submit(prompt);
+      const runId = await api.start(prompt);
+      const panel = await api.openHarness(prompt);
+      const status = panel.getByRole('status');
+      if (wholeRequest) {
+        await expect.poll(api.currentRun).toMatchObject({
+          id: runId,
+          status: 'running',
+          progress: { done: 9, total: 10, complete: false },
+        });
+        await expect(panel.getByText('book_get_context · 已完成', { exact: true })).toHaveCount(1);
+        await expect(status).toHaveText(/^运行中/u);
+        await expect(panel.getByRole('button', { name: '停止', exact: true })).toBeVisible();
+        await expect(panel.locator('.writing-progress')).toHaveCount(0);
+      }
+      goalReply.resolve();
+      const run = await api.finish(runId);
       const final = wholeRequest ? 10 : 1;
       expect(run).toMatchObject({
         status: 'completed',
         taskOutcome: 'fulfilled',
         progress: { done: final, total: final, complete: true },
       });
+      await expect(status).toContainText('已完成');
+      await expect(status).not.toContainText(/\d+\s*\/\s*\d+/u);
+      await expect(panel.locator('.writing-progress')).toHaveCount(0);
       const saved = await api.read(last);
       expect(saved.body).toBe(generated);
       expect((await api.view()).documents.filter(({ id }) => id !== last.id)).toEqual(before);
@@ -819,6 +848,7 @@ for (const wholeRequest of [true, false]) {
         ).toBe(false);
       }
     } finally {
+      goalReply.resolve();
       await api.close();
     }
   });
@@ -1143,6 +1173,8 @@ for (const mode of ['exact', 'pending', 'missing-required-asset'] as const) {
       const logged = (name: string) =>
         events.filter(({ event }) => event === name).map(({ fields }) => fields);
       const goalStates = (await api.journal()).filter((row) => 'novelTask' in row);
+      const panel = await api.openHarness(mixed);
+      const status = panel.getByRole('status');
       if (mode === 'missing-required-asset') {
         expect(result).toMatchObject({
           status: 'failed',
@@ -1158,6 +1190,13 @@ for (const mode of ['exact', 'pending', 'missing-required-asset'] as const) {
             local: { done: 2, total: 2, remaining: [] },
           },
         });
+        await expect(status).toContainText('失败');
+        await expect(status).toContainText('局部事项已满足');
+        await expect(status).toContainText('整书未完成');
+        await expect(status).toContainText('subject/extra');
+        await expect(status).not.toContainText(/\d+\s*\/\s*\d+/u);
+        await expect(panel.locator('.writing-progress')).toHaveCount(0);
+        await expect(panel.getByLabel('诊断编号')).toHaveText(result.id);
         expect(goalStates.at(-1)?.novelTask).toBeTruthy();
         expect(await api.read(clue)).toEqual(before);
         return;
@@ -1179,6 +1218,11 @@ for (const mode of ['exact', 'pending', 'missing-required-asset'] as const) {
           local: summary,
         },
       });
+      await expect(status).toContainText('部分完成');
+      await expect(status).toContainText('整书已齐');
+      await expect(status).toContainText('clue.update/bell');
+      await expect(status).not.toContainText(/\d+\s*\/\s*\d+/u);
+      await expect(panel.locator('.writing-progress')).toHaveCount(0);
       expect(goalStates.at(-1)?.novelTask).toBeNull();
       expect(scope.find(({ callRef: ref }) => ref === callRef('blocked-patch'))).toMatchObject({
         tool: 'book_patch_asset',
@@ -1217,10 +1261,6 @@ for (const mode of ['exact', 'pending', 'missing-required-asset'] as const) {
         callId: logged('tool.finished').find(({ tool }) => tool === 'book_apply_changes')?.callId,
       });
       if (mode === 'pending') return;
-      const progress = await api.showProgress(mixed);
-      await expect(progress).toContainText('整书：10 / 10 章，所需产物已核对');
-      await expect(progress).toContainText('局部：1 / 2 项');
-      await expect(progress).toContainText('clue.update/bell');
 
       await api.restart();
       following = true;

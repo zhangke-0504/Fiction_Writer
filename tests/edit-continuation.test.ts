@@ -537,7 +537,9 @@ for (const blocked of ['stale', 'quality'] as const) {
     ]);
     const partial = await first.wait();
     assert.equal(partial.status, 'failed');
-    assert.match(partial.error ?? '', /5\/7.*second-trace.*late-arrival/);
+    assert.match(partial.error ?? '', /方案未全部提交：.*second-trace.*late-arrival/u);
+    assert.doesNotMatch(partial.error ?? '', /\b\d+\s*\/\s*\d+\b/u);
+    assert.deepEqual([partial.progress?.done, partial.progress?.total], [5, 7]);
     const written = (await f.read()).documents;
     assert.deepEqual(
       written.filter((d) => ['ch06', 'ch09'].includes(d.id)),
@@ -581,7 +583,14 @@ test('the author can correct an unnecessary confirmation using the displayed sco
   const f = await fixture(t);
   await propose(f);
   const run = f.start(correction, [...saveActor, () => text('仅主体已经写入。')]);
-  assert.match((await run.wait()).error ?? '', /1\/5/u);
+  const result = await run.wait();
+  assert.equal(result.status, 'failed');
+  assert.match(
+    result.error ?? '',
+    /方案未全部提交：.*marked-chart.*first-trace.*second-trace.*late-arrival/u,
+  );
+  assert.doesNotMatch(result.error ?? '', /\b\d+\s*\/\s*\d+\b/u);
+  assert.deepEqual([result.progress?.done, result.progress?.total], [1, 5]);
   assert.match(
     (await f.workspace.readDocument(f.id, { type: 'subject', id: 'agent-villain' })).body,
     /subjects\/captain.md/u,

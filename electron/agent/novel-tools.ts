@@ -1216,7 +1216,7 @@ export class NovelTools {
       if (remaining.length) {
         throw new DiagnosticFailure(
           'book_edit_incomplete',
-          `方案未全部提交（${done}/${total}）：${remaining.join('、')}。已保存的内容保留，可在同一会话继续。`,
+          `方案未全部提交：${remaining.join('、')}。已保存的内容保留，可在同一会话继续。`,
         );
       }
       return;
@@ -1229,7 +1229,7 @@ export class NovelTools {
     else
       throw new DiagnosticFailure(
         failure ? failure.diagnosticReason : 'novel_incomplete',
-        `整书未完成（已保存 ${check.done}/${check.total} 章）：${failure ? failure.message : (goalProblem(check) ?? '请核对现稿')}`,
+        `整书未完成：${failure ? failure.message : (goalProblem(check) ?? '请核对现稿')}`,
       );
   }
   private recordReferences(operations: Mutation[], report: WriteReport) {

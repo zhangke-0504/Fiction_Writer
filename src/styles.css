@@ -1040,16 +1040,6 @@ dialog::backdrop {
 .run-status.running {
   color: #246449;
 }
-.writing-progress {
-  display: flex;
-  justify-content: space-between;
-  gap: 6px;
-  background: var(--soft);
-  padding: 8px;
-  border-radius: 5px;
-  font-size: 12px;
-  margin: 7px 0;
-}
 .composer {
   flex: none;
   padding: 10px 12px 13px;
@@ -1271,16 +1261,6 @@ dialog::backdrop {
     padding: 15px;
   }
 }
-.writing-progress {
-  flex-wrap: wrap;
-}
-.writing-progress p {
-  flex-basis: 100%;
-  margin: 0;
-  overflow-wrap: anywhere;
-  color: var(--muted);
-}
-
 .diagnostic-id {
   display: flex;
   flex-wrap: wrap;
