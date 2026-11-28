@@ -416,10 +416,16 @@ for (const { label, request, approval, object } of variants)
         wires.filter((wire) => !wire.tools?.length && wire.system.includes('指定锚点')),
       ).toHaveLength(3);
       expect(revised).not.toContain(hiddenTruth);
+      const finishedDiagnostics = async (runId: string) => {
+        const rows = async () =>
+          (await readDiagnostics(root, 'backend')).filter(({ fields }) => fields.runId === runId);
+        await expect
+          .poll(async () => (await rows()).some(({ event }) => event === 'run.finished'))
+          .toBe(true);
+        return rows();
+      };
       const finished = executed.run!.id;
-      const diag = (await readDiagnostics(root, 'backend')).filter(
-        (row) => row.fields.runId === finished,
-      );
+      const diag = await finishedDiagnostics(finished);
       const firstRequest = diag.find(
         (row) => row.event === 'model.budget_dispatched' && row.fields.lane === 'agent',
       );
@@ -427,16 +433,8 @@ for (const { label, request, approval, object } of variants)
       expect(firstRequest).toBeDefined();
       expect(diag.some(({ event }) => event === 'novel.goal')).toBe(false);
       expect(firstScope?.logSeq ?? 0).toBeGreaterThan(firstRequest!.logSeq);
-      await expect
-        .poll(
-          async () =>
-            (await readDiagnostics(root, 'backend')).filter(
-              (e) => e.fields.runId === finished && e.event === 'workspace.document.committed',
-            ).length,
-        )
-        .toBe(10);
+      expect(diag.filter(({ event }) => event === 'workspace.document.committed')).toHaveLength(10);
       if (object) {
-        const rows = async () => await readDiagnostics(root, 'backend');
         const receipts = async () =>
           (await readFile(join(root, 'state', 'sessions', `${executed.session.id}.jsonl`), 'utf8'))
             .split(/\r?\n/u)
@@ -500,7 +498,7 @@ for (const { label, request, approval, object } of variants)
             commits: [{ type: 'chapter', id: ending, operation: 'write', revision: savedRevision }],
           },
         ]);
-        const followEvents = (await rows()).filter(({ fields }) => fields.runId === follow.id);
+        const followEvents = await finishedDiagnostics(follow.id);
         const reviewed = followEvents.find(
           ({ event, fields }) => event === 'chapter.patch.review' && fields.verdict === 'approved',
         );

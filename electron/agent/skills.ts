@@ -28,6 +28,7 @@ const aliases: Record<SkillName, readonly string[]> = {
     '整部小说',
     '写一本小说',
     '写成小说',
+    '完整故事',
     '改编成长篇',
     '全本',
     '写完整部',
@@ -47,7 +48,9 @@ const aliases: Record<SkillName, readonly string[]> = {
     '本章',
     '指定章节',
     '写一章',
+    '起草正文',
     '续写',
+    '补转场',
     '重写',
     '改写正文',
     'draft chapter',
@@ -55,9 +58,11 @@ const aliases: Record<SkillName, readonly string[]> = {
   'story-consistency': [
     '伏笔',
     '设定一致性',
+    '检查设定',
     '联动',
     '同步资产',
     '人物设定',
+    '人物关系',
     '剧情一致',
     '改大纲',
     'continuity',
@@ -146,12 +151,15 @@ export class SkillCatalog {
         name: 'skill_search',
         description:
           '按创作意图或能力名称查找内置写作 Skill（整本小说、指定章节、设定一致性等）；只返回候选，不执行任务。',
+        discovery: { purpose: '检索内置写作技能的名称和用途', aliases: ['查找写作指南', '技能目录'] },
         schema: object({ query: str('用简短中文描述要找的写作能力', 512) }),
         execute: async ({ query }, ctx) => this.search(query, ctx.diagnostic),
       },
       {
         name: 'skill_load',
-        description: '加载选中的内置 Skill 指令。name 必须是检索返回的注册名称，不是文件路径。',
+        description:
+          '按注册名加载所选内置 Skill 的指令。已知注册名可直接加载，需要查找候选时用 skill_search。',
+        discovery: { purpose: '加载指定写作指南的完整指令', aliases: ['加载写作技能', '读取技能指令'] },
         schema: object({ name: { ...str(undefined, 40), enum: names } }),
         execute: async ({ name }, ctx) => ({
           name,

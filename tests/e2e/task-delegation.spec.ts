@@ -125,6 +125,7 @@ const cases = [
 for (const [protocol, mode] of cases) {
   test(`${protocol}: Run-local delegation (${mode})`, async ({}, info) => {
     const root = info.outputPath('app');
+    const bookSession = mode === 'delete-book' || mode === 'truncated-parent';
     const errors: string[] = [];
     const started = new Set<string>();
     const active = new Set<string>();
@@ -139,6 +140,10 @@ for (const [protocol, mode] of cases) {
         let raw = '';
         for await (const chunk of req) raw += chunk;
         const wire = decode(protocol, raw);
+        if (wire.child || !bookSession) {
+          expect(wire.names).not.toContain('skill_search');
+          expect(wire.names).not.toContain('skill_load');
+        }
         const send = (...calls: Call[]) => {
           for (const { name } of calls) expect(wire.names).toContain(name);
           reply(res, protocol, calls);
@@ -276,15 +281,14 @@ for (const [protocol, mode] of cases) {
         protocol,
         baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
       });
-      const bookId =
-        mode === 'delete-book' || mode === 'truncated-parent'
-          ? (
-              await rpc<{ id: string }>(page, 'book.create', {
-                title: '委派夹具',
-                summary: '仅供测试。',
-              })
-            ).id
-          : undefined;
+      const bookId = bookSession
+        ? (
+            await rpc<{ id: string }>(page, 'book.create', {
+              title: '委派夹具',
+              summary: '仅供测试。',
+            })
+          ).id
+        : undefined;
       const session = await rpc<Session>(page, 'session.create', bookId ? { bookId } : { cwd });
       ({ runId } = await rpc<{ runId: string }>(page, 'session.start', {
         id: session.id,

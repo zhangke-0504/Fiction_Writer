@@ -1,0 +1,156 @@
+[
+  [
+    "file-find",
+    ["edit_file", "search_text", "delete_file", "list_files", "read_file", "wait_tasks"],
+    6,
+    2138
+  ],
+  [
+    "file-read",
+    ["read_file", "delete_file", "edit_file", "list_files", "search_text", "write_file"],
+    6,
+    2038
+  ],
+  [
+    "book-find",
+    [
+      "book_memory_recall",
+      "book_patch_chapter",
+      "book_search_text",
+      "book_apply_changes",
+      "book_generate_chapter",
+      "book_get_context"
+    ],
+    6,
+    11969
+  ],
+  [
+    "proposal",
+    [
+      "book_propose_edits",
+      "book_clean_insert_echo",
+      "book_patch_chapter",
+      "book_task_scope",
+      "book_apply_changes",
+      "book_memory_forget"
+    ],
+    5,
+    9310
+  ],
+  [
+    "subject",
+    [
+      "book_patch_asset",
+      "book_patch_chapter",
+      "book_clean_insert_echo",
+      "book_generate_assets",
+      "book_memory_recall",
+      "book_search_text"
+    ],
+    6,
+    8281
+  ],
+  ["subject-status", ["book_memory_recall", "book_propose_edits"], 2, 3673],
+  [
+    "clue",
+    [
+      "book_generate_assets",
+      "book_apply_changes",
+      "book_patch_asset",
+      "book_propose_edits",
+      "book_generate_chapter",
+      "book_get_context"
+    ],
+    6,
+    14219
+  ],
+  ["gap", ["book_patch_chapter", "book_generate_chapter"], 2, 6137],
+  [
+    "insert",
+    [
+      "book_patch_chapter",
+      "book_apply_changes",
+      "book_clean_insert_echo",
+      "book_memory_recall",
+      "book_propose_edits",
+      "book_task_scope"
+    ],
+    5,
+    9588
+  ],
+  [
+    "draft",
+    [
+      "book_generate_chapter",
+      "book_patch_chapter",
+      "book_apply_changes",
+      "book_generate_assets",
+      "book_memory_recall",
+      "book_search_text"
+    ],
+    6,
+    12035
+  ],
+  ["directory-empty", [], 0, 2],
+  ["book-empty", [], 0, 2],
+  ["child-find", ["book_search_text", "task_report"], 1, 651],
+  ["child-read", ["book_get_context", "book_search_text"], 2, 1687],
+  ["file-find-variant", ["delete_file"], 1, 265],
+  ["file-read-variant", ["edit_file", "search_text"], 2, 777],
+  ["book-find-variant", ["book_patch_asset", "book_patch_chapter"], 2, 3956],
+  ["proposal-variant", ["book_memory_forget", "book_memory_recall", "book_patch_chapter"], 3, 3877],
+  ["subject-variant", ["book_memory_recall", "book_patch_asset", "book_patch_chapter"], 3, 4563],
+  [
+    "clue-variant",
+    [
+      "book_apply_changes",
+      "book_generate_assets",
+      "book_patch_asset",
+      "book_propose_edits",
+      "book_generate_chapter",
+      "book_task_scope"
+    ],
+    5,
+    11918
+  ],
+  ["gap-variant", ["book_patch_chapter", "book_generate_chapter"], 2, 6137],
+  ["insert-variant", ["book_clean_insert_echo", "book_patch_chapter"], 2, 3642],
+  ["draft-variant", ["book_patch_chapter"], 1, 2941],
+  ["child-find-variant", ["book_search_text", "task_report"], 1, 651],
+  ["child-read-variant", ["book_search_text"], 1, 651],
+  ["child-empty", [], 0, 2],
+  [
+    "ids-single",
+    ["book_patch_asset", "book_apply_changes", "book_generate_assets", "book_task_scope"],
+    3,
+    5657
+  ],
+  [
+    "ids-batch",
+    [
+      "book_patch_asset",
+      "book_task_scope",
+      "book_apply_changes",
+      "book_generate_assets",
+      "book_generate_chapter",
+      "book_get_context"
+    ],
+    5,
+    11154
+  ],
+  ["ids-unavailable", [], 0, 2],
+  ["ids-child", ["book_search_text"], 1, 651],
+  [
+    "ids-mixed",
+    [
+      "book_patch_chapter",
+      "book_get_context",
+      "book_patch_asset",
+      "book_task_scope",
+      "book_memory_recall",
+      "book_apply_changes"
+    ],
+    5,
+    9138
+  ]
+]

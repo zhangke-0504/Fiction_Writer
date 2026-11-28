@@ -9,7 +9,7 @@ import {
   type JsonObject,
   type UserMessage,
 } from '@earendil-works/pi-ai';
-import type { AssistantTurn, ModelProvider, ModelRequest, Turn } from './model.js';
+import type { AssistantTurn, ModelProvider, ModelRequest, ToolSpec, Turn } from './model.js';
 import { ToolFailure, type LocalTool, type ReadToolContext } from './local-tool.js';
 import { ChatOutputLimit, MalformedMessagesArguments, MessagesOutputLimit } from './provider.js';
 import type { RunContext } from './runs.js';
@@ -32,6 +32,11 @@ import {
 } from './tool-receipts.js';
 
 export { object, str, ToolFailure, type LocalTool } from './local-tool.js';
+const toToolSpec = ({ name, description, schema }: ToolSpec): ToolSpec => ({
+  name,
+  description,
+  schema,
+});
 const model: Model<'openai-completions'> = {
   id: 'fw',
   name: 'Fiction Writer',
@@ -191,7 +196,7 @@ async function runLoop<Context extends ReadToolContext>(
 ) {
   const catalog = discovery && discoverTools(tools, discovery.bootstrap);
   const registry = catalog?.registry ?? tools;
-  const initialTools = catalog?.visible() ?? tools;
+  const initialTools = (catalog?.visible() ?? tools).map(toToolSpec);
   const trace = diagnosticScope(safeReporter(ctx.diagnostic ?? noDiagnostic), {
     lane: task ? 'task' : 'agent',
   });
@@ -431,7 +436,7 @@ async function runLoop<Context extends ReadToolContext>(
             : undefined;
         const budgetPurpose = pendingWholeSkill ? 'long-writing' : activePurpose;
         const planned = planModelBudget(provider, budgetPurpose);
-        const visibleTools = catalog?.visible() ?? tools;
+        const visibleTools = (catalog?.visible() ?? tools).map(toToolSpec);
         let dispatchedTools = visibleTools;
         const fit = (step?: NarrowedWritingStep) => {
           dispatchedTools = visibleTools;
@@ -441,7 +446,7 @@ async function runLoop<Context extends ReadToolContext>(
             const needed = new Set(step.toolNames);
             dispatchedTools = [
               ...visibleTools,
-              ...tools.filter(({ name }) => needed.has(name) && !visible.has(name)),
+              ...tools.filter(({ name }) => needed.has(name) && !visible.has(name)).map(toToolSpec),
             ];
           }
           const wire = context.fit(

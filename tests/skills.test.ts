@@ -22,8 +22,13 @@ test('skill discovery ranks Chinese variants without loading instructions', asyn
     ['从大纲到正文，把这部故事改编成长篇', 'generate-novel'],
     ['根据设定生成10章内容', 'generate-novel'],
     ['生成多章内容', 'generate-novel'],
+    ['把这个题材写成完整故事', 'generate-novel'],
     ['续写指定章节', 'write-chapter'],
+    ['现有章节补转场', 'write-chapter'],
+    ['给新章起草正文', 'write-chapter'],
     ['同步人物设定，检查伏笔和剧情一致', 'story-consistency'],
+    ['检查设定', 'story-consistency'],
+    ['校对大纲和人物关系', 'story-consistency'],
   ]) {
     const trace = collectDiagnostics();
     const { candidates } = await catalog.search(query, trace.report);
@@ -36,6 +41,7 @@ test('skill discovery ranks Chinese variants without loading instructions', asyn
     assert.deepEqual(trace.rejected, []);
   }
   assert.deepEqual(await catalog.search('completely unrelated //'), { candidates: [] });
+  assert.deepEqual(await catalog.search('校对错别字'), { candidates: [] });
   for (const invalid of ['unknown', '../generate-novel', 'C:/generate-novel/SKILL.md', ''])
     await assert.rejects(catalog.load(invalid), /只能加载/);
 });

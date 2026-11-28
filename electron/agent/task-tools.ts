@@ -166,6 +166,7 @@ export function createTaskTools(
       name: 'start_task',
       description:
         '异步委派独立的只读调查、核对、比较或候选文字任务。立即返回本轮 taskId，不会替你写入；继续独立工作，需要报告时再用 wait_tasks。',
+      discovery: { purpose: '委派独立的只读调查、核对、比较或候选文字任务', aliases: ['启动子任务'] },
       schema: object(
         {
           brief: str('独立任务的简要说明和必要约束，不复制历史', 2000),
@@ -190,6 +191,7 @@ export function createTaskTools(
       name: 'wait_tasks',
       description:
         '等待本轮异步委派的 taskIds。有新终态即返回，不等待全部或重新运行；waitMs=0 只查询。报告延期可再次等待，已送达只返状态。',
+      discovery: { purpose: '等待委派任务或查询其结果和状态', aliases: ['查看子任务报告'] },
       schema: object(
         {
           taskIds: { type: 'array', minItems: 1, maxItems: 8, items: taskId },

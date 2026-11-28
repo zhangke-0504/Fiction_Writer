@@ -65,6 +65,7 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
   const calls: string[] = [],
     drafts: number[] = [],
     errors: string[] = [];
+  const requestBytes: number[] = [];
   let resumed = false,
     hold = mode !== 'full';
   let unblock!: () => void;
@@ -100,7 +101,9 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
     try {
       const raw: Buffer[] = [];
       for await (const chunk of req) raw.push(chunk);
-      const body = JSON.parse(Buffer.concat(raw).toString()) as RequestBody;
+      const wire = Buffer.concat(raw);
+      requestBytes.push(wire.length);
+      const body = JSON.parse(wire.toString()) as RequestBody;
       expect(req.url).toBe('/v1/messages');
       expect(req.headers['x-api-key']).toBe(apiKey);
       const reply = (value: string) => {
@@ -280,7 +283,7 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
                 ? repairPrompt
                 : faultPrompt,
         );
-        expect(body.system).toContain('skill_search');
+        expect(body.system).toContain('直接调用 skill_load（name=generate-novel）');
         if (resumed) expect(body.system).toContain('有可供参考的整书记录');
         return use('tool_search', 'whole-discover', {
           query: 'book_get_context book_apply_changes book_generate_assets book_generate_chapter',
@@ -304,6 +307,7 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
       }
       if (marker === 'whole-scope') {
         expect(result.ok).toBe(true);
+        if (mode === 'full') return use('skill_load', 'load', { name: 'generate-novel' });
         return use('skill_search', 'search', { query: searchQuery });
       }
       if (marker === 'single-discover')
@@ -314,8 +318,15 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
         expect(result.ok).toBe(true);
         return generate(3);
       }
-      if (marker === 'entry-discover')
+      if (marker === 'entry-discover') {
+        expect(result.value.candidates.map(({ id }: { id: string }) => id)).toEqual([
+          'book_get_context',
+          'book_patch_asset',
+          'book_generate_assets',
+          'book_generate_chapter',
+        ]);
         return use('book_get_context', 'entry-context', { includeBodies: true });
+      }
       if (marker === 'entry-context') {
         expect(result.ok).toBe(true);
         expect(result.value.documents.filter((d: Manuscript) => d.type === 'subject')).toHaveLength(3);
@@ -663,6 +674,7 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
     calls,
     drafts,
     errors,
+    requestBytes,
     baseUrl: `http://127.0.0.1:${port}/v1`,
     unblock() {
       hold = false;
@@ -756,8 +768,12 @@ test('two natural-language sends complete the Odyssey and insert a related antag
     const bookId = await setup(page, mock.baseUrl);
     await openBook(page);
     await openComposer(page);
+    const wholeStart = mock.requestBytes.length;
+    const wholeStartedAt = performance.now();
     await send(page, odyssey);
     await expect.poll(async () => (await status(page, bookId))?.status).toBe('completed');
+    const wholeEnd = mock.requestBytes.length;
+    const wholeElapsedMs = Math.round(performance.now() - wholeStartedAt);
     expect(await status(page, bookId)).toMatchObject({
       progress: { done: 10, total: 10, complete: true },
     });
@@ -777,14 +793,13 @@ test('two natural-language sends complete the Odyssey and insert a related antag
     });
     for (const [index, chapterId] of mock.chapterIds.entries())
       expect((await read(page, bookId, chapterId)).body).toBe(chapterBody(index + 1));
-    expect(mock.calls.filter((call) => call.startsWith('skill_'))).toEqual([
-      'skill_search:search',
-      'skill_load:load',
-    ]);
+    expect(mock.calls.filter((call) => call.startsWith('skill_'))).toEqual(['skill_load:load']);
     expect(mock.calls).toContain('tool_search:whole-discover');
     expect(mock.drafts).toEqual(Array.from({ length: 10 }, (_, index) => index + 1));
     const prior = (await status(page, bookId))!.id;
     const originalOutline = await readDoc('outline', 'outline');
+    const entryStart = mock.requestBytes.length;
+    const entryStartedAt = performance.now();
     await send(page, antagonistRequest);
     try {
       await expect
@@ -796,6 +811,8 @@ test('two natural-language sends complete the Odyssey and insert a related antag
     } catch (error) {
       throw new Error(`${mock.errors.join('\n')}\n${String(error)}`);
     }
+    const entryEnd = mock.requestBytes.length;
+    const entryElapsedMs = Math.round(performance.now() - entryStartedAt);
     const entryRun = await status(page, bookId);
     expect(entryRun).toMatchObject({
       taskOutcome: 'fulfilled',
@@ -853,7 +870,7 @@ test('two natural-language sends complete the Odyssey and insert a related antag
       )
       .toBe(3);
     const events = (await readDiagnostics(root, 'backend')).filter((e) => e.fields.runId === prior);
-    expect(events.some((e) => e.event === 'skill.search' && e.fields.candidates > 0)).toBe(true);
+    expect(events.filter((e) => e.event === 'skill.search')).toEqual([]);
     expect(
       events.some((e) => e.event === 'tool.finished' && e.fields.reason === 'invalid_references'),
     ).toBe(true);
@@ -875,6 +892,22 @@ test('two natural-language sends complete the Odyssey and insert a related antag
     const entryEvents = (await readDiagnostics(root, 'backend')).filter(
       (e) => e.fields.runId === entryId,
     );
+    const summarize = (rows: typeof events, start: number, end: number, elapsedMs: number) => ({
+      requests: end - start,
+      bytes: mock.requestBytes.slice(start, end).reduce((total, size) => total + size, 0),
+      estimatedInputTokens: rows
+        .filter(({ event }) => event === 'model.budget_dispatched')
+        .reduce((total, { fields }) => total + Number(fields.estimatedInput), 0),
+      searches: rows.filter(({ event }) => event === 'tool.discovery').length,
+      elapsedMs,
+    });
+    await info.attach('writing-workflow-metrics', {
+      body: JSON.stringify({
+        whole: summarize(events, wholeStart, wholeEnd, wholeElapsedMs),
+        insert: summarize(entryEvents, entryStart, entryEnd, entryElapsedMs),
+      }),
+      contentType: 'application/json',
+    });
     expect(
       entryEvents.filter(
         (e) => e.event === 'writing.context.dispatched' && e.fields.writingAction === 'insert',

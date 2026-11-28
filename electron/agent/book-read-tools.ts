@@ -42,6 +42,10 @@ export const bookContextProperties = {
 };
 export const bookContextDescription =
   '读取当前作品。按 type/documentId 定向读取；index=chapters/subjects/beats 查真实 ID；offset/length 只读有界原文；按实际 nextOffset 和 revision 续页。目录默认仅元数据，includeBodies 可请求完整短资料，长资料按 ID 翻页。';
+export const bookContextDiscovery = {
+  purpose: '按章节编号或文档 ID 读取指定范围原文和修订，查看作品目录',
+  aliases: ['查章节顺序', '核对章节原文', '回读资料', '读取当前版本'],
+};
 
 type BookQuery = { type?: Manuscript['type']; documentId?: string; offset?: number };
 export type BookContextArgs = BookQuery & {
@@ -162,6 +166,10 @@ export function bookSearchTool(workspace: WorkspaceService, bookId: string): Loc
     name: 'book_search_text',
     description:
       '在当前作品按字面搜索正文或资料，按可选类型和文档 ID 缩小范围；返回修订、位置和预览，不是写入原文证据。按 nextOffset 翻页。',
+    discovery: {
+      purpose: '在作品中搜索章节原文或资料中的字面词句，定位匹配位置',
+      aliases: ['全文搜索', '章内关键词', '查找原文片段', '只读查找'],
+    },
     schema: object(
       {
         query: str('要查的原文字面词句', 120),
@@ -234,6 +242,7 @@ export function bookReadTools(
     {
       name: 'book_get_context',
       description: bookContextDescription,
+      discovery: bookContextDiscovery,
       schema: object(bookContextProperties, []),
       async execute(args, { signal }) {
         return (await readBookContext(workspace, bookId, args, signal)).value;

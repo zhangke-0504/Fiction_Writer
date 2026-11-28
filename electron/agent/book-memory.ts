@@ -434,6 +434,10 @@ export function bookMemoryTools(workspace: WorkspaceService, bookId: string): Lo
       name: 'book_memory_recall',
       description:
         '取回本书已保存的历史正文证据、计划资料及作者长期约定。用人物、物件或原句关键词；取前情时传已定位的目标章 ID，仅返回更早章节正文；省略时只查询作品级约定、计划或参考资料。仅查询，不修改稿件。',
+      discovery: {
+        purpose: '取回本书的前情、计划资料和作者长期约定',
+        aliases: ['回顾前情', '查作品记忆', '查写作约定'],
+      },
       schema: object(
         {
           query: { type: 'string', maxLength: 1024, description: '关键词，可留空以只列作者约定' },
@@ -460,6 +464,10 @@ export function bookMemoryTools(workspace: WorkspaceService, bookId: string): Lo
       name: 'book_memory_remember',
       description:
         '作者希望长期保留或更正本书的写作约定时使用。text 可以是忠实整理的话，不必逐字引用；普通讨论不用保存。传已有约定 id 可更正，不传则新增。',
+      discovery: {
+        purpose: '新增或更正作者长期写作约定',
+        aliases: ['记住写作习惯', '保存约定'],
+      },
       schema: object({ text: str('整理后的长期写作约定', ruleSize), id: str('要更正的约定 ID', 80) }, [
         'text',
       ]),
@@ -472,6 +480,7 @@ export function bookMemoryTools(workspace: WorkspaceService, bookId: string): Lo
     {
       name: 'book_memory_forget',
       description: '作者不再希望保留某条长期约定时，使用已保存的约定 ID 删除，不修改稿件。',
+      discovery: { purpose: '删除已有作者长期约定', aliases: ['忘记写作约定'] },
       schema: object({ id: str('要删除的约定 ID', 80) }),
       execute: async (args, ctx) => {
         if (!isId(args.id)) throw new DiagnosticFailure('invalid_arguments', '缺少约定 ID');

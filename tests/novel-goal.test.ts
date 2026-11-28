@@ -150,6 +150,43 @@ test('a saved catalog and the model claim are not success before goal activation
   assert.match(result.error ?? '', /尚未激活/);
 });
 
+test('direct whole-book skill loading requires dispatch before goal activation', async (t) => {
+  const f = await fixture(t, 3);
+  const result = await run(f, '写3章完整小说', [
+    enroll(f.id),
+    ({ budgetBasis }) => {
+      assert.equal(budgetBasis, undefined);
+      return {
+        ...text(''),
+        calls: [...activate().calls, ...goal('register', chapterIds).calls],
+      };
+    },
+    ({ history, budgetPurpose, budgetBasis }) => {
+      assert.equal(budgetPurpose, 'long-writing');
+      assert.equal(budgetBasis, 'first-whole-skill');
+      const [guide, earlyGoal] = history.slice(-2);
+      assert.ok(guide?.role === 'tool');
+      assert.equal(guide.id, 'skill');
+      assert.equal(guide.result.ok, true);
+      assert.match(JSON.stringify(guide.result.value), /"name":"generate-novel","instructions":/);
+      assert.ok(earlyGoal?.role === 'tool');
+      assert.equal(earlyGoal.id, 'register-3');
+      assert.equal(earlyGoal.result.reason, 'novel_goal_required');
+      assert.match(earlyGoal.result.error ?? '', /先送达 generate-novel/);
+      return tool('register-after-dispatch', 'book_get_context', {
+        novelGoal: { action: 'register', chapterIds },
+      });
+    },
+    ({ history, budgetBasis }) => {
+      assert.equal(budgetBasis, 'active-whole-skill');
+      assert.match(JSON.stringify(history.at(-1)), /"complete":true/);
+      return text('全书已完成');
+    },
+  ]);
+  assert.equal(result.status, 'completed', result.error);
+  assert.equal(result.progress?.complete, true);
+});
+
 test('a supplied count cannot be silently reduced at initial registration', async (t) => {
   const f = await fixture(t, 3);
   const result = await run(f, '希望大概写10章左右', [

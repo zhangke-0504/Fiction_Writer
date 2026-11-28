@@ -11,6 +11,7 @@ export interface ReadToolContext {
 }
 
 export interface LocalTool<Context extends ReadToolContext = RunContext> extends ToolSpec {
+  discovery?: { purpose: string; aliases?: readonly string[] };
   execute: (args: Record<string, any>, ctx: Context) => Promise<unknown>;
   isWholeSkillResult?: (result: ToolResult) => boolean;
   onResultSent?: (result: ToolResult, report: ReportDiagnostic) => void;

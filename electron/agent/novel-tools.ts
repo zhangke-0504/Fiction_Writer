@@ -81,6 +81,7 @@ import { hasStoryDescription } from './story-notes.js';
 import { type DocumentPage, type ReadDocument } from './tool-context.js';
 import {
   bookContextDescription,
+  bookContextDiscovery,
   bookContextProperties,
   bookDocumentIdSchema as idSchema,
   bookIndexReadKey,
@@ -2616,6 +2617,10 @@ export class NovelTools {
       name: 'book_propose_edits',
       description:
         '作者只问修改方案时保存用于后续确认的范围，不修改作品。assets 和 passages 分列，按真实 ID 和章节位置说明；先查索引。创建主体字段 name/kind，可在同级写 relatedSubjectIds；新伏笔在 fields 里写 title/subjectIds/setupChapterId/payoffChapterId。不同中期迹象用不同位置、后期实际登场用 stage=reveal；payoffChapterId 是计划回收，允许与登场分章。',
+      discovery: {
+        purpose: '拟定作品修改方案，记录供后续确认的范围',
+        aliases: ['只给方案', '修改建议', '改稿计划'],
+      },
       schema: editPlanSchema,
       execute: async (args, ctx) => {
         if (
@@ -2653,6 +2658,10 @@ export class NovelTools {
       {
         name: 'book_get_context',
         description: `${bookContextDescription}按写入要求核对有关现稿，不反复读取未变化的同版资料。仅本轮明确的整书请求用 book_task_scope 登记 novel.register 或 novel.resume，加载指南后用 novelGoal 激活；check 只核对活动目标。局部读取不传 novelGoal。`,
+        discovery: {
+          ...bookContextDiscovery,
+          aliases: [...bookContextDiscovery.aliases, '激活整书目标', '核对整书目标'],
+        },
         schema: object(
           {
             ...bookContextProperties,
@@ -2697,6 +2706,10 @@ export class NovelTools {
         name: 'book_apply_changes',
         description:
           '提交已登记的大纲和章节目录，不接受章节正文。独立写大纲：先读取目标当前版，再按需取用主体、伏笔和前文，不必扫读全书；用真实 Markdown 链接标明采用的来源。可与已登记目录同批提交；可选关系字段用 null 清除。整书范围先激活目标；已有资料的说明走 book_generate_assets(update) 或 book_patch_asset，不在这里生成或改写。按实际提交结果汇报。',
+        discovery: {
+          purpose: '提交作品大纲与章节目录变更',
+          aliases: ['新建章节目录', '调整章序', '写入大纲'],
+        },
         schema: object({
           operations: {
             type: 'array',
@@ -2722,6 +2735,10 @@ export class NovelTools {
               name: 'book_patch_asset',
               description:
                 '普通范围任务定点修订已有主体或伏笔一处短说明。用 book_get_context 按类型和 ID 回读当前版；查找预览不是原文。用 book_task_scope 的 subject.update／clue.update.assetPatch 登记确切 revision、quote、replacement 后提交相同变更，不写其它字段或生成整份说明。无法定点时按授权用原全文更新或保留待办。',
+              discovery: {
+                purpose: '修订已有主体或伏笔的一处说明短句，把原句改成指定文字',
+                aliases: ['人物卡', '人物简介', '主体说明', '伏笔说明', '定点替换', '短句局部修订'],
+              },
               schema: object({
                 kind: { type: 'string', enum: ['subject', 'clue'] },
                 id: idSchema,
@@ -2736,6 +2753,10 @@ export class NovelTools {
         name: 'book_generate_assets',
         description:
           '独立生成或补齐一小批同类主体／伏笔说明，每个目标按自己的关联取材；缺少其他资料不必先补。create 主体传 fields:{name,kind}，可传 relatedSubjectIds；伏笔传 fields:{title}，按需加 subjectIds 与真实埋设／回收章 ID。未排期就省略，不建占位章。fill 只补空说明，保留字段。开放式 update 和已登记的 subject.sync／clue.sync 分开调用；同步只传对应 ID；资料定点用 book_patch_asset。不要在参数里写正文，按已提交回执汇报。',
+        discovery: {
+          purpose: '新建主体或伏笔、补齐空白资料、开放式改写整份说明或同步已写场景',
+          aliases: ['生成人物卡', '补全伏笔资料', '整份说明更新', '同步关联场景'],
+        },
         schema: object(
           {
             kind: { type: 'string', enum: ['subject', 'clue'] },
@@ -2785,6 +2806,7 @@ export class NovelTools {
         name: 'book_clean_insert_echo',
         description:
           '仅清理本轮刚提交的插入片段首尾可证实的相邻旧文回声。传成功 insert 返回的 insertionRef、章 ID 和该次提交的修订；不提供范围或新文，不修改旧稿。拒绝时保留现稿并报告。若返回待同步，用合法的资料同步动作核验。',
+        discovery: { purpose: '清理本轮插入片段首尾的重复文字', aliases: ['清理回声'] },
         schema: object({
           chapterId: idSchema,
           revision: revisionSchema,
@@ -2797,6 +2819,10 @@ export class NovelTools {
         name: 'book_patch_chapter',
         description:
           '按当前作者明确授权定点修改一章的少量原文，不用于插入新场景或整章重写。先用 book_get_context 按章节 ID 读取当前版本与完整短原文。只需把一处段间空白缩为 1 个空行时，edits 只填一个 paragraphGap：用前段原样短尾和后段原样短首定位，不抄中间换行，不提交替换正文或 evidence。章内搬移优先同一批删除旧段并在新锚点补入；任一项不成立则整批不写。还需修订时重读新版本后继续，不重发旧补丁。只有本轮从空白生成并保持原提交版本的整书新稿，才可另凭已读取的前章原文证据做明确事实勘误。',
+        discovery: {
+          purpose: '定点替换、删除或搬移章节旧文，修整段间空白',
+          aliases: ['改一句正文', '局部修订', '删除多余换行', '保留一个空行'],
+        },
         schema: object(
           {
             chapterId: idSchema,
@@ -2861,6 +2887,10 @@ export class NovelTools {
         name: 'book_generate_chapter',
         description:
           '每次流式生成一章。独立 draft 只需已保存的目标目录，可复用相关大纲、前文、主体和阶段可见的伏笔；subjectIds / clueIds 是选材线索，不是必需项。仅当前作者明确要求的证据不可用才因缺料停止。依次生成多章，下一章复用实际提交的前文。insert 先读目标版本与唯一原文锚点，可按需附本章大纲增补；成功后可凭 insertionRef 请求清理新增段回声。后接章已有正文时保留 nextBoundary；replace 仍需明确授权。整书先激活目标，再顺序写空白章。',
+        discovery: {
+          purpose: '起草空白章正文、续写或重写全章、在已有章节插入新场景',
+          aliases: ['写新章正文', '增补场景', '插入过渡', '从空白写正文'],
+        },
         schema: object(
           {
             chapterId: idSchema,

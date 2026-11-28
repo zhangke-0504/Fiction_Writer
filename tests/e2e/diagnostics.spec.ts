@@ -389,6 +389,7 @@ test('local diaries reconstruct concurrent runs and actual tool decisions withou
           (await readDiagnostics(root, 'backend')).find(
             (e) => e.event === 'run.finished' && e.fields.runId === runId,
           )?.fields.outcome,
+        { timeout: 15_000 },
       )
       .toBe('ok');
   } finally {

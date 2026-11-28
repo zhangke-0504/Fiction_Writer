@@ -92,10 +92,11 @@ async function* walk(
 function fileTool<Context extends ReadToolContext>(
   name: string,
   description: string,
+  discovery: LocalTool<Context>['discovery'],
   schema: Record<string, unknown>,
   execute: LocalTool<Context>['execute'],
 ): LocalTool<Context> {
-  return { name, description, schema, execute };
+  return { name, description, discovery, schema, execute };
 }
 
 export class FileTools {
@@ -181,6 +182,7 @@ export class FileTools {
       deliver(
         'list_files',
         '列出工作目录中的文件。',
+        { purpose: '列出工作目录的文件路径', aliases: ['目录清单', '查看有哪些文件'] },
         object({ path: field }, []),
         async ({ path = '.' }, ctx) => {
           ctx.signal.throwIfAborted();
@@ -203,6 +205,10 @@ export class FileTools {
       deliver(
         'search_text',
         '在 UTF-8 文件中查找文本，返回文件、行号和截短的匹配行。',
+        {
+          purpose: '在文件中查找原文并定位匹配行',
+          aliases: ['文件全文检索', '查找字符串', '搜索关键词'],
+        },
         object({ query: str(undefined, 1000), path: field }, ['query']),
         async ({ query, path = '.' }, ctx) => {
           ctx.signal.throwIfAborted();
@@ -245,6 +251,7 @@ export class FileTools {
       deliver(
         'read_file',
         '读取 UTF-8 文件，可指定起始行和行数。',
+        { purpose: '读取指定文件的完整行或一段原文', aliases: ['打开文件', '读取文件内容', '指定行号'] },
         object(
           {
             path: field,
@@ -286,6 +293,7 @@ export class FileTools {
       deliver(
         'write_file',
         '创建或覆盖 UTF-8 文件；小说资产应优先使用小说专用工具。',
+        { purpose: '创建文本文件或覆盖它的全部内容', aliases: ['新建文件', '写入整份文件'] },
         object({ path: field, content }),
         async ({ path, content }, ctx) =>
           this.write(await this.path(ctx.session.cwd, path, true), content, ctx),
@@ -293,6 +301,7 @@ export class FileTools {
       deliver(
         'edit_file',
         '替换文件中恰好出现一次的精确文本。',
+        { purpose: '替换文件中唯一匹配的文本', aliases: ['精确替换', '局部编辑文件'] },
         object({ path: field, oldText: str(), newText: content }),
         async ({ path, oldText, newText }, ctx) => {
           const file = await this.path(ctx.session.cwd, path, false),
@@ -311,6 +320,7 @@ export class FileTools {
       deliver(
         'delete_file',
         '永久删除指定单个文件。',
+        { purpose: '永久删除指定单个文件', aliases: ['移除文件'] },
         object({ path: field }),
         async ({ path }, ctx) => {
           const file = await this.path(ctx.session.cwd, path, false);
@@ -336,6 +346,7 @@ export class FileTools {
       deliver(
         'run_command',
         '在工作目录使用 PowerShell（非 Windows 则使用 sh）运行明确的本地开发命令，返回退出码与输出。',
+        { purpose: '在工作目录运行本地开发命令', aliases: ['运行测试', '终端命令', '执行脚本'] },
         object(
           {
             command: str(undefined, 4000),

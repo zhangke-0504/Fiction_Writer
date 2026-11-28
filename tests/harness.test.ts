@@ -230,7 +230,7 @@ test('a cancelled command records the observed stop, not just the abort request'
 
 test('tool discovery exposes only session tools on the next dispatched turn', async (t) => {
   const { workspace, runs, dir, state } = await fixture(t);
-  const session = await runs.create({ cwd: dir });
+  const session = await runs.create({ cwd: dir }, '工具检索夹具');
   const output = join(dir, 'catalog.txt');
   const trace = collectDiagnostics();
   const provider = new ScriptedProvider([
@@ -266,17 +266,87 @@ test('tool discovery exposes only session tools on the next dispatched turn', as
   runs.start(
     session.id,
     '写一个文件',
-    (ctx) =>
-      runAgent(ctx, provider, '', [], '写一个文件', new FileTools(workspace, state).tools(), 12, {}),
+    async (ctx) => {
+      await runAgent(
+        ctx,
+        provider,
+        '',
+        [],
+        '写一个文件',
+        new FileTools(workspace, state).tools(),
+        12,
+        {},
+      );
+    },
     'default',
     trace.report,
   );
   await runs.wait(session.id);
-  assert.equal(runs.get(session.id).run?.status, 'completed', runs.get(session.id).run?.error);
+  assert.equal(
+    runs.get(session.id).run?.status,
+    'completed',
+    runs.get(session.id).run?.error ?? '写入未完成',
+  );
   assert.equal(await readFile(output, 'utf8'), 'discovered');
   assert.deepEqual(trace.rejected, []);
   assert.deepEqual(
     trace.rows.filter((row) => row.event === 'tool.discovery').map((row) => row.fields.count),
     [0, 1],
+  );
+
+  const followUp = new ScriptedProvider([
+    ({ tools }) => {
+      assert.deepEqual(
+        tools.map(({ name }) => name),
+        ['tool_search'],
+      );
+      return assistant('收到');
+    },
+  ]);
+  runs.start(session.id, '继续讨论', async (ctx) => {
+    await runAgent(ctx, followUp, '', [], '继续讨论', new FileTools(workspace, state).tools(), 12, {});
+  });
+  await runs.wait(session.id);
+  assert.equal(
+    runs.get(session.id).run?.status,
+    'completed',
+    runs.get(session.id).run?.error ?? '续轮未完成',
+  );
+});
+
+test('discovery metadata stays out of model definitions and context budget', async (t) => {
+  const { workspace, runs, dir, state } = await fixture(t);
+  const session = await runs.create({ cwd: dir }, '估算夹具');
+  const tools = new FileTools(workspace, state).tools().map((tool) => ({
+    ...tool,
+    discovery: { purpose: '占'.repeat(4_000) },
+  }));
+  const script = new ScriptedProvider([
+    ({ tools }) => {
+      assert.deepEqual(
+        tools.map(({ name }) => name),
+        ['tool_search', 'list_files'],
+      );
+      for (const tool of tools) assert.deepEqual(Object.keys(tool), ['name', 'description', 'schema']);
+      return assistant('', [['tool_search', { query: 'read_file' }]]);
+    },
+    ({ tools }) => {
+      assert.deepEqual(
+        tools.map(({ name }) => name),
+        ['tool_search', 'list_files', 'read_file'],
+      );
+      assert.deepEqual(Object.keys(tools[2]), ['name', 'description', 'schema']);
+      return assistant('可读取');
+    },
+  ]);
+  const provider = Object.assign(script, { inputTokenBudget: 2_000 });
+  runs.start(session.id, '检查读取能力', async (ctx) => {
+    await runAgent(ctx, provider, '', [], '检查读取能力', tools, 12, { bootstrap: ['list_files'] });
+  });
+  await runs.wait(session.id);
+  assert.equal(
+    runs.get(session.id).run?.status,
+    'completed',
+    runs.get(session.id).run?.error ?? '检索未完成',
   );
 });

@@ -266,6 +266,10 @@ export class BookTaskScope {
       name: 'book_task_scope',
       description:
         '按本轮作者实际要求为写作动作登记最小范围。只读或仅提案不用登记。承接同会话待办时用 sourceQuote 引用可见回复并逐项登记仍未满足的结果。主体／伏笔短文修订用 subject.update／clue.update 的 assetPatch 登记当前 revision、已回读的唯一 quote 和确切 replacement，再用 book_patch_asset 提交；不能定位且无全文更新授权时用 assetPending: true 保留待办，不写。对本轮新建且已有实际关联场景提交的资料同步，单独登记 subject.sync／clue.sync，随后用 book_generate_assets(action=update) 只传对应 ID；sync 不代替精确补丁或普通开放式 update。仅开放式更新登记不带 assetPatch 的更新。同章复合补丁分别登记每处 part，例如删除旧段与补入新位置；后续 edits[].part 使用相同标识。依据现稿填写真实文档 ID。待建章先单独登记 chapter.catalog 并实际提交目录，随后登记 chapter.draft；已存章新增场景用 chapter.insert，确需改旧文才用 chapter.patch。整书交付（含未限定指定章节或追加范围的完整多章创作）登记 novel.register（完整章数），明确续接原整书登记 novel.resume（有效记录），然后用 book_get_context.novelGoal 激活；不要逐章代替整书。',
+      discovery: {
+        purpose: '登记本轮已授权的写作范围和最小动作',
+        aliases: ['范围登记', '续办待办', '登记整书目标'],
+      },
       schema: object(
         {
           sourceQuote: str(
