@@ -290,6 +290,17 @@ test('long chapter, subject, clue and outline regions scroll independently withi
 
 test('Harness keeps its scroll regions and composer accessible in a short window', async ({}, info) => {
   test.setTimeout(180_000);
+  const columns = Array.from({ length: 12 }, (_, index) => `第 ${index + 1} 栏`);
+  const longCodeLine = 'chapters/example-scene/'.repeat(20);
+  const wideMarkdown = [
+    `| ${columns.join(' | ')} |`,
+    `| ${columns.map(() => '---').join(' | ')} |`,
+    `| ${columns.map(() => '章节资料').join(' | ')} |`,
+    '',
+    '```text',
+    longCodeLine,
+    '```',
+  ].join('\n');
   let replies = 0;
   const server = createServer(async (request, response) => {
     if (request.method !== 'POST') {
@@ -305,7 +316,7 @@ test('Harness keeps its scroll regions and composer accessible in a short window
       {
         type: 'content_block_start',
         index: 0,
-        content_block: { type: 'text', text: `对话回复 ${index}\n${longBody}` },
+        content_block: { type: 'text', text: `## 对话回复 ${index}\n\n${wideMarkdown}\n\n${longBody}` },
       },
       { type: 'content_block_stop', index: 0 },
       { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
@@ -369,6 +380,22 @@ test('Harness keeps its scroll regions and composer accessible in a short window
     await resize(app, page, windowSizes[1]);
     await wheel(page, feed, -100_000);
     await expect.poll(() => scrollTop(feed)).toBe(0);
+    const firstReply = feed.locator('article.assistant').first();
+    await expect(firstReply.getByRole('heading', { name: '对话回复 1' })).toBeVisible();
+    await expect(firstReply.getByRole('columnheader')).toHaveCount(columns.length);
+    await expect(firstReply.locator('pre > code')).toHaveText(longCodeLine);
+    const feedWidth = await feed.evaluate((el) => el.scrollWidth - el.clientWidth);
+    expect(feedWidth).toBeLessThanOrEqual(scrollEdgeTolerance);
+    for (const block of [firstReply.locator('.chat-table-scroll'), firstReply.locator('pre')]) {
+      const { overflowX, scrollLeft } = await block.evaluate((el) => {
+        el.scrollLeft = el.scrollWidth;
+        return { overflowX: getComputedStyle(el).overflowX, scrollLeft: el.scrollLeft };
+      });
+      expect(overflowX).toMatch(/^(auto|scroll)$/);
+      expect(scrollLeft).toBeGreaterThan(scrollEdgeTolerance);
+    }
+    expect(await scrollTop(feed)).toBe(0);
+    await expectRootFixed(page);
     await requestReply(2);
     expect(await scrollTop(feed)).toBe(0);
     await checkThumb(page, feed, content, true);

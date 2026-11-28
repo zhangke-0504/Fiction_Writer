@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { api } from './bridge';
+import { HarnessMarkdown } from './HarnessMarkdown';
 import { ErrorText, Icon, errorDetails, norm } from './ui';
 import type { ActiveChapter } from './Workspace';
 import type {
@@ -63,7 +64,11 @@ function ChatMessage({ line }: { line: ChatLine }) {
   return (
     <article className={`chat-line ${line.role}`}>
       <strong>{roles[line.role]}</strong>
-      <p>{line.text}</p>
+      {line.role === 'assistant' ? (
+        <HarnessMarkdown text={line.text} />
+      ) : (
+        <p className="chat-body">{line.text}</p>
+      )}
     </article>
   );
 }

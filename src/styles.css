@@ -972,16 +972,79 @@ dialog::backdrop {
   padding: 9px 0;
   border-bottom: 1px solid #e8e8e1;
 }
-.chat-line strong {
+.chat-line > strong {
   font-size: 11px;
   color: var(--teal);
 }
-.chat-line p {
+.chat-body {
   margin: 3px 0;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
   line-height: 1.6;
   font-size: 13px;
+}
+.chat-line > p {
+  white-space: pre-wrap;
+}
+.chat-markdown :where(p, ul, ol, blockquote, pre),
+.chat-table-scroll {
+  margin: 0 0 8px;
+}
+.chat-markdown :where(h1, h2, h3, h4, h5, h6) {
+  margin: 12px 0 4px;
+  font-size: 1.05em;
+  line-height: 1.35;
+}
+.chat-markdown h1 {
+  font-size: 1.4em;
+}
+.chat-markdown h2 {
+  font-size: 1.25em;
+}
+.chat-markdown > :first-child {
+  margin-top: 0;
+}
+.chat-markdown > :last-child,
+.chat-markdown :where(li, blockquote) > :last-child {
+  margin-bottom: 0;
+}
+.chat-markdown :where(ul, ol) {
+  padding-inline-start: 20px;
+}
+.chat-markdown blockquote {
+  border-inline-start: 3px solid var(--border);
+  padding-inline-start: 9px;
+  color: var(--muted);
+}
+.chat-markdown code {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+}
+.chat-markdown :not(pre) > code {
+  border-radius: 3px;
+  padding: 1px 4px;
+  background: var(--soft);
+}
+.chat-markdown pre,
+.chat-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.chat-markdown pre {
+  border-radius: 5px;
+  padding: 7px 9px;
+  background: var(--soft);
+  overflow-wrap: normal;
+}
+.chat-markdown table {
+  border-collapse: collapse;
+  overflow-wrap: normal;
+}
+.chat-markdown :where(th, td) {
+  border: 1px solid var(--border);
+  padding: 3px 7px;
+}
+.chat-markdown th {
+  background: var(--soft);
 }
 .tool-activity {
   border-bottom: 1px solid #e8e8e1;
@@ -1009,7 +1072,7 @@ dialog::backdrop {
   padding: 4px 0;
   color: var(--muted);
 }
-.chat-line.tool p {
+.chat-line.tool > p {
   font-size: 11px;
   display: inline;
   margin-left: 6px;
