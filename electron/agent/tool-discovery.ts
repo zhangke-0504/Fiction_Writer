@@ -7,6 +7,8 @@ const readTools = new Set([
   'book_get_context',
   'book_search_text',
   'book_memory_recall',
+  'web_search',
+  'web_fetch',
 ]);
 const defaultControlTools = ['skill_search', 'skill_load', 'book_task_scope'];
 const controlTools = new Set([...defaultControlTools, 'start_task', 'wait_tasks', 'task_report']);

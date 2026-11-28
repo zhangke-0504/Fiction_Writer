@@ -422,6 +422,25 @@ Harness SHALL 把当前用户消息、有关的同会话上下文及当前会话
 - **WHEN** 模型在同一响应中调用 `tool_search` 并尝试调用此前未声明、由此次搜索命中的工具
 - **THEN** 新发现的工具在本响应中不执行。下一次模型请求实际声明该工具的原有完整定义，后续请求在本 Run 可重复使用它。调用仍须符合现有参数检查和执行前提
 
+### Requirement: The main Agent can research the public web on demand
+
+Harness SHALL make `web_search` and `web_fetch` discoverable as read-only tools for the main Agent. The Agent SHALL choose when to use them through the existing natural-language Session flow. `web_search` SHALL use DuckDuckGo by default without user-provided credentials and return bounded source titles, public URLs and available snippets. `web_fetch` SHALL accept a public HTTP(S) URL and return a bounded extract and its source URL. The tools SHALL follow Run cancellation and bound their response times. Searches with no matches and failed network requests SHALL have distinguishable outcomes.
+
+#### Scenario: Answer a current question with sources
+
+- **WHEN** an author requests current information in the Session composer
+- **THEN** the main Agent can discover and call the web tools, receive source data as a tool result, and use it in the final assistant reply in the same Session
+
+#### Scenario: Read a link provided by the author
+
+- **WHEN** the author gives an accessible public page URL and asks about its contents
+- **THEN** the main Agent can read the page directly without a search
+
+#### Scenario: Web research fails
+
+- **WHEN** the search service refuses a request, the page cannot be read, or a network request times out
+- **THEN** the tool returns an observable failure to the Agent for this Run
+
 ### Requirement: The main agent requests book memory on demand
 
 小说 Harness MUST NOT 在首次主模型请求前从用户措辞猜章，或预先查询并注入作品记忆。主 Agent SHALL 按需发现并调用 `book_memory_recall`，按任务需要传入查询和已定位的 `chapterId`；工具 SHALL 返回在当前作品范围内的有界结果，区分已保存前情、计划与长期约定。指定目标章时不返回其后的正文；未指定目标章时不得把全书正文默认为前情。写章工具已经获知明确章节 ID 后，在该动作内按章取材不受此限制。

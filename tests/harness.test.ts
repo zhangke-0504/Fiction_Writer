@@ -12,6 +12,7 @@ import { FileTools } from '../electron/agent/files.js';
 import { runAgent } from '../electron/agent/loop.js';
 import { runCommand } from '../electron/agent/commands.js';
 import { Gate, ScriptedProvider } from '../electron/agent/scripted.js';
+import { webResearchTools } from '../electron/agent/web-research.js';
 const assistant = (text: string, calls: Array<[string, unknown]> = []) => ({
   role: 'assistant' as const,
   text,
@@ -348,5 +349,123 @@ test('discovery metadata stays out of model definitions and context budget', asy
     runs.get(session.id).run?.status,
     'completed',
     runs.get(session.id).run?.error ?? '检索未完成',
+  );
+});
+
+test('a book session researches Shenzhen weather and returns a final reply grounded in the fetched page', async (t) => {
+  const { runs, dir } = await fixture(t);
+  const session = await runs.create({ cwd: dir, bookId: 'weather-fixture' }, '网页取材夹具');
+  const query = '深圳天气';
+  const source = 'https://weather.example/shenzhen';
+  const title = '深圳天气 &amp; 观测';
+  const observation = '深圳气象站本次观测气温为27°C，东南风二级。';
+  const forbidden = 'RESEARCH_PAGE_SCRIPT';
+  const requested: Request[] = [];
+  const transport: typeof fetch = async (input, init) => {
+    const request = new Request(input, init);
+    requested.push(request);
+    const html =
+      request.url === source
+        ? `<!doctype html><html><head><title>${title}</title></head><body>
+            <script>${forbidden}</script><main><h1>深圳气象站</h1><p>${observation}</p></main>
+          </body></html>`
+        : `<div class="results"><div class="result results_links results_links_deep web-result">
+            <h2 class="result__title"><a class="result__a" href="//duckduckgo.com/l/?uddg=${encodeURIComponent(source)}&amp;rut=fixture">${title}</a></h2>
+            <a class="result__snippet">天气实况和当日观测</a>
+          </div></div>`;
+    const response = new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+    Object.defineProperty(response, 'url', { value: request.url });
+    return response;
+  };
+  const provider = new ScriptedProvider([
+    ({ tools }) => {
+      assert.deepEqual(
+        tools.map(({ name }) => name),
+        ['tool_search'],
+      );
+      return assistant('', [['tool_search', { query: 'web_search web_fetch' }]]);
+    },
+    ({ tools, history }) => {
+      assert.deepEqual(tools.map(({ name }) => name).sort(), ['tool_search', 'web_fetch', 'web_search']);
+      const result = history.at(-1);
+      assert.ok(result?.role === 'tool' && result.result.ok);
+      const value = result.result.value as { candidates: { id: string; access: string }[] };
+      assert.deepEqual(
+        value.candidates.map(({ id, access }) => ({ id, access })),
+        [
+          { id: 'web_search', access: 'read' },
+          { id: 'web_fetch', access: 'read' },
+        ],
+      );
+      return assistant('', [['web_search', { query }]]);
+    },
+    ({ history }) => {
+      const result = history.at(-1);
+      assert.ok(result?.role === 'tool' && result.result.ok);
+      const value = result.result.value as {
+        provider: string;
+        results: { title: string; url: string; snippet: string }[];
+      };
+      assert.equal(value.provider, 'duckduckgo');
+      assert.deepEqual(value.results, [
+        { title: '深圳天气 & 观测', url: source, snippet: '天气实况和当日观测' },
+      ]);
+      return assistant('', [['web_fetch', { url: value.results[0].url }]]);
+    },
+    ({ history }) => {
+      const result = history.at(-1);
+      assert.ok(result?.role === 'tool' && result.result.ok);
+      const value = result.result.value as { url: string; title: string; text: string };
+      assert.equal(value.url, source);
+      assert.equal(value.title, '深圳天气 & 观测');
+      assert.ok(value.text.includes(observation));
+      assert.ok(!value.text.includes(forbidden));
+      const fact = value.text.match(/深圳气象站本次观测[^。]+。/u)?.[0];
+      return assistant(`${fact}\n来源：${value.url}`);
+    },
+  ]);
+  const prompt = '查一下深圳的天气';
+  const trace = collectDiagnostics();
+  runs.start(
+    session.id,
+    prompt,
+    async (ctx) => {
+      await runAgent(ctx, provider, '', [], prompt, webResearchTools(transport), 12, {});
+    },
+    'default',
+    trace.report,
+  );
+  await runs.wait(session.id);
+  const view = runs.get(session.id);
+  assert.equal(view.run?.status, 'completed', view.run?.error);
+  assert.equal(view.messages.at(-1)?.role, 'assistant');
+  assert.equal(view.messages.at(-1)?.text, `${observation}\n来源：${source}`);
+  assert.equal(requested.length, 2);
+  assert.equal(requested[0].url, 'https://html.duckduckgo.com/html/');
+  assert.equal(requested[0].method, 'POST');
+  assert.equal(new URLSearchParams(await requested[0].text()).get('q'), query);
+  assert.equal(requested[1].url, source);
+  assert.equal(requested[1].method, 'GET');
+  assert.deepEqual(trace.rejected, []);
+  assert.deepEqual(
+    trace.rows.filter(({ event }) => event === 'tool.result_sent').map(({ fields }) => fields.tool),
+    ['tool_search', 'web_search', 'web_fetch'],
+  );
+});
+
+test('DuckDuckGo challenges surface as a search error', async () => {
+  const [search] = webResearchTools(
+    async () =>
+      new Response('<form action="/anomaly.js">Verify you are a human</form>', {
+        status: 202,
+        headers: { 'content-type': 'text/html' },
+      }),
+  );
+  await assert.rejects(
+    search.execute(
+      { query: '深圳天气' },
+      { session: { cwd: '.' }, signal: new AbortController().signal },
+    ),
+    { diagnosticReason: 'http_error', message: /DuckDuckGo.*人工验证/u },
   );
 });

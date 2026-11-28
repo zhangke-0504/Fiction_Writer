@@ -171,6 +171,8 @@ const tool = one(
   'book_memory_remember',
   'book_memory_forget',
   'tool_search',
+  'web_search',
+  'web_fetch',
   'book_task_scope',
   'start_task',
   'wait_tasks',

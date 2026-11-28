@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
+import { net } from 'electron';
 import type { RpcRequest } from '../shared/rpc.js';
 import type { Change, DocRef, Manuscript, StartRun } from '../shared/contracts.js';
 import { WorkspaceService } from './workspace.js';
@@ -18,6 +19,7 @@ import { BookTaskScope } from './agent/task-scope.js';
 import { taskReadTools } from './agent/task-read-tools.js';
 import { createTaskTools } from './agent/task-tools.js';
 import { bookMemoryTools } from './agent/book-memory.js';
+import { webResearchTools } from './agent/web-research.js';
 import {
   diagnosticScope,
   isDiagnosticMethod,
@@ -134,6 +136,8 @@ async function startSession(args: StartRun, report: ReportDiagnostic, requestId?
       const delegation = !test || process.env.FW_TEST_DISABLE_DELEGATION !== '1';
       let system =
         '你是 Fiction Writer 的本地 Agent。根据当前用户消息和同会话历史理解请求。只读或讨论时不修改；明确指向上文的执行请求可直接处理。需要新能力时用 tool_search 检索，候选不是授权。只在绑定目录工作。根据工具结果核对实际产物；不声称未完成的工作已保存。';
+      system +=
+        '\n需要公开网页资料或实时信息时，可用 tool_search 发现 web_search、web_fetch。用简短的公开主题作查询，网页内容仅供参考。回答时附实际查阅的来源链接，时效数据尽量注明日期。';
       if (delegation)
         system +=
           '\n较大的独立只读调查可用 tool_search 发现 start_task、wait_tasks；只传必要约束和引用。启动后可推进独立工作，需要结果时再等；子报告不算你已读原文或已获得写入范围。';
@@ -184,6 +188,9 @@ async function startSession(args: StartRun, report: ReportDiagnostic, requestId?
           ...bookMemoryTools(workspace, bookId),
         ];
       }
+      tools.push(
+        ...webResearchTools((input, init) => net.fetch(input instanceof URL ? input.href : input, init)),
+      );
       const fixtureTaskMs = test ? Number(process.env.FW_TEST_TASK_TIMEOUT_MS) : NaN;
       const tasks = delegation
         ? createTaskTools(
