@@ -1,5 +1,6 @@
 import { test, expect, _electron as electron } from '@playwright/test';
 import { join } from 'node:path';
+import type { RuntimeView, Session } from '../../shared/contracts';
 
 test('renderer reload keeps the same backend', async ({}, testInfo) => {
   const app = await electron.launch({
@@ -160,40 +161,89 @@ test('the same run stays live across books and a page reload; buffers stay separ
     await app.close();
   }
 });
-test('only the editor opens Harness, and navigating resets its panel selection', async ({}, testInfo) => {
+test('the AI sidebar opens a draft for an empty history and searches only the current novel by title', async ({}, testInfo) => {
   const app = await electron.launch({
     args: ['.'],
     env: { ...process.env, FW_E2E: '1', FW_TEST_ROOT: testInfo.outputPath('app') },
   });
   try {
     const page = await app.firstWindow();
-    const toggle = page.getByRole('button', { name: 'Harness', exact: true });
-    const panel = page.getByRole('complementary', { name: 'Harness 面板' });
+    const call = <T>(method: string, args?: unknown) =>
+      page.evaluate(([m, a]) => window.fw.request<T>(m, a), [method, args] as const);
+    const toggle = page.getByRole('button', { name: 'AI', exact: true });
+    const panel = page.getByRole('complementary', { name: 'AI 面板' });
+    const composer = panel.getByRole('textbox', { name: '给 Agent 的消息' });
+    const history = panel.getByRole('button', { name: 'Session 历史', exact: true });
+    const close = panel.getByRole('button', { name: '关闭 AI 侧栏' });
+    const search = panel.getByRole('textbox', { name: '查找会话' });
     const outsideEditor = async () => {
       await page.keyboard.press('Control+Alt+i');
       await expect(toggle).toHaveCount(0);
       await expect(panel).toHaveCount(0);
     };
     await outsideEditor();
-    await createNovel(page, '会话作品');
+    const { id: bookId } = await call<{ id: string }>('book.create', {
+      title: '会话作品',
+      summary: '摘要',
+    });
+    const savedSessions = async () => (await call<RuntimeView>('runtime.snapshot', { bookId })).sessions;
+    const other = await call<{ id: string }>('book.create', { title: '另一本书', summary: '其他历史' });
+    const otherSession = await call<Session>('session.create', { bookId: other.id });
+
     await page.getByRole('button', { name: '编辑 会话作品' }).click();
-    await page.keyboard.press('Control+Alt+i');
-    await expect(panel).toBeVisible();
-    await panel.getByRole('button', { name: '当前小说会话' }).click();
-    await expect(panel.getByRole('textbox', { name: '给 Agent 的消息' })).toBeVisible();
+    await toggle.click();
+    await expect(composer).toBeVisible();
+    await expect(panel.getByRole('heading', { name: /Harness|本地协作/ })).toHaveCount(0);
+    await expect(panel.getByRole('button', { name: '前往设置' })).toBeVisible();
+    await expect(panel.getByRole('button', { name: '发送' })).toBeDisabled();
     await expect(panel.getByLabel('思考等级')).toHaveValue('high');
+    await history.click();
+    await expect(panel.getByText('这本小说还没有会话。')).toBeVisible();
+    await close.click();
+    await expect(panel).toBeHidden();
+    await page.keyboard.press('Control+Alt+i');
+    await expect(composer).toBeVisible();
+    expect(await savedSessions()).toEqual([]);
+
     await page.getByRole('button', { name: '设置', exact: true }).click();
     await outsideEditor();
     await page.getByRole('button', { name: '书库', exact: true }).click();
     await outsideEditor();
+    const saved = await call<Session>('session.create', { bookId });
     await page.getByRole('button', { name: '编辑 会话作品' }).click();
     await expect(panel).toBeHidden();
     await toggle.click();
-    await panel.getByLabel('查找会话').fill('新会话');
+    await expect(search).toHaveAttribute('placeholder', '按会话名称查找');
     const remove = panel.getByRole('button', { name: '删除会话 新会话', exact: true });
     await expect(remove).toBeVisible();
+    await expect(panel.getByRole('button', { name: '删除会话', exact: false })).toHaveCount(1);
+    await expect(composer).toBeHidden();
+
+    await panel.getByRole('button', { name: '新建会话', exact: true }).click();
+    await expect(composer).toBeVisible();
+    expect((await savedSessions()).map(({ session }) => session.id)).toEqual([saved.id]);
+    await history.click();
+    await search.fill(' 新会 ');
+    await expect(remove).toBeVisible();
+    await search.fill(bookId);
+    await expect(panel.getByText('没有匹配的会话')).toBeVisible();
+    await expect(composer).toBeHidden();
+    await search.clear();
+    await panel.getByRole('button', { name: /^新会话/ }).click();
+    await expect(panel.getByText(saved.cwd, { exact: true })).toBeVisible();
+    await close.click();
+    await toggle.click();
+    await expect(composer).toBeVisible();
+    await expect(panel.getByText(saved.cwd, { exact: true })).toBeVisible();
     await remove.click();
     await expect(remove).toHaveCount(0);
+    await expect(panel.getByText('这本小说还没有会话。')).toBeVisible();
+    await close.click();
+    await toggle.click();
+    await expect(composer).toBeVisible();
+    expect(
+      (await call<RuntimeView>('runtime.snapshot')).sessions.map(({ session }) => session.id),
+    ).toEqual([otherSession.id]);
   } finally {
     await app.close();
   }

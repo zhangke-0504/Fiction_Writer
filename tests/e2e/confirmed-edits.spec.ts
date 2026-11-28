@@ -350,9 +350,8 @@ for (const { label, request, approval, object } of variants)
       const files = await Promise.all(scenes.map((n) => read(`chapters/${ch(n)}.md`)));
       await page.reload();
       await page.getByRole('button', { name: '编辑 暗线确认', exact: true }).click();
-      await page.getByRole('button', { name: 'Harness', exact: true }).click();
-      const panel = page.getByRole('complementary', { name: 'Harness 面板' });
-      await panel.getByRole('button', { name: '当前小说会话', exact: true }).click();
+      await page.getByRole('button', { name: 'AI', exact: true }).click();
+      const panel = page.getByRole('complementary', { name: 'AI 面板' });
       const send = async (s: string) => {
         const field = panel.getByLabel('给 Agent 的消息');
         await field.fill(s);

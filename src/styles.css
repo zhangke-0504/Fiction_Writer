@@ -880,9 +880,9 @@ dialog::backdrop {
   padding: 14px;
   border-bottom: 1px solid var(--border);
 }
-.harness-header h2 {
-  margin: 3px 0 0;
-  font-size: 18px;
+.harness-header {
+  justify-content: flex-end;
+  padding-block: 8px;
 }
 .harness-header .icon-button {
   width: 31px;
@@ -902,12 +902,6 @@ dialog::backdrop {
 }
 .session-list .search-box {
   margin-bottom: 9px;
-}
-.session-actions {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin-bottom: 11px;
 }
 .session-row {
   display: flex;

@@ -162,6 +162,8 @@ async function checkThumb(page: Page, region: Locator, neighbor: Locator, startA
   const before = await scrollTop(region);
   const neighborTop = await scrollTop(neighbor);
   await page.mouse.move(x, y);
+  // A hidden Electron window can defer updating the native scrollbar hit area.
+  await delay(75);
   await page.mouse.down();
   try {
     expect(Math.abs((await scrollTop(region)) - before)).toBeLessThanOrEqual(scrollEdgeTolerance);
@@ -235,10 +237,10 @@ test('long chapter, subject, clue and outline regions scroll independently withi
         const listTop = await scrollTop(content);
         await asset.click();
         await expect(heading(name)).toBeVisible();
+        await expect(content.locator('.asset-body')).toContainText('第 60 行测试正文');
         expect(await scrollTop(content)).toBe(0);
         if (section === '主体' && size === windowSizes[0]) await checkThumb(page, content, chapters);
         await checkWheel(page, content, chapters);
-        await expect(content.locator('.asset-body')).toContainText('第 60 行测试正文');
         if (section === '伏笔') {
           const links = content.locator('.references');
           await expect(links).toBeInViewport();
@@ -253,14 +255,14 @@ test('long chapter, subject, clue and outline regions scroll independently withi
         await expect.poll(() => scrollTop(content)).toBe(listTop);
       }
 
-      await button(page, 'Harness').click();
+      await button(page, 'AI').click();
       for (const name of ['大纲', '测试章节 28']) {
         await button(page, name).click();
         await expect(heading(name)).toBeVisible();
         await checkWheel(page, editor, chapters);
         await expect(button(page, '保存')).toBeInViewport({ ratio: 1 });
       }
-      await button(page, '关闭 Harness').click();
+      await button(page, '关闭 AI 侧栏').click();
     }
 
     await button(page, '主体').click();
@@ -341,8 +343,8 @@ test('Harness keeps its scroll regions and composer accessible in a short window
     });
     for (let index = 0; index < 25; index++) await rpc<Session>(page, 'session.create', { bookId });
     await button(page, '主体').click();
-    await button(page, 'Harness').click();
-    const panel = page.getByRole('complementary', { name: 'Harness 面板' });
+    await button(page, 'AI').click();
+    const panel = page.getByRole('complementary', { name: 'AI 面板' });
     const list = panel.locator('.session-list');
     const content = page.locator('.workspace-content');
     const field = panel.getByLabel('给 Agent 的消息');

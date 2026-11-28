@@ -177,8 +177,7 @@ test('a rejected Harness submission displays an ID that correlates both files, w
       fixture.credential,
     );
     await page.getByRole('button', { name: '编辑 日志夹具' }).click();
-    await page.getByRole('button', { name: 'Harness', exact: true }).click();
-    await page.getByRole('button', { name: '当前小说会话', exact: true }).click();
+    await page.getByRole('button', { name: 'AI', exact: true }).click();
     await expect(page.getByLabel('给 Agent 的消息')).toBeVisible();
     await app.evaluate(({ dialog }, path) => {
       dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [path] });
@@ -369,8 +368,7 @@ test('local diaries reconstruct concurrent runs and actual tool decisions withou
     }));
     await expect.poll(() => sawAgentInput).toBe(true);
     await page.getByRole('button', { name: '编辑 日志正文夹具' }).click();
-    await page.getByRole('button', { name: 'Harness', exact: true }).click();
-    await page.getByRole('button', { name: '当前小说会话', exact: true }).click();
+    await page.getByRole('button', { name: 'AI', exact: true }).click();
     await page.getByLabel('给 Agent 的消息').fill('fail only this Run');
     await page.getByRole('button', { name: '发送', exact: true }).click();
     const referenceTag = page.getByLabel('诊断编号');

@@ -62,13 +62,12 @@ test('Harness keyboard and button share submission, protect IME and trace a Mess
       title: '快捷键夹具',
       summary: '受控验收。',
     });
-    const panel = page.getByRole('complementary', { name: 'Harness 面板' });
+    const panel = page.getByRole('complementary', { name: 'AI 面板' });
     const field = panel.getByLabel('给 Agent 的消息');
     const button = (name: string) => page.getByRole('button', { name, exact: true });
     const open = async () => {
       await button('编辑 快捷键夹具').click();
-      await button('Harness').click();
-      await panel.getByRole('button', { name: '当前小说会话', exact: true }).click();
+      await button('AI').click();
       await expect(field).toBeVisible();
     };
     const rows = () => rpc<RuntimeView>('runtime.snapshot');
@@ -83,7 +82,7 @@ test('Harness keyboard and button share submission, protect IME and trace a Mess
     await expect(button('发送')).toBeDisabled();
     await field.press('Enter');
     await expect(field).toHaveValue('没有模型时保留输入');
-    expect(await active()).toBeUndefined();
+    expect((await rows()).sessions).toEqual([]);
     const profile = await rpc<{ id: string }>('profiles.save', {
       name: '合成 Messages',
       model: 'fixture',
@@ -141,6 +140,7 @@ test('Harness keyboard and button share submission, protect IME and trace a Mess
     await expect(panel.getByText(returned, { exact: true })).toBeVisible();
     await expect(panel.getByText(temporary, { exact: true })).toHaveCount(0);
     expect(bodies[1]).toEqual(bodies[0]);
+    expect((await rows()).sessions).toHaveLength(1);
     expect((await active())!.messages.filter((m) => m.role === 'user').map((m) => m.text)).toEqual([
       typed,
     ]);

@@ -21,7 +21,7 @@ function App() {
     pageSize: 1,
   });
   const editorBook = settings ? undefined : bookId;
-  const { view, refresh, error } = useRuntime(editorBook);
+  const { view, ready, refresh, error } = useRuntime(editorBook);
   const drafts = useRef<Drafts>(new Map());
   useEffect(() => {
     api.diagnostic('ui.ready', {});
@@ -102,7 +102,7 @@ function App() {
               onClick={() => setOpen((value) => !value)}
             >
               <Icon name="chat" />
-              Harness
+              AI
             </button>
           )}
         </div>
@@ -143,6 +143,7 @@ function App() {
             open={open}
             close={() => setOpen(false)}
             view={view}
+            ready={ready}
             bookId={editorBook}
             chapter={chapter}
             profiles={profiles}

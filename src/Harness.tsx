@@ -156,10 +156,13 @@ function DiagnosticId({ id }: { id?: string }) {
     </p>
   );
 }
+type Conversation = 'new' | { id: string; pending?: Session };
+
 export function Harness({
   open,
   close,
   view,
+  ready,
   bookId,
   chapter,
   profiles,
@@ -169,14 +172,15 @@ export function Harness({
   open: boolean;
   close: () => void;
   view: RuntimeView;
+  ready: boolean;
   bookId: string;
   chapter?: ActiveChapter;
   profiles: ModelProfile[];
   settings: () => void;
   backendError?: string;
 }) {
-  const [selectedId, select] = useState(''),
-    [list, setList] = useState(true),
+  const [conversation, setConversation] = useState<Conversation>(),
+    [historyOpen, setHistoryOpen] = useState(false),
     [query, setQuery] = useState('');
   const [prompt, setPrompt] = useState(''),
     [profileId, setProfile] = useState(''),
@@ -191,25 +195,37 @@ export function Harness({
   const composing = useRef(false);
   const composerHint = useId();
   const sessions = view.sessions.filter((s) => s.session.bookId === bookId);
-  const current = sessions.find((s) => s.session.id === selectedId);
+  const selection = typeof conversation === 'object' ? conversation : undefined;
+  const current = sessions.find((s) => s.session.id === selection?.id);
+  const session = current?.session ?? selection?.pending;
+  const showList = historyOpen || (!session && conversation !== 'new' && sessions.length > 0);
+  const search = norm(query);
   const rows = sessions
     .sort((a, b) => b.session.updated.localeCompare(a.session.updated))
-    .filter((s) => norm(`${s.session.label} ${s.session.cwd}`).includes(norm(query)));
-  const running = current?.run?.status === 'running',
+    .filter((s) => norm(s.session.label).includes(search));
+  const run = current?.run,
+    running = run?.status === 'running',
     profile = profiles.find((p) => p.id === profileId) ?? profiles[0];
   const hasChapter = !!chapter && chapter.bookId === bookId;
   const canSend = !!(
-    current &&
+    ready &&
+    !showList &&
     profile &&
-    !current.session.missing &&
+    !session?.missing &&
     !busy &&
     !running &&
     prompt.trim()
   );
   useEffect(() => {
-    if (open && !list && sticky.current && feed.current)
+    if (current && selection?.pending) setConversation({ id: current.session.id });
+  }, [current, selection]);
+  useEffect(() => {
+    if (!open && ready && !session && !sessions.length) setHistoryOpen(false);
+  }, [open, ready, session, sessions.length]);
+  useEffect(() => {
+    if (open && ready && !showList && sticky.current && feed.current)
       feed.current.scrollTop = feed.current.scrollHeight;
-  }, [open, list, current]);
+  }, [open, ready, showList, current]);
   async function perform(work: () => Promise<void>) {
     setBusy(true);
     setError('');
@@ -224,35 +240,34 @@ export function Harness({
       setBusy(false);
     }
   }
-  function selectSession(id: string) {
-    select(id);
-    setList(false);
+  function openConversation(next: Conversation) {
+    setConversation(next);
+    setHistoryOpen(false);
     setError('');
     setFailureId(undefined);
     setAttachments([]);
     sticky.current = true;
   }
-  async function create() {
-    await perform(async () => {
-      const created = await api.request<Session>('session.create', { bookId });
-      selectSession(created.id);
-    });
-  }
   async function send(e: FormEvent) {
     e.preventDefault();
-    if (!canSend || !current || !profile || submitting.current) return;
+    if (!canSend || !profile || submitting.current) return;
+    const options: Omit<StartRun, 'id'> = {
+      profileId: profile.id,
+      prompt: prompt.trim(),
+      effort,
+      attachments: [...attachments],
+      chapterId: hasChapter ? chapter.chapterId : undefined,
+    };
     submitting.current = true;
     try {
       await perform(async () => {
-        const args: StartRun = {
-          id: current.session.id,
-          profileId: profile.id,
-          prompt: prompt.trim(),
-          effort,
-          attachments: [...attachments],
-          chapterId: hasChapter ? chapter.chapterId : undefined,
-        };
-        await api.request('session.start', args);
+        let target = session;
+        if (!target) {
+          setConversation('new');
+          target = await api.request<Session>('session.create', { bookId });
+          setConversation({ id: target.id, pending: target });
+        }
+        await api.request('session.start', { ...options, id: target.id });
         setPrompt('');
         setAttachments([]);
         sticky.current = true;
@@ -264,30 +279,23 @@ export function Harness({
   const remove = (id: string) =>
     perform(async () => {
       await api.request('session.delete', { id });
-      if (selectedId === id) {
-        select('');
-        setList(true);
+      if (selection?.id === id) {
+        setConversation(undefined);
+        setHistoryOpen(true);
         setAttachments([]);
       }
     });
-  const showList = list || !current;
   return (
-    <aside className="harness" aria-label="Harness 面板" hidden={!open}>
+    <aside className="harness" aria-label="AI 面板" hidden={!open}>
       <header className="harness-header">
-        <div>
-          <p className="eyebrow">本地协作</p>
-          <h2>Harness</h2>
-        </div>
         <div className="actions">
           <button
             className="icon-button"
             title="Session 历史"
             aria-label="Session 历史"
-            aria-pressed={showList}
-            onClick={() => {
-              if (current) setList(!list);
-              else setList(true);
-            }}
+            aria-pressed={ready && showList}
+            disabled={!ready || busy}
+            onClick={() => setHistoryOpen(!showList)}
           >
             <Icon name="outline" />
           </button>
@@ -295,37 +303,47 @@ export function Harness({
             className="icon-button"
             title="新建会话"
             aria-label="新建会话"
-            onClick={() => void create()}
-            disabled={busy}
+            onClick={() => {
+              setPrompt('');
+              openConversation('new');
+            }}
+            disabled={!ready || busy}
           >
             <Icon name="plus" />
           </button>
-          <button className="icon-button" title="关闭 Harness" aria-label="关闭 Harness" onClick={close}>
+          <button className="icon-button" title="关闭 AI 侧栏" aria-label="关闭 AI 侧栏" onClick={close}>
             <Icon name="close" />
           </button>
         </div>
       </header>
-      {showList ? (
+      {!ready ? (
+        <div className="session-list">
+          {backendError ? (
+            <ErrorText text={backendError} />
+          ) : (
+            <p className="muted" role="status">
+              正在加载会话…
+            </p>
+          )}
+        </div>
+      ) : showList ? (
         <section className="session-list scroll-region" aria-label="会话列表" tabIndex={0}>
           <h3>Session 历史</h3>
           <label className="search-box">
             <Icon name="search" />
             <input
               aria-label="查找会话"
-              placeholder="按名称或目录查找"
+              placeholder="按会话名称查找"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
           </label>
-          <div className="session-actions">
-            <button className="primary" onClick={() => void create()} disabled={busy}>
-              <Icon name="plus" size={15} />
-              当前小说会话
-            </button>
-          </div>
           {rows.map(({ session, run }) => (
             <div className="session-row" key={session.id}>
-              <button className="session-link text-button" onClick={() => selectSession(session.id)}>
+              <button
+                className="session-link text-button"
+                onClick={() => openConversation({ id: session.id })}
+              >
                 <strong>{session.label}</strong>
                 <small title={session.cwd}>
                   {session.missing ? '工作区不可用' : run ? runStatusLabel(run) : basename(session.cwd)}
@@ -342,7 +360,9 @@ export function Harness({
             </div>
           ))}
           {!rows.length && (
-            <div className="empty-mini">{query ? '没有匹配的会话' : '这本小说还没有会话。'}</div>
+            <div className="empty-mini">
+              {sessions.length ? '没有匹配的会话' : '这本小说还没有会话。'}
+            </div>
           )}
           <ErrorText text={error || backendError} />
           <DiagnosticId id={failureId} />
@@ -351,20 +371,24 @@ export function Harness({
         <>
           <div className="session-context">
             <div>
-              <strong>{current.session.label}</strong>
-              <small title={current.session.cwd}>
-                <Icon name="folder" size={13} />
-                {current.session.cwd}
-              </small>
+              <strong>{session?.label ?? '新会话'}</strong>
+              {session && (
+                <small title={session.cwd}>
+                  <Icon name="folder" size={13} />
+                  {session.cwd}
+                </small>
+              )}
             </div>
-            <button
-              className="icon-button destructive"
-              aria-label={`删除会话 ${current.session.label}`}
-              onClick={() => void remove(current.session.id)}
-              disabled={busy}
-            >
-              <Icon name="trash" size={15} />
-            </button>
+            {session && (
+              <button
+                className="icon-button destructive"
+                aria-label={`删除会话 ${session.label}`}
+                onClick={() => void remove(session.id)}
+                disabled={busy}
+              >
+                <Icon name="trash" size={15} />
+              </button>
+            )}
           </div>
           <div
             className="chat-feed scroll-region"
@@ -377,9 +401,9 @@ export function Harness({
             role="region"
             tabIndex={0}
           >
-            <ChatTranscript key={current.session.id} messages={current.messages} />
-            {current.streaming && <ChatMessage line={{ role: 'assistant', text: current.streaming }} />}
-            {!current.messages.length && (
+            {current && <ChatTranscript key={current.session.id} messages={current.messages} />}
+            {current?.streaming && <ChatMessage line={{ role: 'assistant', text: current.streaming }} />}
+            {!current?.messages.length && (
               <div className="chat-empty">
                 <span className="book-mark">
                   <Icon name="spark" size={21} />
@@ -388,9 +412,9 @@ export function Harness({
                 <p>直接说你想做什么：讨论故事、维护资料、写一章或写整本。</p>
               </div>
             )}
-            {current.run && (
+            {run && (
               <p className={`run-status ${running ? 'running' : ''}`} role="status">
-                {runStatusText(current.run)}
+                {runStatusText(run)}
               </p>
             )}
           </div>
@@ -400,9 +424,7 @@ export function Harness({
               <DiagnosticId
                 id={
                   failureId ??
-                  (current.run?.status === 'failed' || current.run?.status === 'interrupted'
-                    ? current.run.id
-                    : undefined)
+                  (run?.status === 'failed' || run?.status === 'interrupted' ? run.id : undefined)
                 }
               />
               {!profile && (
@@ -413,7 +435,7 @@ export function Harness({
                   </button>
                 </p>
               )}
-              {current.session.missing && <p className="notice">工作区已删除或不可用，历史仍可查看。</p>}
+              {session?.missing && <p className="notice">工作区已删除或不可用，历史仍可查看。</p>}
               {!!attachments.length && (
                 <div className="attachment-list">
                   {attachments.map((path) => (
@@ -494,12 +516,12 @@ export function Harness({
                 <option value="medium">Medium</option>
                 <option value="high">High</option>
               </select>
-              {running ? (
+              {running && session ? (
                 <button
                   type="button"
                   onClick={() =>
                     void perform(async () => {
-                      await api.request('session.stop', { id: current.session.id });
+                      await api.request('session.stop', { id: session.id });
                     })
                   }
                   disabled={busy}

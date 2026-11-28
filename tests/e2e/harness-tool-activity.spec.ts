@@ -81,8 +81,8 @@ test('Harness reopens Markdown replies and legacy tool groups without a progress
     expect(restored?.messages).toEqual(messages);
 
     await page.getByRole('button', { name: '编辑 活动折叠', exact: true }).click();
-    await page.getByRole('button', { name: 'Harness', exact: true }).click();
-    const panel = page.getByRole('complementary', { name: 'Harness 面板' });
+    await page.getByRole('button', { name: 'AI', exact: true }).click();
+    const panel = page.getByRole('complementary', { name: 'AI 面板' });
     await panel.getByRole('button', { name: new RegExp(`^${prompt}`) }).click();
     const feed = panel.getByLabel('对话消息');
     const groups = feed.locator('details');

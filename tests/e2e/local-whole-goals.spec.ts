@@ -194,8 +194,8 @@ async function harness(
       },
       openHarness: async (prompt: string) => {
         await page.getByRole('button', { name: '编辑 灯塔日志', exact: true }).click();
-        await page.getByRole('button', { name: 'Harness', exact: true }).click();
-        const panel = page.getByRole('complementary', { name: 'Harness 面板' });
+        await page.getByRole('button', { name: 'AI', exact: true }).click();
+        const panel = page.getByRole('complementary', { name: 'AI 面板' });
         await panel.getByRole('button', { name: new RegExp('^' + prompt.slice(0, 16)) }).click();
         return panel;
       },

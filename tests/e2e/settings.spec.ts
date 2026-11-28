@@ -1,6 +1,6 @@
 import { test, expect, _electron as electron } from '@playwright/test';
 import { createServer } from 'node:http';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ModelProfile, RuntimeView, Session } from '../../shared/contracts';
 
@@ -113,34 +113,41 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
     const unrelated = await request<Session>('session.create', { cwd: dir });
     const enter = async (title: string) => {
       await page.getByRole('button', { name: `编辑 ${title}`, exact: true }).click();
-      await page.getByRole('button', { name: 'Harness', exact: true }).click();
-      return page.getByRole('complementary', { name: 'Harness 面板' });
+      await page.getByRole('button', { name: 'AI', exact: true }).click();
+      return page.getByRole('complementary', { name: 'AI 面板' });
     };
+    const sessionsFor = async (bookId: string) =>
+      (await request<RuntimeView>('runtime.snapshot', { bookId })).sessions;
     const panel = await enter('配置信息 A');
-    await panel.getByRole('button', { name: '当前小说会话' }).click();
     await expect(panel.getByLabel('模型')).toBeVisible();
-    const id = (await request<RuntimeView>('runtime.snapshot', { bookId: first.id })).sessions[0].session
-      .id;
-    expect(id).not.toBe(unrelated.id);
-    await expect(
-      request('session.start', {
-        id,
-        profileId: a.id,
-        prompt: 'fixture',
-        attachments: [join(dir, 'missing.md')],
-      }),
-    ).rejects.toThrow('无法附加文件');
-    expect(requests).toHaveLength(0);
+    expect(await sessionsFor(first.id)).toEqual([]);
     await app.evaluate(({ dialog }, file) => {
       dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [file] });
     }, text);
     await panel.getByRole('button', { name: '添加参考文件' }).click();
-    await expect(panel.getByText('info.md', { exact: true })).toBeVisible();
+    const attachment = panel.getByText('info.md', { exact: true });
+    await expect(attachment).toBeVisible();
     await panel.getByLabel('模型').selectOption(a.id);
     await panel.getByLabel('思考等级').selectOption('high');
-    await panel.getByLabel('给 Agent 的消息').fill('使用我的参考文件');
-    await panel.getByRole('button', { name: '发送' }).click();
+    const composer = panel.getByLabel('给 Agent 的消息');
+    const send = panel.getByRole('button', { name: '发送' });
+    await composer.fill('使用我的参考文件');
+    await unlink(text);
+    await send.click();
+    await expect(panel.getByText(/无法附加文件/)).toBeVisible();
+    await expect(composer).toHaveValue('使用我的参考文件');
+    await expect(attachment).toBeVisible();
+    const rejected = await sessionsFor(first.id);
+    expect(rejected).toHaveLength(1);
+    const id = rejected[0].session.id;
+    expect(rejected[0].messages).toEqual([]);
+    expect(id).not.toBe(unrelated.id);
+    expect(await sessionsFor(second.id)).toEqual([]);
+    expect(requests).toHaveLength(0);
+    await writeFile(text, '最初版本', 'utf8');
+    await send.click();
     await expect(panel.getByText('第一段', { exact: true })).toBeVisible();
+    expect((await sessionsFor(first.id)).map(({ session }) => session.id)).toEqual([id]);
     await panel.getByLabel('模型').selectOption(b.id);
     await panel.getByLabel('思考等级').selectOption('low');
     await writeFile(text, '已变更', 'utf8');
@@ -184,7 +191,6 @@ test('encrypted profiles, routing selection, effort fallback and attachment snap
     const secondPanel = await enter('配置信息 B');
     await expect(secondPanel.getByText('使用我的参考文件', { exact: true })).toHaveCount(0);
     await expect(secondPanel.getByText(unrelated.label, { exact: true })).toHaveCount(0);
-    await secondPanel.getByRole('button', { name: '当前小说会话' }).click();
     await secondPanel.getByLabel('模型').selectOption(a.id);
     await secondPanel.getByLabel('给 Agent 的消息').fill('用同一配置处理另一本书');
     await secondPanel.getByRole('button', { name: '发送' }).click();

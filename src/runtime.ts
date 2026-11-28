@@ -9,9 +9,11 @@ import { errorMessage } from './ui';
 const emptyView: RuntimeView = { cursor: 0, sessions: [] };
 export function useRuntime(bookId: string | undefined) {
   const [loaded, setLoaded] = useState<{ bookId: string | undefined; view: RuntimeView }>();
-  const [refresh, setRefresh] = useState<UiRefreshContext>({ reason: 'load' }),
-    [error, setError] = useState('');
+  const [refresh, setRefresh] = useState<UiRefreshContext>({ reason: 'load' });
+  const [failure, setFailure] = useState<{ bookId: string | undefined; message: string }>();
   useEffect(() => {
+    setLoaded(undefined);
+    setFailure(undefined);
     let disposed = false,
       loading = false,
       needed = true,
@@ -61,11 +63,11 @@ export function useRuntime(bookId: string | undefined) {
             traceTrigger ??= trigger;
             needed = true;
           }
-          setError('');
+          setFailure(undefined);
         } else reload?.finish('superseded');
       } catch (e) {
         reload?.finish(disposed || current !== epoch ? 'superseded' : 'failed');
-        if (!disposed && current === epoch) setError(errorMessage(e));
+        if (!disposed && current === epoch) setFailure({ bookId, message: errorMessage(e) });
       } finally {
         loading = false;
         if (needed) schedule();
@@ -128,5 +130,11 @@ export function useRuntime(bookId: string | undefined) {
       clearTimeout(timer);
     };
   }, [bookId]);
-  return { view: loaded?.bookId === bookId ? (loaded?.view ?? emptyView) : emptyView, refresh, error };
+  const snapshot = loaded?.bookId === bookId ? loaded : undefined;
+  return {
+    view: snapshot?.view ?? emptyView,
+    ready: !!snapshot,
+    refresh,
+    error: failure?.bookId === bookId ? failure?.message : undefined,
+  };
 }

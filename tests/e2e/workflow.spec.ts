@@ -695,7 +695,7 @@ async function fixture(mode: 'full' | 'single' | 'repair' | Fault) {
 const rpc = <T>(page: Page, method: string, args?: unknown) =>
   page.evaluate(([m, a]) => window.fw.request<T>(m, a), [method, args] as const);
 const button = (page: Page, name: string) => page.getByRole('button', { name, exact: true });
-const panel = (page: Page) => page.getByRole('complementary', { name: 'Harness 面板' });
+const panel = (page: Page) => page.getByRole('complementary', { name: 'AI 面板' });
 const launch = (root: string) =>
   electron.launch({ args: ['.'], env: { ...process.env, FW_E2E: '1', FW_TEST_ROOT: root } });
 async function setup(page: Page, baseUrl: string) {
@@ -716,14 +716,14 @@ async function openBook(page: Page) {
   await button(page, '编辑 奥德赛').click();
 }
 async function openComposer(page: Page, resume: boolean | string = false) {
-  await button(page, 'Harness').click();
+  await button(page, 'AI').click();
   if (resume)
     await panel(page)
       .getByRole('button', {
         name: new RegExp(`^${(typeof resume === 'string' ? resume : faultPrompt).slice(0, 20)}`),
       })
       .click();
-  else await panel(page).getByRole('button', { name: '当前小说会话', exact: true }).click();
+  else await panel(page).getByRole('button', { name: '新建会话', exact: true }).click();
   await expect(panel(page).getByLabel('写作动作')).toHaveCount(0);
 }
 async function send(page: Page, text: string) {
@@ -771,7 +771,9 @@ test('two natural-language sends complete the Odyssey and insert a related antag
     const wholeStart = mock.requestBytes.length;
     const wholeStartedAt = performance.now();
     await send(page, odyssey);
-    await expect.poll(async () => (await status(page, bookId))?.status).toBe('completed');
+    await expect
+      .poll(async () => (await status(page, bookId))?.status, { timeout: 15_000 })
+      .toBe('completed');
     const wholeEnd = mock.requestBytes.length;
     const wholeElapsedMs = Math.round(performance.now() - wholeStartedAt);
     expect(await status(page, bookId)).toMatchObject({

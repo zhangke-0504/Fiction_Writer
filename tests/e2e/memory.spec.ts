@@ -158,7 +158,7 @@ test('new editor sessions isolate book memory and diagnostics match actual reque
       ).error,
     ).toBeUndefined();
     const { books } = await rpc<LibraryView>(page, 'library.list');
-    const panel = page.getByRole('complementary', { name: 'Harness 面板' });
+    const panel = page.getByRole('complementary', { name: 'AI 面板' });
     const open = async (id: string) => {
       const buttons = page.getByRole('button', { name: `编辑 ${bookTitle}`, exact: true });
       await expect(buttons).toHaveCount(2);
@@ -193,7 +193,8 @@ test('new editor sessions isolate book memory and diagnostics match actual reque
     await page.getByRole('button', { name: '返回书库' }).click();
     await open(b.id);
     await expect(panel.getByText(rememberPrompt, { exact: true })).toHaveCount(0);
-    await expect(panel.getByText('这本小说还没有会话。')).toBeVisible();
+    await expect(panel.getByLabel('给 Agent 的消息')).toBeVisible();
+    expect((await rpc<RuntimeView>(page, 'runtime.snapshot', { bookId: b.id })).sessions).toEqual([]);
     const bRecall = await send(b.id, overviewPrompt);
     const bResult = JSON.parse(received.at(-1)!.messages.at(-1)!.content).value as BookRecall;
     expect(bResult).toEqual({ conventions: [], earlierStory: [], plans: [], reference: [] });

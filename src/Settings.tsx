@@ -88,7 +88,7 @@ export function Settings({ profiles, refresh }: { profiles: ModelProfile[]; refr
         <div>
           <p className="eyebrow">FICTION WRITER / 设置</p>
           <h1>模型配置</h1>
-          <p className="muted">连接你常用的模型，在 Harness 中随时切换。</p>
+          <p className="muted">连接你常用的模型，在 AI 侧栏中随时切换。</p>
         </div>
         <button className="primary" disabled={checking || saving} onClick={() => select(null, 'pick')}>
           <Icon name="plus" />

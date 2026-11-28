@@ -63,9 +63,8 @@ test('Harness formats a streaming reply and saves the original Markdown once', a
       }, bookId);
 
     await page.getByRole('button', { name: '编辑 流式排版', exact: true }).click();
-    await page.getByRole('button', { name: 'Harness', exact: true }).click();
-    const panel = page.getByRole('complementary', { name: 'Harness 面板' });
-    await panel.getByRole('button', { name: '当前小说会话', exact: true }).click();
+    await page.getByRole('button', { name: 'AI', exact: true }).click();
+    const panel = page.getByRole('complementary', { name: 'AI 面板' });
     await panel.getByLabel('模型').selectOption(profileId);
     await panel.getByLabel('给 Agent 的消息').fill('讨论开篇写法');
     await panel.getByRole('button', { name: '发送', exact: true }).click();
